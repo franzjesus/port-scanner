@@ -306,6 +306,16 @@ Supported initially:
 
 Use proper IP/CIDR types rather than manually parsing strings.
 
+## Tasks
+
+- [x]Parse single IPv4 addresses into a structured target.
+- [x]Parse and normalize CIDR subnets (host bits truncated).
+- [x]Reject invalid targets with clear errors, without panicking.
+- [x]Enforce a maximum subnet size to prevent accidental unbounded scans.
+- [x]Wire target parsing into the CLI (invalid input → clear error, non-zero exit).
+- [x]Display the parsed target in the TUI (title and body).
+- [x]Add unit tests for parsing, validation, and error messages.
+
 ## Requirements
 
 - Validate IPv4 addresses.
@@ -327,6 +337,15 @@ hello
 Valid targets become structured scan targets.
 
 Invalid targets produce clear errors without panicking.
+
+## Notes
+
+- CIDR handling uses `ipnet 2` (`Ipv4Net`): the standard library provides `Ipv4Addr` but no CIDR type, and `ipnet` is small and dependency-free.
+- `ScanTarget` is an enum: `Host(Ipv4Addr)` / `Subnet(Ipv4Net)`. Subnets are normalized via `trunc()`, so `192.168.1.1/24` is stored as `192.168.1.0/24`. `len()` returns the address count as `u64` (a `/0` is 2^32).
+- `MAX_SUBNET_SIZE = 65_536` (i.e. minimum prefix `/16`) rejects larger targets with a `TooManyHosts` error. It is a constant for now and can become configurable once scan configuration exists (Phase 5).
+- IPv6 input is explicitly rejected with `Ipv6NotSupported` until IPv6 support lands (Phase 23).
+- The TUI displays the target in the title (per the UI mockup) and in the body (`Target: ... (N hosts). Press q to quit.`); the body remains a placeholder until the host list exists in a later phase.
+- Verified: `cargo fmt --check`, `cargo check`, `cargo test` (16 unit tests), `cargo clippy --all-targets` (clean), plus manual CLI checks of every error path (invalid address, invalid prefix, oversized subnet, IPv6 → exit 1) and a PTY smoke test (renders the target title/body, clean exit on `q`).
 
 ---
 
@@ -1027,7 +1046,7 @@ Selecting a host:
 Implement in this order:
 
 - [x]Project bootstrap.
-- [ ]CLI and target parsing.
+- [x]CLI and target parsing.
 - [ ]Core network data structures.
 - [ ]Scanner event model.
 - [ ]Basic host discovery.

@@ -10,6 +10,7 @@ crossterm = "0.28"
 ratatui = "0.29"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+ipnet = "2.12.2"
 
 [lints.clippy]
 all = "warn"

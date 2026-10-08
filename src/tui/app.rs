@@ -16,13 +16,17 @@ use ratatui::{
     Frame, Terminal,
 };
 
+use crate::target::ScanTarget;
+
 /// Central application state.
 ///
-/// Phase 1 keeps this minimal. Later phases will track scan state, discovered
-/// hosts, selection, and filters here.
+/// Phase 2 keeps this minimal: the parsed scan target is displayed. Later
+/// phases will track scan state, discovered hosts, selection, and filters.
 #[derive(Debug, Default)]
 pub struct App {
     pub should_quit: bool,
+    /// The validated scan target, if the user provided one.
+    pub target: Option<ScanTarget>,
 }
 
 impl App {
@@ -35,14 +39,17 @@ impl App {
 }
 
 /// Run the terminal UI until the user quits, then restore the terminal.
-pub fn run() -> io::Result<()> {
+pub fn run(target: Option<ScanTarget>) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::default();
+    let mut app = App {
+        target,
+        ..Default::default()
+    };
     let result = run_loop(&mut terminal, &mut app);
 
     // Restore the terminal even if the event loop failed.
@@ -60,7 +67,7 @@ fn run_loop(
     app: &mut App,
 ) -> io::Result<()> {
     loop {
-        terminal.draw(draw)?;
+        terminal.draw(|f| draw(f, app))?;
 
         if app.should_quit {
             return Ok(());
@@ -82,7 +89,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io
     terminal.show_cursor()
 }
 
-fn draw(frame: &mut Frame) {
+fn draw(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -92,10 +99,25 @@ fn draw(frame: &mut Frame) {
         ])
         .split(frame.area());
 
-    let title = Paragraph::new("NETSCOPE").style(Style::default().add_modifier(Modifier::BOLD));
+    // The title echoes the plan's UI mockup: `NETSCOPE  192.168.1.0/24`.
+    let title = match &app.target {
+        Some(target) => format!("NETSCOPE  {target}"),
+        None => "NETSCOPE".to_owned(),
+    };
+    let title = Paragraph::new(title).style(Style::default().add_modifier(Modifier::BOLD));
     frame.render_widget(title, chunks[0]);
 
-    let body = Paragraph::new("Ready. Press q to quit.");
+    let body = match &app.target {
+        Some(target) => {
+            let unit = if target.len() == 1 { "host" } else { "hosts" };
+            format!(
+                "Target: {target} ({} {unit}). Press q to quit.",
+                target.len()
+            )
+        }
+        None => "No target. Run netscope with an IPv4 address or CIDR range.".to_owned(),
+    };
+    let body = Paragraph::new(body);
     frame.render_widget(body, chunks[1]);
 
     let help = Paragraph::new("q Quit");
@@ -120,5 +142,20 @@ mod tests {
         app.handle_key(KeyCode::Char('x'));
         app.handle_key(KeyCode::Enter);
         assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn app_holds_optional_target() {
+        let app = App::default();
+        assert!(app.target.is_none());
+
+        let app = App {
+            target: Some(ScanTarget::parse("192.168.1.0/24").unwrap()),
+            ..Default::default()
+        };
+        assert_eq!(
+            app.target.as_ref().map(|t| t.to_string()),
+            Some("192.168.1.0/24".to_owned())
+        );
     }
 }
