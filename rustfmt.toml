@@ -1,0 +1,6 @@
+# Formatting configuration.
+#
+# Relies on rustfmt defaults; this file exists so overrides are explicit and
+# can grow with the codebase.
+
+max_width = 100

@@ -1,0 +1,14 @@
+# Build artifacts
+/target
+
+# Cargo.lock is committed for this application (do not ignore it).
+
+# Editor / IDE
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+
+# OS
+.DS_Store

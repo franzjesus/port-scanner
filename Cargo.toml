@@ -1,0 +1,19 @@
+[package]
+name = "netscope"
+version = "0.1.0"
+edition = "2021"
+description = "Interactive terminal network exploration: target, hosts, services, changes."
+license = "MIT"
+
+[dependencies]
+crossterm = "0.28"
+ratatui = "0.29"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[lints.clippy]
+all = "warn"
+
+[profile.release]
+lto = true
+strip = "symbols"

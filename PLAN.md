@@ -1,0 +1,1171 @@
+# Network TUI Scanner — Implementation Plan
+
+## 1\. Project Overview
+
+Build a Linux terminal user interface (TUI) application in Rust for discovering and exploring hosts on an IP address or subnet.
+
+The application should make it easy to go from:
+
+```
+Target → Host discovery → Open ports → Services → Historical changes
+```
+
+The primary goal is **interactive network exploration from the terminal**, not simply reproducing the output of an existing command-line scanner.
+
+The application should be fast, responsive, asynchronous, and designed so the scanner engine is independent from the TUI.
+
+---
+
+# 2\. Product Goals
+
+## Primary goals
+
+- Scan a single IPv4 address.
+- Scan an IPv4 CIDR subnet.
+- Discover live hosts.
+- Scan TCP ports.
+- Display results interactively in a TUI.
+- Show scan progress while scanning.
+- Inspect individual hosts.
+- Filter and search scan results.
+- Export scan results as JSON.
+- Keep scanner logic independent from the UI.
+- Support concurrent network operations.
+- Provide useful error handling and cancellation.
+
+## Future goals
+
+- ARP discovery.
+- Service detection.
+- Hostname resolution.
+- MAC address and vendor information.
+- TLS information.
+- Saved scans.
+- Scan history.
+- Scan-to-scan diff.
+- Network visualization.
+- IPv6.
+- Additional discovery mechanisms.
+- Additional service detectors.
+
+## Non-goals for the initial release
+
+Do not attempt to implement a full Nmap replacement.
+
+Do not initially implement:
+
+- UDP scanning.
+- OS fingerprinting.
+- Aggressive service fingerprinting.
+- Complex packet crafting.
+- Vulnerability scanning.
+- Exploit detection.
+- Network topology claims based only on IP addresses.
+
+These can be considered later if there is a clear need.
+
+---
+
+# 3\. High-Level Architecture
+
+Keep the project separated into three major layers:
+
+```
+                    ┌───────────────┐
+                    │      CLI      │
+                    └───────┬───────┘
+                            │
+                    ┌───────▼───────┐
+                    │    Scanner     │
+                    └───────┬───────┘
+                            │
+                       Scan Events
+                            │
+              ┌─────────────┴─────────────┐
+              │                           │
+       ┌──────▼──────┐             ┌──────▼──────┐
+       │     TUI     │             │   Storage   │
+       └─────────────┘             └─────────────┘
+```
+
+## Important architectural rule
+
+The scanner must not depend on the TUI.
+
+The scanner should be usable independently and produce structured results/events.
+
+The TUI consumes scanner events and renders application state.
+
+This allows future functionality such as:
+
+```
+netscope scan 192.168.1.0/24
+netscope tui 192.168.1.0/24
+netscope export scan.json
+```
+
+without requiring scanner logic to be rewritten.
+
+---
+
+# 4\. Proposed Project Structure
+
+Start with the following structure:
+
+```
+src/
+├── main.rs
+├── cli/
+│   └── mod.rs
+├── scanner/
+│   ├── mod.rs
+│   ├── discovery.rs
+│   ├── icmp.rs
+│   ├── arp.rs
+│   ├── tcp.rs
+│   └── ports.rs
+├── network/
+│   ├── mod.rs
+│   ├── host.rs
+│   ├── port.rs
+│   └── subnet.rs
+├── storage/
+│   ├── mod.rs
+│   └── json.rs
+└── tui/
+    ├── mod.rs
+    ├── app.rs
+    ├── events.rs
+    ├── state.rs
+    └── views/
+        ├── overview.rs
+        ├── hosts.rs
+        ├── host_detail.rs
+        └── ports.rs
+```
+
+Do not create modules until they have a concrete purpose.
+
+The structure may evolve as implementation progresses.
+
+---
+
+# 5\. Core Data Model
+
+The internal data model must be independent of the TUI.
+
+## Host
+
+Conceptually:
+
+```
+struct Host {
+    ip: IpAddr,
+    state: HostState,
+    hostname: Option<String>,
+    mac: Option<MacAddr>,
+    vendor: Option<String>,
+    latency: Option<Duration>,
+    ports: Vec<Port>,
+}
+```
+
+Initial implementation may omit fields whose functionality has not yet been implemented.
+
+## Host state
+
+```
+enum HostState {
+    Unknown,
+    Scanning,
+    Up,
+    Down,
+    Error,
+}
+```
+
+## Port
+
+```
+struct Port {
+    number: u16,
+    protocol: Protocol,
+    state: PortState,
+    service: Option<String>,
+}
+```
+
+## Port state
+
+Initially:
+
+```
+enum PortState {
+    Open,
+    Closed,
+    Filtered,
+}
+```
+
+Only states that can actually be determined by the implemented scanner should be reported.
+
+---
+
+# 6\. Scan Events
+
+The scanner should communicate progress through events.
+
+Conceptually:
+
+```
+enum ScanEvent {
+    Started,
+    HostDiscovered(Host),
+    PortDiscovered {
+        ip: IpAddr,
+        port: Port,
+    },
+    HostCompleted(IpAddr),
+    Progress {
+        completed: usize,
+        total: usize,
+    },
+    Finished,
+    Cancelled,
+    Error(ScanError),
+}
+```
+
+The exact design may change during implementation.
+
+Requirements:
+
+- Events must be usable by the TUI.
+- Events must not contain TUI-specific types.
+- Scanning must not block the UI thread.
+- The UI should update incrementally as results arrive.
+
+---
+
+# 7\. Phase 1 — Project Bootstrap
+
+## Tasks
+
+- [x]Create Rust binary project.
+- [x]Configure Rust edition.
+- [x]Add basic command-line argument parsing.
+- [x]Add TUI framework.
+- [x]Add asynchronous runtime if required by scanner architecture.
+- [x]Establish formatting/linting configuration.
+- [x]Add basic test infrastructure.
+- [x]Add README.
+- [x]Add LICENSE.
+- [x]Add `.gitignore`.
+
+## Acceptance criteria
+
+The application builds successfully with:
+
+```
+cargo build
+```
+
+and runs with:
+
+```
+cargo run
+```
+
+The project should have a minimal TUI that can start and exit cleanly.
+
+## Notes
+
+- Crate/binary name: `netscope` (edition 2021).
+- TUI stack: `ratatui 0.29` + `crossterm 0.28` (latest compatible majors at bootstrap time).
+- CLI parsing: `clap 4` (derive).
+- Async runtime: `tokio 1` (rt-multi-thread, macros) — included now per the scanner architecture.
+- Linting: `[lints.clippy] all = "warn"` in `Cargo.toml`; formatting via `rustfmt.toml` (`max_width = 100`).
+- Minimal TUI: three-row layout (title / body / help), 100 ms event poll, quits on `q`, restores the terminal on both success and failure paths.
+- CLI captures an optional `target` argument; intentionally unused until Phase 2.
+- Verified: `cargo fmt --check`, `cargo check` (no warnings), `cargo test` (2 unit tests), `cargo clippy --all-targets` (clean), `cargo build`, and a PTY smoke test (renders all three rows, enters/leaves the alternate screen, exits 0 on `q`).
+
+---
+
+# 8\. Phase 2 — Target Parsing
+
+Implement parsing and validation of scan targets.
+
+Supported initially:
+
+```
+192.168.1.1
+192.168.1.0/24
+10.0.0.1
+10.0.0.0/28
+```
+
+Use proper IP/CIDR types rather than manually parsing strings.
+
+## Requirements
+
+- Validate IPv4 addresses.
+- Validate CIDR prefixes.
+- Reject invalid targets cleanly.
+- Prevent accidental unbounded scans.
+- Provide useful error messages.
+
+Examples of invalid input:
+
+```
+192.168.1.999
+192.168.1.0/99
+hello
+```
+
+## Acceptance criteria
+
+Valid targets become structured scan targets.
+
+Invalid targets produce clear errors without panicking.
+
+---
+
+# 9\. Phase 3 — Host Discovery
+
+Implement the first real scanner.
+
+## Initial discovery strategy
+
+Start with a simple mechanism that works reliably in normal user environments.
+
+Primary initial mechanism:
+
+- ICMP echo discovery where practical.
+
+Design discovery behind an abstraction so additional mechanisms can be added later.
+
+Conceptually:
+
+```
+trait HostDiscovery {
+    async fn discover(
+        &self,
+        target: ScanTarget,
+    ) -> Result<Vec<Host>, DiscoveryError>;
+}
+```
+
+The exact trait/API can be adapted to the selected networking libraries.
+
+## Requirements
+
+- Scan all addresses in the target.
+- Run probes concurrently.
+- Respect configurable timeout.
+- Respect configurable concurrency.
+- Report hosts incrementally.
+- Support cancellation.
+- Do not freeze the TUI.
+
+## Acceptance criteria
+
+Scanning:
+
+```
+192.168.1.0/24
+```
+
+produces live hosts as they are discovered.
+
+The TUI remains responsive during the scan.
+
+---
+
+# 10\. Phase 4 — TCP Port Scanning
+
+Implement TCP connect scanning.
+
+## Requirements
+
+- Support configurable ports.
+- Support individual ports.
+- Support port ranges.
+- Support predefined scan profiles.
+- Run scans concurrently.
+- Respect connection timeout.
+- Report results incrementally.
+
+Example port specification:
+
+```
+22
+80
+443
+22,80,443
+8000-8100
+22,80,8000-8100
+```
+
+## Initial profiles
+
+### Quick
+
+Small set of common ports.
+
+### Common
+
+Larger predefined list.
+
+### Full
+
+TCP ports 1–65535.
+
+Full scans should require an explicit selection.
+
+## Acceptance criteria
+
+Given a live host, the scanner can report:
+
+```
+22/tcp   open
+80/tcp   open
+443/tcp  closed
+```
+
+Results appear in the TUI while scanning.
+
+---
+
+# 11\. Phase 5 — Scanner Configuration
+
+Create a scan configuration model.
+
+Conceptually:
+
+```
+struct ScanConfig {
+    target: ScanTarget,
+    discovery: DiscoveryConfig,
+    ports: PortConfig,
+    timeout: Duration,
+    concurrency: usize,
+}
+```
+
+The configuration should be usable without the TUI.
+
+Initial configurable properties:
+
+- Target.
+- Discovery method.
+- Port list/profile.
+- Timeout.
+- Concurrency.
+
+Use sensible defaults.
+
+Avoid exposing every internal scanner option to users initially.
+
+---
+
+# 12\. Phase 6 — TUI Application State
+
+Create a central application state model.
+
+Conceptually:
+
+```
+struct App {
+    scan: ScanState,
+    hosts: Vec<Host>,
+    selected_host: Option<usize>,
+    filter: Option<String>,
+    should_quit: bool,
+}
+```
+
+The exact representation can evolve.
+
+The TUI should consume `ScanEvent`s and update state.
+
+The TUI must not directly perform network operations.
+
+---
+
+# 13\. Phase 7 — Overview Screen
+
+Create the primary scan screen.
+
+Display:
+
+```
+Target: 192.168.1.0/24
+
+Hosts:
+  37 up
+  219 down
+
+Progress:
+  194 / 256
+
+Elapsed:
+  12.4s
+```
+
+Below the summary, display discovered hosts.
+
+Example:
+
+```
+IP              STATE       LATENCY
+192.168.1.1     UP          1.2 ms
+192.168.1.10    UP          2.1 ms
+192.168.1.20    UP          0.8 ms
+192.168.1.42    UP          3.4 ms
+```
+
+## Keyboard navigation
+
+At minimum:
+
+```
+↑ / k       Move up
+↓ / j       Move down
+Enter       Open host
+r           Rescan
+/           Filter
+?           Help
+q           Quit
+```
+
+Follow normal terminal/TUI conventions where possible.
+
+---
+
+# 14\. Phase 8 — Host Detail Screen
+
+Selecting a host should display detailed information.
+
+Initial version:
+
+```
+Host
+────────────────────────
+IP          192.168.1.42
+State       UP
+Latency     3.4 ms
+
+Ports
+────────────────────────
+22/tcp      OPEN
+80/tcp      OPEN
+443/tcp     CLOSED
+```
+
+Future fields:
+
+```
+Hostname
+MAC address
+Vendor
+Services
+TLS information
+```
+
+Do not display information that has not actually been discovered.
+
+---
+
+# 15\. Phase 9 — Filtering
+
+Implement interactive filtering.
+
+Minimum requirement:
+
+```
+/ ssh
+/ 192.168.1.42
+/ up
+```
+
+The first implementation can use simple substring matching.
+
+Potential future query syntax:
+
+```
+state:up
+port:22
+port:443
+service:http
+ip:192.168.1.*
+```
+
+Do not implement a complex query language until simple filtering proves insufficient.
+
+Filtering should operate on the UI model and must not trigger a new scan.
+
+---
+
+# 16\. Phase 10 — Scan Lifecycle
+
+Implement proper scan lifecycle handling.
+
+States:
+
+```
+Idle
+Starting
+Discovering
+ScanningPorts
+Completed
+Cancelled
+Error
+```
+
+The user must be able to:
+
+- Start a scan.
+- Cancel a scan.
+- Return to results.
+- Start another scan.
+
+Cancellation must propagate to scanner tasks.
+
+No orphaned network tasks should remain after cancellation.
+
+---
+
+# 17\. Phase 11 — JSON Export
+
+Add export functionality.
+
+Example:
+
+```
+netscope scan 192.168.1.0/24 --json
+```
+
+or from the TUI:
+
+```
+e → Export JSON
+```
+
+The exported format should contain structured scan information.
+
+Example:
+
+```
+{
+  "target": "192.168.1.0/24",
+  "hosts": [
+    {
+      "ip": "192.168.1.1",
+      "state": "up",
+      "latency_ms": 1.2,
+      "ports": [
+        {
+          "port": 22,
+          "protocol": "tcp",
+          "state": "open"
+        }
+      ]
+    }
+  ]
+}
+```
+
+The exact schema should be treated as a versioned public format once released.
+
+---
+
+# 18\. Phase 12 — Service Detection
+
+After basic scanning is stable, add service detection.
+
+Start conservatively.
+
+Initial detectors:
+
+- HTTP.
+- HTTPS/TLS.
+- SSH.
+
+Possible later detectors:
+
+- FTP.
+- SMTP.
+- DNS.
+- SMB.
+- RDP.
+
+Service detection should be modular.
+
+Conceptually:
+
+```
+trait ServiceDetector {
+    async fn detect(
+        &self,
+        host: &Host,
+        port: &Port,
+    ) -> Result<Option<ServiceInfo>, ServiceError>;
+}
+```
+
+Do not make service detection mandatory for basic port scanning.
+
+---
+
+# 19\. Phase 13 — Hostname, MAC and Vendor Information
+
+Add optional enrichment.
+
+## Hostname
+
+Perform reverse DNS where appropriate.
+
+## MAC address
+
+Use ARP/local network mechanisms where available.
+
+## Vendor
+
+Map MAC OUI information to vendor.
+
+Important:
+
+- Treat enrichment as optional.
+- Do not fail an entire scan because enrichment fails.
+- Clearly distinguish discovered information from inferred information.
+
+---
+
+# 20\. Phase 14 — Persistence
+
+Add persistent scan storage.
+
+Possible initial implementation:
+
+- SQLite.
+
+Store:
+
+```
+Scan
+ ├── target
+ ├── timestamp
+ ├── configuration
+ └── hosts
+      ├── host information
+      └── ports
+```
+
+The storage layer must remain independent from the TUI.
+
+---
+
+# 21\. Phase 15 — Scan History and Diff
+
+Allow comparison between scans.
+
+Example:
+
+```
+NETWORK CHANGES
+
++ 192.168.1.73       NEW HOST
++ 192.168.1.42:8080  NEW PORT
+- 192.168.1.20:445   PORT CLOSED
+~ 192.168.1.10       HOST INFORMATION CHANGED
+```
+
+This should compare structured data rather than textual output.
+
+---
+
+# 22\. Phase 16 — Network Visualization
+
+Add a dedicated network view.
+
+The visualization should show discovered hosts and useful relationships.
+
+Example:
+
+```
+                  192.168.1.1
+                       │
+          ┌────────────┼────────────┐
+          │            │            │
+     192.168.1.10  192.168.1.20  192.168.1.42
+```
+
+Important:
+
+The application must not claim that an actual physical/network topology has been discovered unless it has supporting data.
+
+The visualization should distinguish between:
+
+- Known relationships.
+- Inferred relationships.
+- Simple subnet grouping.
+
+A subnet view can be useful even without claiming topology.
+
+---
+
+# 23\. Future IPv6 Support
+
+IPv6 should be considered in the architecture from the beginning, but does not need to be implemented in the MVP.
+
+Avoid unnecessarily hardcoding IPv4-only assumptions into:
+
+- Host models.
+- Scan targets.
+- Port models.
+- Storage.
+- UI rendering.
+
+Initial implementation may explicitly reject IPv6 with a clear message.
+
+---
+
+# 24\. Error Handling
+
+Errors should be structured and user-friendly.
+
+Potential categories:
+
+```
+TargetError
+DiscoveryError
+ConnectionError
+ScanError
+ConfigurationError
+StorageError
+ExportError
+```
+
+The application should never panic because:
+
+- A host is unreachable.
+- A connection times out.
+- A port refuses a connection.
+- DNS fails.
+- An optional enrichment operation fails.
+
+Unexpected programmer errors may still panic during development, but user/network errors should be handled.
+
+---
+
+# 25\. Performance Requirements
+
+The application should remain responsive during large scans.
+
+Requirements:
+
+- Network operations must not block the TUI.
+- Concurrency must be configurable.
+- Avoid spawning unbounded tasks.
+- Use bounded channels/queues where appropriate.
+- Avoid storing unnecessary duplicate data.
+- Do not render more information than necessary for the current view.
+
+Large subnet scans should provide continuous progress feedback.
+
+---
+
+# 26\. Security and Safety
+
+This is a network scanner and must behave predictably.
+
+Requirements:
+
+- Make the target explicit.
+- Make expensive scan modes explicit.
+- Do not silently scan unrelated networks.
+- Require explicit selection for full TCP scans.
+- Avoid destructive network operations.
+- Do not implement exploitation functionality.
+- Do not send arbitrary payloads as part of the initial scanner.
+- Clearly report scan configuration before execution where practical.
+
+The tool should be designed primarily for networks the user is authorized to test.
+
+---
+
+# 27\. Testing Strategy
+
+## Unit tests
+
+Test:
+
+- IP parsing.
+- CIDR parsing.
+- Port specification parsing.
+- Port range expansion.
+- Configuration validation.
+- Filtering.
+- Result serialization.
+- Scan diff logic.
+
+## Integration tests
+
+Test:
+
+- Scanner against controlled local test services.
+- TCP port detection.
+- JSON export.
+- Event delivery.
+- Cancellation.
+
+## TUI tests
+
+Where practical, test:
+
+- State transitions.
+- Selection movement.
+- Filtering.
+- Event handling.
+- Scan completion/cancellation.
+
+Avoid making tests dependent on a real external network.
+
+---
+
+# 28\. Logging and Diagnostics
+
+The application should support optional debug logging.
+
+Normal TUI operation should remain clean.
+
+Possible approach:
+
+```
+RUST_LOG=debug netscope ...
+```
+
+When running in TUI mode, avoid writing logs directly over the terminal UI.
+
+Consider logging to a file or only enabling detailed logs when explicitly requested.
+
+---
+
+# 29\. CLI Design
+
+Initial command structure:
+
+```
+netscope
+netscope scan <target>
+netscope tui <target>
+```
+
+Possible future commands:
+
+```
+netscope history
+netscope show <scan>
+netscope diff <scan-a> <scan-b>
+netscope export <scan>
+```
+
+Do not over-design the CLI before the core scanner works.
+
+The default command can eventually launch the interactive TUI.
+
+---
+
+# 30\. Suggested MVP User Experience
+
+A user should be able to run:
+
+```
+netscope 192.168.1.0/24
+```
+
+and immediately see:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ NETSCOPE  192.168.1.0/24                  SCANNING 42%      │
+├─────────────────────────────────────────────────────────────┤
+│ Hosts: 12 up / 95 scanned                                  │
+├─────────────────────────────────────────────────────────────┤
+│ IP              STATE       LATENCY     OPEN PORTS          │
+│                                                             │
+│ 192.168.1.1     UP          1.2 ms      22,80,443           │
+│ 192.168.1.10    UP          2.1 ms      22,445              │
+│ 192.168.1.20    UP          0.8 ms      80,443              │
+│ 192.168.1.42    UP          3.4 ms      22,80               │
+│                                                             │
+├─────────────────────────────────────────────────────────────┤
+│ ↑↓ Navigate  Enter Details  / Filter  r Rescan  q Quit     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+Selecting a host:
+
+```
+┌─ 192.168.1.42 ──────────────────────────────────────────────┐
+│ State       UP                                              │
+│ Latency     3.4 ms                                          │
+│ Hostname    raspberrypi.local                               │
+│                                                             │
+│ PORT       STATE       SERVICE                              │
+│ 22/tcp     OPEN        SSH                                  │
+│ 80/tcp     OPEN        HTTP                                 │
+│ 443/tcp    OPEN        HTTPS                                │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+# 31\. Development Order
+
+Implement in this order:
+
+- [x]Project bootstrap.
+- [ ]CLI and target parsing.
+- [ ]Core network data structures.
+- [ ]Scanner event model.
+- [ ]Basic host discovery.
+- [ ]Async/concurrent scanning.
+- [ ]TUI application state.
+- [ ]Live scan progress.
+- [ ]Host list.
+- [ ]Host detail view.
+- [ ]TCP port scanning.
+- [ ]Port profiles.
+- [ ]Filtering.
+- [ ]Cancellation.
+- [ ]JSON export.
+- [ ]Improve error handling.
+- [ ]Add tests and integration tests.
+- [ ]Service detection.
+- [ ]Hostname/MAC/vendor enrichment.
+- [ ]Persistence.
+- [ ]Scan history.
+- [ ]Scan diff.
+- [ ]Network visualization.
+- [ ]IPv6.
+
+Do not jump ahead to persistence, visualization, or service detection until the basic scanner and TUI are stable.
+
+---
+
+# 32\. Definition of Done for MVP
+
+The MVP is complete when all of the following are true:
+
+- [ ]`netscope 192.168.1.0/24` launches the TUI.
+- [ ]Single IPv4 addresses can be scanned.
+- [ ]IPv4 CIDR subnets can be scanned.
+- [ ]Live hosts are discovered.
+- [ ]TCP ports can be scanned.
+- [ ]Scan concurrency is bounded.
+- [ ]Scan timeout is configurable.
+- [ ]Progress is displayed in real time.
+- [ ]The UI remains responsive during scans.
+- [ ]Hosts can be selected.
+- [ ]Host details can be viewed.
+- [ ]Open ports are displayed.
+- [ ]Results can be filtered.
+- [ ]Scans can be cancelled.
+- [ ]A new scan can be started without restarting the application.
+- [ ]Results can be exported as JSON.
+- [ ]Network errors do not crash the application.
+- [ ]Core scanner functionality has automated tests.
+- [ ]The scanner has no dependency on the TUI.
+
+---
+
+# 33\. Implementation Principles for OpenCode
+
+When implementing this plan:
+
+1. **Work incrementally.**
+
+Complete one phase before starting unrelated future functionality.
+
+2. **Keep the project compiling.**
+
+After each meaningful change, run formatting, compilation, and relevant tests.
+
+3. **Prefer simple abstractions.**
+
+Do not introduce traits or generic infrastructure without a concrete use case.
+
+4. **Keep networking separate from presentation.**
+
+The scanner should never import TUI-specific modules.
+
+5. **Keep TUI state separate from scanner state.**
+
+Scanner events should update application state.
+
+6. **Use asynchronous/concurrent operations carefully.**
+
+Never create an unbounded number of network tasks.
+
+7. **Handle cancellation explicitly.**
+
+A user pressing `q` or a cancellation key must not leave background scanner tasks running.
+
+8. **Do not silently expand scan scope.**
+
+A requested target should determine exactly what is scanned.
+
+9. **Prefer structured data over formatted strings.**
+
+Store IPs, ports, states, services, and timestamps as typed values.
+
+10. **Do not implement future functionality prematurely.**
+
+Especially avoid implementing service detection, topology inference, persistence, or IPv6 before the MVP is working.
+
+11. **Write tests alongside functionality.**
+
+Particularly for parsers, scanner state, filtering, serialization, and diff logic.
+
+12. **Keep the user experience responsive.**
+
+The TUI must remain interactive while scans are running.
+
+13. **Document architectural decisions.**
+
+If implementation requires deviating from this plan, update the plan or add an ADR explaining why.
+
+14. **Never fabricate scan results.**
+
+The UI must only display information actually reported by the scanner.
+
+15. **Prefer platform-aware behavior.**
+
+Network capabilities such as ICMP and ARP can differ across Linux environments. Fail gracefully and explain required permissions/capabilities when necessary.
+
+---
+
+# 34\. First Task for OpenCode
+
+Start with **Phase 1 only**.
+
+Before implementing the scanner:
+
+1. Inspect the repository.
+2. Determine whether a Rust project already exists.
+3. Set up the project if necessary.
+4. Select and configure the TUI framework.
+5. Set up CLI argument parsing.
+6. Create the initial module structure.
+7. Create a minimal application state.
+8. Render a basic TUI.
+9. Make sure the application starts and exits cleanly.
+10. Add initial tests.
+11. Run formatting, compilation, and tests.
+
+Do not implement network scanning yet.
+
+Once Phase 1 is complete, proceed to Phase 2.
+
