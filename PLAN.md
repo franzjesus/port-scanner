@@ -99,9 +99,9 @@ The TUI consumes scanner events and renders application state.
 This allows future functionality such as:
 
 ```
-netscope scan 192.168.1.0/24
-netscope tui 192.168.1.0/24
-netscope export scan.json
+port-scanner scan 192.168.1.0/24
+port-scanner tui 192.168.1.0/24
+port-scanner export scan.json
 ```
 
 without requiring scanner logic to be rewritten.
@@ -280,7 +280,7 @@ The project should have a minimal TUI that can start and exit cleanly.
 
 ## Notes
 
-- Crate/binary name: `netscope` (edition 2021).
+- Crate/binary name: `port-scanner` (edition 2021).
 - TUI stack: `ratatui 0.29` + `crossterm 0.28` (latest compatible majors at bootstrap time).
 - CLI parsing: `clap 4` (derive).
 - Async runtime: `tokio 1` (rt-multi-thread, macros) — included now per the scanner architecture.
@@ -661,7 +661,7 @@ Add export functionality.
 Example:
 
 ```
-netscope scan 192.168.1.0/24 --json
+port-scanner scan 192.168.1.0/24 --json
 ```
 
 or from the TUI:
@@ -961,7 +961,7 @@ Normal TUI operation should remain clean.
 Possible approach:
 
 ```
-RUST_LOG=debug netscope ...
+RUST_LOG=debug port-scanner ...
 ```
 
 When running in TUI mode, avoid writing logs directly over the terminal UI.
@@ -975,18 +975,18 @@ Consider logging to a file or only enabling detailed logs when explicitly reques
 Initial command structure:
 
 ```
-netscope
-netscope scan <target>
-netscope tui <target>
+port-scanner
+port-scanner scan <target>
+port-scanner tui <target>
 ```
 
 Possible future commands:
 
 ```
-netscope history
-netscope show <scan>
-netscope diff <scan-a> <scan-b>
-netscope export <scan>
+port-scanner history
+port-scanner show <scan>
+port-scanner diff <scan-a> <scan-b>
+port-scanner export <scan>
 ```
 
 Do not over-design the CLI before the core scanner works.
@@ -1000,14 +1000,14 @@ The default command can eventually launch the interactive TUI.
 A user should be able to run:
 
 ```
-netscope 192.168.1.0/24
+port-scanner 192.168.1.0/24
 ```
 
 and immediately see:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ NETSCOPE  192.168.1.0/24                  SCANNING 42%      │
+│ PORT-SCANNER  192.168.1.0/24                  SCANNING 42%      │
 ├─────────────────────────────────────────────────────────────┤
 │ Hosts: 12 up / 95 scanned                                  │
 ├─────────────────────────────────────────────────────────────┤
@@ -1078,7 +1078,7 @@ Do not jump ahead to persistence, visualization, or service detection until the 
 
 The MVP is complete when all of the following are true:
 
-- [ ]`netscope 192.168.1.0/24` launches the TUI.
+- [ ]`port-scanner 192.168.1.0/24` launches the TUI.
 - [ ]Single IPv4 addresses can be scanned.
 - [ ]IPv4 CIDR subnets can be scanned.
 - [ ]Live hosts are discovered.
@@ -1187,4 +1187,3 @@ Before implementing the scanner:
 Do not implement network scanning yet.
 
 Once Phase 1 is complete, proceed to Phase 2.
-

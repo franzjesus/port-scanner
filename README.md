@@ -1,8 +1,8 @@
-# NETSCOPE
+# PORT-SCANNER
 
 Interactive terminal network exploration: **target → hosts → services → changes.**
 
-NETSCOPE is a Rust-based Linux TUI application for discovering and exploring
+PORT-SCANNER is a Rust-based Linux TUI application for discovering and exploring
 hosts on an IP address or subnet.
 
 > **Status: Phase 1 — Project bootstrap.** The TUI starts and exits cleanly.

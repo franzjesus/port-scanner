@@ -1,6 +1,6 @@
 //! Parsing and validation of scan targets.
 //!
-//! A [`ScanTarget`] is the structured form of what the user asks netscope to
+//! A [`ScanTarget`] is the structured form of what the user asks port-scanner to
 //! scan: either a single IPv4 host or an IPv4 CIDR subnet. Parsing is the
 //! single gate through which CLI input enters the application, so invalid
 //! input is rejected here with a clear error instead of panicking later.

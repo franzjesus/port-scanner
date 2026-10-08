@@ -99,10 +99,10 @@ fn draw(frame: &mut Frame, app: &App) {
         ])
         .split(frame.area());
 
-    // The title echoes the plan's UI mockup: `NETSCOPE  192.168.1.0/24`.
+    // The title echoes the plan's UI mockup: `PORT-SCANNER  192.168.1.0/24`.
     let title = match &app.target {
-        Some(target) => format!("NETSCOPE  {target}"),
-        None => "NETSCOPE".to_owned(),
+        Some(target) => format!("PORT-SCANNER  {target}"),
+        None => "PORT-SCANNER".to_owned(),
     };
     let title = Paragraph::new(title).style(Style::default().add_modifier(Modifier::BOLD));
     frame.render_widget(title, chunks[0]);
@@ -115,7 +115,7 @@ fn draw(frame: &mut Frame, app: &App) {
                 target.len()
             )
         }
-        None => "No target. Run netscope with an IPv4 address or CIDR range.".to_owned(),
+        None => "No target. Run port-scanner with an IPv4 address or CIDR range.".to_owned(),
     };
     let body = Paragraph::new(body);
     frame.render_widget(body, chunks[1]);

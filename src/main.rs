@@ -7,12 +7,12 @@ use clap::Parser;
 
 use crate::target::ScanTarget;
 
-/// NETSCOPE — interactive terminal network exploration.
+/// PORT-SCANNER — interactive terminal network exploration.
 ///
 /// target → hosts → services → changes
 #[derive(Parser, Debug)]
 #[command(
-    name = "netscope",
+    name = "port-scanner",
     version,
     about = "Interactive terminal network exploration: target, hosts, services, changes."
 )]
@@ -31,7 +31,7 @@ async fn main() -> ExitCode {
         Some(raw) => match ScanTarget::parse(&raw) {
             Ok(target) => Some(target),
             Err(err) => {
-                eprintln!("netscope: {err}");
+                eprintln!("port-scanner: {err}");
                 return ExitCode::FAILURE;
             }
         },
@@ -41,7 +41,7 @@ async fn main() -> ExitCode {
     match tui::app::run(target) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("netscope: {err}");
+            eprintln!("port-scanner: {err}");
             ExitCode::FAILURE
         }
     }
