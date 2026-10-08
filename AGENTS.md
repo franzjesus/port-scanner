@@ -192,6 +192,79 @@ The plan must reflect the repository's actual state.
 
 Before moving to the next phase, make sure the implementation still follows the architectural principles below.
 
+## 7\. Commit the change
+
+Once the task is verified and `PLAN.md` is updated, commit the work using the commit conventions below.
+
+---
+
+# Commit Conventions
+
+Commits must follow the Conventional Commits specification so that history stays readable and release tooling can derive semantic versions from it.
+
+## Format
+
+```
+type(scope): summary
+
+optional body
+
+optional footer
+```
+
+- `type` is required and lowercase.
+- `scope` is optional; use a short module or feature name.
+- `summary` is in the imperative mood, has no trailing period, and is at most 72 characters.
+- The body explains the *why*; footers carry references and breaking-change notes.
+
+## Allowed types
+
+| Type       | Use for                                                        |
+| ---------- | -------------------------------------------------------------- |
+| `feat`     | New user-visible functionality                                 |
+| `fix`      | Behavior fixes                                                 |
+| `refactor` | Structural changes with no behavior change                     |
+| `perf`     | Performance improvements                                       |
+| `test`     | Adding or updating tests                                       |
+| `docs`     | Documentation-only changes, including `PLAN.md`/`AGENTS.md`    |
+| `build`    | Build system or dependencies (`Cargo.toml`, toolchain)         |
+| `ci`       | CI configuration                                               |
+| `style`    | Formatting and whitespace (`cargo fmt`)                        |
+| `chore`    | Maintenance that fits no other type                            |
+
+## Scopes
+
+Prefer the module or phase the change affects, for example:
+
+- `target` — target/CIDR parsing.
+- `ports` — port parsing and port profiles.
+- `scanner` — scanning engine.
+- `events` — scan event model.
+- `tui` — TUI rendering and state.
+- `cli` — command-line interface.
+- `export` — result export.
+
+Omit the scope when the change spans multiple areas.
+
+## Rules
+
+- One logical change per commit; do not mix unrelated work.
+- Use the imperative mood in summaries (`add`, not `added` or `adds`).
+- Mark breaking changes with `!` after the type and a `BREAKING CHANGE:` footer.
+- Reference the `PLAN.md` phase in the body when useful (for example `Phase 2`).
+- Do not rewrite published history unless there is a strong reason.
+
+## Examples
+
+```
+feat(target): parse single IPv4 addresses and CIDR ranges
+fix(scanner): stop scheduling workers after cancellation
+refactor(tui): move event polling behind a bounded channel
+test(target): cover invalid CIDR prefixes
+docs: mark Phase 2 acceptance criteria complete
+build: bump ratatui to 0.29
+```
+
 ---
 
 # Architecture Rules
@@ -659,6 +732,7 @@ Before considering a task finished:
 [ ] Updated PLAN.md status
 [ ] Updated PLAN.md with newly discovered work
 [ ] Confirmed no unrelated functionality was introduced
+[ ] Committed with a Conventional Commit message
 ```
 
 The most important final step is:
