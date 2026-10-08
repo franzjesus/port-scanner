@@ -10,9 +10,13 @@
 //! out-of-band (see Phase 3 in `PLAN.md`).
 
 use std::fmt;
-use std::sync::mpsc::SendError;
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::{SendError, Sender};
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::network::Host;
+use crate::target::ScanTarget;
 
 /// A structured message produced by the scanner as a scan progresses.
 ///
@@ -68,6 +72,45 @@ impl From<SendError<ScanEvent>> for ScanError {
     fn from(err: SendError<ScanEvent>) -> Self {
         ScanError::Channel(err.to_string())
     }
+}
+
+/// Tunables for a host-discovery run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiscoveryConfig {
+    /// How long to wait for an ICMP reply before marking a host down.
+    pub timeout: Duration,
+    /// Maximum number of hosts probed concurrently.
+    pub concurrency: usize,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_millis(300),
+            concurrency: 128,
+        }
+    }
+}
+
+/// A mechanism for discovering which hosts in a target are up.
+///
+/// Implementations probe the target's addresses concurrently and report
+/// results as [`ScanEvent`]s through the provided channel. Discovery is
+/// blocking: the call returns once the target has been fully probed, the
+/// scan was cancelled, or a fatal error occurred.
+pub trait HostDiscovery {
+    /// Probe `target`, reporting discovered hosts and progress through
+    /// `events`.
+    ///
+    /// `cancel` is checked periodically; when set, discovery stops promptly
+    /// without marking in-flight hosts down.
+    fn discover(
+        &self,
+        target: &ScanTarget,
+        config: &DiscoveryConfig,
+        events: &Sender<ScanEvent>,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<(), ScanError>;
 }
 
 #[cfg(test)]
@@ -133,5 +176,12 @@ mod tests {
         let err = tx.send(ScanEvent::Finished).unwrap_err();
         let scan_error = ScanError::from(err);
         assert!(matches!(scan_error, ScanError::Channel(_)));
+    }
+
+    #[test]
+    fn default_discovery_config() {
+        let config = DiscoveryConfig::default();
+        assert_eq!(config.timeout, Duration::from_millis(300));
+        assert_eq!(config.concurrency, 128);
     }
 }
