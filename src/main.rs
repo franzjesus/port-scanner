@@ -1,4 +1,5 @@
 mod network;
+mod scanner;
 mod target;
 mod tui;
 
