@@ -1,3 +1,4 @@
+mod network;
 mod target;
 mod tui;
 
