@@ -103,15 +103,71 @@ impl ScanTarget {
     /// Number of addresses in the target (a single host counts as 1).
     ///
     /// There is deliberately no `is_empty()`: every valid target contains at
-    /// least one address, so it would always return `false`. Enumeration of
-    /// the addresses arrives with host discovery (Phase 3).
+    /// least one address, so it would always return `false`.
     pub fn len(&self) -> u64 {
         match self {
             ScanTarget::Host(_) => 1,
             ScanTarget::Subnet(net) => (u32::from(net.hostmask()) as u64) + 1,
         }
     }
+
+    /// Iterate over every address in the target, in ascending order.
+    ///
+    /// Unlike [`Ipv4Net::hosts`], this yields *all* addresses in the range,
+    /// including the network and broadcast addresses. That matches the scan
+    /// scope contract: the user asked for a range, so every address in it is
+    /// probed. The count of items yielded is always [`ScanTarget::len`].
+    pub fn iter(&self) -> ScanTargetIter {
+        let (start, end) = match self {
+            ScanTarget::Host(ip) => (*ip, *ip),
+            ScanTarget::Subnet(net) => (net.network(), net.broadcast()),
+        };
+        ScanTargetIter {
+            current: Some(start),
+            end,
+        }
+    }
 }
+
+/// Iterator over the addresses of a [`ScanTarget`].
+///
+/// Yielded in ascending numeric order and always terminates after exactly
+/// [`ScanTarget::len`] items, even for the largest possible address
+/// (`255.255.255.255/32`), because the range never wraps.
+#[derive(Debug, Clone)]
+pub struct ScanTargetIter {
+    current: Option<Ipv4Addr>,
+    end: Ipv4Addr,
+}
+
+impl Iterator for ScanTargetIter {
+    type Item = Ipv4Addr;
+
+    fn next(&mut self) -> Option<Ipv4Addr> {
+        let cur = self.current?;
+        // Yield the current address; stop once it is the last in the range.
+        // Because we only advance while `cur < end`, `cur + 1` can never
+        // overflow past `u32::MAX`.
+        if u32::from(cur) >= u32::from(self.end) {
+            self.current = None;
+        } else {
+            self.current = Some(Ipv4Addr::from(u32::from(cur) + 1));
+        }
+        Some(cur)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = match self.current {
+            None => 0,
+            Some(cur) => (u32::from(self.end) - u32::from(cur)) as usize + 1,
+        };
+        (remaining, Some(remaining))
+    }
+}
+
+// Discovery only ever iterates forward, so the iterator is intentionally
+// not double-ended.
+impl ExactSizeIterator for ScanTargetIter {}
 
 impl fmt::Display for ScanTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -259,6 +315,84 @@ mod tests {
     fn parses_slash_16_boundary() {
         let subnet = parse_ok("10.0.0.0/16");
         assert_eq!(subnet.len(), 65_536);
+    }
+
+    // --- address enumeration --------------------------------------------------
+
+    #[test]
+    fn iter_single_host_yields_one_address() {
+        let host = parse_ok("192.168.1.1");
+        let addrs: Vec<Ipv4Addr> = host.iter().collect();
+        let expected: Vec<Ipv4Addr> = vec!["192.168.1.1".parse().unwrap()];
+        assert_eq!(addrs, expected);
+    }
+
+    #[test]
+    fn iter_subnet_yields_all_addresses_in_ascending_order() {
+        let subnet = parse_ok("10.0.0.0/28");
+        let addrs: Vec<Ipv4Addr> = subnet.iter().collect();
+        assert_eq!(addrs.len(), 16);
+        assert_eq!(addrs[0], "10.0.0.0".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(
+            addrs.last().unwrap(),
+            &"10.0.0.15".parse::<Ipv4Addr>().unwrap()
+        );
+        for pair in addrs.windows(2) {
+            assert!(pair[0] < pair[1], "addresses must be ascending");
+        }
+    }
+
+    #[test]
+    fn iter_includes_network_and_broadcast_addresses() {
+        // Unlike Ipv4Net::hosts(), every address in the range is yielded.
+        let subnet = parse_ok("192.168.1.0/30");
+        let addrs: Vec<Ipv4Addr> = subnet.iter().collect();
+        let expected: Vec<Ipv4Addr> = vec![
+            "192.168.1.0".parse().unwrap(),
+            "192.168.1.1".parse().unwrap(),
+            "192.168.1.2".parse().unwrap(),
+            "192.168.1.3".parse().unwrap(),
+        ];
+        assert_eq!(addrs, expected);
+    }
+
+    #[test]
+    fn iter_count_matches_len() {
+        for input in ["192.168.1.1", "192.168.1.0/24", "10.0.0.0/16"] {
+            let target = parse_ok(input);
+            let count = target.iter().count() as u64;
+            assert_eq!(count, target.len(), "count mismatch for {input}");
+        }
+    }
+
+    #[test]
+    fn iter_handles_slash_32_and_max_address() {
+        let slash32 = parse_ok("10.0.0.1/32");
+        assert_eq!(
+            slash32.iter().collect::<Vec<_>>(),
+            vec!["10.0.0.1".parse::<Ipv4Addr>().unwrap()]
+        );
+
+        // The largest possible address must terminate without wrapping.
+        let max = parse_ok("255.255.255.255/32");
+        assert_eq!(
+            max.iter().collect::<Vec<_>>(),
+            vec!["255.255.255.255".parse::<Ipv4Addr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn iter_size_hint_is_exact() {
+        let subnet = parse_ok("192.168.1.0/30");
+        let mut it = subnet.iter();
+        assert_eq!(it.size_hint(), (4, Some(4)));
+        it.next();
+        assert_eq!(it.size_hint(), (3, Some(3)));
+        it.next();
+        it.next();
+        it.next();
+        assert_eq!(it.size_hint(), (0, Some(0)));
+        assert!(it.next().is_none());
     }
 
     // --- invalid input -------------------------------------------------------
