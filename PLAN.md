@@ -482,6 +482,8 @@ Given a live host, the scanner can report:
 
 Results appear in the TUI while scanning.
 
+Both acceptance criteria are met. The scanner reports a `PortState` for every probed port — `TcpPortScanner` maps a successful `connect_timeout` to `Open` and any error (refused or timeout) to `Closed`, emitting one `ScanEvent::PortDiscovered` per port (a local-listener integration test asserts the open port reports `Open` and a closed port reports `Closed`). The TUI records open ports in the OPEN PORTS column and shows live `Ports: probed/total` progress while scanning (verified by a PTY smoke test scanning `127.0.0.1`: the open port is recorded and the progress reaches `18/18`).
+
 ## Tasks
 
 - [x]4.1 Port data model (`Port`, `PortState`, `PortError`), `Host.ports`, and the `ScanEvent::PortDiscovered` event.
@@ -535,14 +537,41 @@ Results appear in the TUI while scanning.
     Also removes `PortSpec::is_full` (test-only, no Phase-4 consumer).
 - [x]4.10 TUI: record open ports on the host + OPEN PORTS column.
 - [x]4.11 TUI: live port progress.
-- [ ]4.12 Update `PLAN.md`.
+- [x]4.12 Update `PLAN.md`.
 
-Note: with the CLI wired (4.9), the TUI recording open ports (4.10), and live port
-progress (4.11), `run_scan`, the `TcpPortScanner`/`PortScanner` items,
-`Host::add_open_port`, the `ScanEvent::PortDiscovered` fields, and `PortSpec::len`
-(consumed by `main` via `port_config.ports.len()`) are all reachable/consumed. The TUI
-test module constructs `App` with struct-update syntax (e.g. `App { hosts,
-..Default::default() }`) so `cargo clippy --all-targets` is warning-free.
+## Notes
+
+- **Scan mechanism:** TCP connect scan — `TcpStream::connect_timeout` per port; a
+  successful connect means `Open`, any error (refused or timeout) means `Closed`. No raw
+  sockets or privileges required.
+- **Concurrency model:** `TcpPortScanner` runs a bounded worker pool over the target's
+  port set (`PortConfig::concurrency`, default `DEFAULT_CONCURRENCY` = 128); ports are
+  drawn from a shared queue, so concurrency never scales with target size. Cancellation
+  is checked before each host and between port batches.
+- **Port configuration:** `--ports` (comma/range list) and `--profile` (quick/common/full)
+  resolve via `resolve_port_config` with precedence `--ports` > `--profile` > Quick default.
+  `Full` (1–65535) is reachable only by explicit selection. `PortConfig` defaults to the
+  Quick profile with a 300ms timeout (`DEFAULT_TIMEOUT`).
+- **Event emission:** a `PortDiscovered { ip, port, state }` event is emitted for every
+  probed port (open **and** closed), so the scanner reports the full picture even though
+  the TUI records only open ports in the OPEN PORTS column.
+- **TUI live port progress:** the TUI derives global port progress by counting
+  `PortDiscovered` events against `up_count() × ports_per_host` (passed in from `main` as
+  `port_config.ports.len()`). Because every `HostDiscovered` precedes every
+  `PortDiscovered`, `up_count()` is stable across the port phase and the total is exact.
+  The `Ports: probed/total` line appears once the first port is probed and stays accurate
+  through `Finished`/`Cancelled`.
+- **Reachability / warnings:** with the CLI wired (4.9), the TUI recording open ports
+  (4.10), and live port progress (4.11), `run_scan`, the `TcpPortScanner`/`PortScanner`
+  items, `Host::add_open_port`, the `ScanEvent::PortDiscovered` fields, and
+  `PortSpec::len` (consumed by `main` via `port_config.ports.len()`) are all
+  reachable/consumed. The TUI test module constructs `App` with struct-update syntax
+  (e.g. `App { hosts, ..Default::default() }`) so `cargo clippy --all-targets` is
+  warning-free.
+- **Verified:** `cargo fmt --check` (clean), `cargo check` (no warnings), `cargo test`
+  (110 passed), `cargo clippy --all-targets` (no warnings), `cargo build` (clean), and a
+  PTY smoke test scanning `127.0.0.1` (the open port is recorded in the OPEN PORTS column
+  and the live `Ports:` progress reaches `18/18`).
 
 ---
 
