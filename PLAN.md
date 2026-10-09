@@ -485,7 +485,7 @@ Results appear in the TUI while scanning.
 ## Tasks
 
 - [x]4.1 Port data model (`Port`, `PortState`, `PortError`), `Host.ports`, and the `ScanEvent::PortDiscovered` event.
-- [ ]4.2 `PortSpec` type + single-port parsing + `PortSpecError` + tests.
+- [x]4.2 `PortSpec` type + single-port parsing + `PortSpecError` + tests.
 - [ ]4.3 `PortSpec` range + mixed parsing, reversed-range normalization, `is_full` + tests.
 - [ ]4.4 `PortProfile` (Quick/Common/Full lists) + `PortConfig` + `Default` + re-exports.
 - [ ]4.5 `PortScanner` trait + `TcpPortScanner` (bounded worker pool, `connect_timeout`).
