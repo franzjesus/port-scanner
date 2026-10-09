@@ -500,15 +500,25 @@ Results appear in the TUI while scanning.
   - `discover` is now a thin wrapper: open socket → emit `Started` → `match sweep`
     → emit `Finished` on `Completed`. Behavior is identical (`discovers_localhost`
     still passes). The `Completed` payload is consumed by the 4.8 orchestrator.
-- [ ]4.8 `run_scan` orchestrator (discovery + ports, single `Started`/`Finished`).
+- [x]4.8 `run_scan` orchestrator (discovery + ports, single `Started`/`Finished`).
+  - Added `pub fn run_scan(target, discovery, ports, events, cancel)` in `scanner/mod.rs`.
+  - Opens the socket before announcing (so a socket failure is an `Error` event, not a
+    half-started scan), then emits one `Started{total}`.
+  - Calls `discovery::sweep`; on `Completed(up_hosts)` it port-scans each host via
+    `TcpPortScanner::scan` with a cooperative cancel check before each host, and one more
+    check after the loop so a cancel that landed during the final host reports `Cancelled`
+    rather than `Finished`. On `Cancelled` the sweep already reported it, so it stops.
+  - A loopback test asserts exactly one `Started`/`Finished` pair, the host up, and one
+    `PortDiscovered` per probed port.
 - [ ]4.9 CLI `--ports`/`--profile` (default Quick; Full requires explicit selection) wired into `main`.
 - [ ]4.10 TUI: record open ports on the host + OPEN PORTS column.
 - [ ]4.11 TUI: live port progress.
 - [ ]4.12 Update `PLAN.md`.
 
-Note: the port types introduced in 4.1 are not reachable from `main` until the CLI is
-wired (4.9) and the TUI consumes the events (4.10–4.11). Until then `cargo check`
-reports transient `dead_code` for those items; the phase completes with zero warnings.
+Note: the port types (4.1), the `TcpPortScanner`/`PortScanner` items (4.5), and the
+`run_scan` orchestrator (4.8) are not reachable from `main` until the CLI is wired (4.9)
+and the TUI consumes the events (4.10–4.11). Until then `cargo check` reports transient
+`dead_code` for those items; the phase completes with zero warnings.
 
 ---
 

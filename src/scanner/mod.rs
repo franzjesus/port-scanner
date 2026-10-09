@@ -11,7 +11,7 @@
 
 use std::fmt;
 use std::net::Ipv4Addr;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SendError, Sender};
 use std::sync::Arc;
 use std::time::Duration;
@@ -172,6 +172,73 @@ pub trait PortScanner {
     ) -> Result<(), ScanError>;
 }
 
+/// Run a full scan of `target`: discover which hosts are up, then port-scan
+/// every host that comes up.
+///
+/// This is the orchestrating entry point for a whole scan. A single run is
+/// framed by exactly one [`ScanEvent::Started`] / [`ScanEvent::Finished`] pair;
+/// discovery and port scanning stream their intermediate events
+/// ([`ScanEvent::HostDiscovered`], [`ScanEvent::Progress`],
+/// [`ScanEvent::PortDiscovered`]) inside that frame.
+///
+/// `discovery` tunes the ICMP probe stage and `ports` tunes the TCP port stage.
+///
+/// Cancellation is cooperative: when `cancel` is set, discovery stops (and
+/// reports [`ScanEvent::Cancelled`]) and no further hosts are port-scanned;
+/// in-flight connections are allowed to finish. Both normal completion and
+/// cancellation return `Ok(())` — only a fatal error returns `Err`.
+pub fn run_scan(
+    target: &ScanTarget,
+    discovery: &DiscoveryConfig,
+    ports: &PortConfig,
+    events: &Sender<ScanEvent>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(), ScanError> {
+    // Enumerate every address up front (bounded by MAX_SUBNET_SIZE) so the
+    // progress display has a stable total.
+    let addresses: Vec<Ipv4Addr> = target.iter().collect();
+    let total = addresses.len() as u64;
+
+    // Open the socket before announcing the scan so a socket failure is
+    // reported as an error event instead of a half-started scan.
+    let socket = match icmp::PingSocket::new() {
+        Ok(socket) => socket,
+        Err(e) => {
+            let err = ScanError::Socket(e.to_string());
+            let _ = events.send(ScanEvent::Error(err.clone()));
+            return Err(err);
+        }
+    };
+    let _ = events.send(ScanEvent::Started { total });
+
+    match discovery::sweep(&socket, &addresses, discovery, events, cancel)? {
+        discovery::SweepOutcome::Completed(up_hosts) => {
+            // Port-scan every host that came up. Cancellation is checked before
+            // starting each host so a cancelled scan stops scheduling new work.
+            for host in &up_hosts {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = events.send(ScanEvent::Cancelled);
+                    return Ok(());
+                }
+                if let Err(err) = TcpPortScanner.scan(host.ip, ports, events, cancel) {
+                    let _ = events.send(ScanEvent::Error(err.clone()));
+                    return Err(err);
+                }
+            }
+            // The last host's scan may have started before cancellation was
+            // requested; if so, report it rather than finishing normally.
+            if cancel.load(Ordering::Relaxed) {
+                let _ = events.send(ScanEvent::Cancelled);
+            } else {
+                let _ = events.send(ScanEvent::Finished);
+            }
+        }
+        // The sweep already emitted Cancelled; nothing further to report.
+        discovery::SweepOutcome::Cancelled => {}
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +309,93 @@ mod tests {
         let config = DiscoveryConfig::default();
         assert_eq!(config.timeout, Duration::from_millis(300));
         assert_eq!(config.concurrency, 128);
+    }
+
+    /// Runs a full scan against loopback and checks that the whole run — host
+    /// discovery plus port scanning — is framed by exactly one `Started` /
+    /// `Finished` pair, with the host reported up and every probed port
+    /// reported inside that frame.
+    ///
+    /// ICMP echo over an unprivileged datagram socket is not guaranteed on
+    /// every platform, so the test skips rather than failing when the socket
+    /// cannot be opened.
+    #[test]
+    fn run_scan_frames_the_whole_run_with_one_started_and_finished() {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        use crate::network::HostState;
+        use crate::ports::PortSpec;
+
+        // Bind a real listener on loopback for a guaranteed-open port and derive
+        // a guaranteed-closed port the same way the port-scan test does.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let open_port = listener.local_addr().expect("listener address").port();
+        let probe = TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+        let closed_port = probe.local_addr().expect("probe address").port();
+        drop(probe);
+
+        let target = ScanTarget::Host(Ipv4Addr::LOCALHOST);
+        let discovery = DiscoveryConfig::default();
+        let ports = PortConfig {
+            ports: PortSpec::from_port_numbers([open_port, closed_port]),
+            timeout: Duration::from_millis(500),
+            concurrency: 4,
+        };
+
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = run_scan(&target, &discovery, &ports, &tx, &cancel);
+        drop(tx);
+
+        // Skip in environments where ICMP is unavailable.
+        assert!(
+            result.is_ok(),
+            "ICMP echo unavailable in this environment; skipping: {:?}",
+            result.err()
+        );
+
+        let events: Vec<ScanEvent> = rx.try_iter().collect();
+
+        // Exactly one Started and one Finished, framing the whole run.
+        let started = events
+            .iter()
+            .filter(|e| matches!(e, ScanEvent::Started { .. }))
+            .count();
+        let finished = events
+            .iter()
+            .filter(|e| matches!(e, ScanEvent::Finished))
+            .count();
+        assert_eq!(started, 1, "expected exactly one Started: {events:?}");
+        assert_eq!(finished, 1, "expected exactly one Finished: {events:?}");
+
+        // The frame opens with Started and closes with Finished.
+        match &events.first() {
+            Some(ScanEvent::Started { total }) => assert_eq!(*total, 1),
+            other => panic!("expected Started first, got {other:?}"),
+        }
+        assert!(
+            matches!(events.last(), Some(ScanEvent::Finished)),
+            "expected Finished last: {events:?}"
+        );
+
+        // The loopback host is discovered up, inside the frame.
+        let host_up = events.iter().any(|e| match e {
+            ScanEvent::HostDiscovered(h) => {
+                h.ip == Ipv4Addr::LOCALHOST && matches!(h.state, HostState::Up)
+            }
+            _ => false,
+        });
+        assert!(host_up, "expected loopback host reported up: {events:?}");
+
+        // Every probed port is reported inside the frame.
+        let port_events = events
+            .iter()
+            .filter(|e| matches!(e, ScanEvent::PortDiscovered { .. }))
+            .count();
+        assert_eq!(
+            port_events, 2,
+            "expected one event per probed port: {events:?}"
+        );
     }
 }
