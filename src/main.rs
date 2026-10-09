@@ -129,7 +129,10 @@ async fn main() -> ExitCode {
         drop(sender);
     }
 
-    match tui::app::run(target, receiver, cancel) {
+    // The TUI derives live port progress from the number of ports it will
+    // probe per up host, so pass that count through from the resolved config.
+    let ports_per_host = port_config.ports.len();
+    match tui::app::run(target, ports_per_host, receiver, cancel) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("port-scanner: {err}");

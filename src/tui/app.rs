@@ -77,6 +77,11 @@ pub struct App {
     pub hosts: Vec<Host>,
     /// The current phase of the scan.
     pub scan: ScanState,
+    /// Number of TCP ports to probe on each up host, from the resolved port
+    /// configuration. Drives the live port-progress display.
+    pub ports_per_host: usize,
+    /// Number of ports probed so far, one per `PortDiscovered` event.
+    pub ports_probed: u64,
 }
 
 impl App {
@@ -86,6 +91,24 @@ impl App {
             .iter()
             .filter(|host| host.state == HostState::Up)
             .count()
+    }
+
+    /// Total number of TCP ports to probe across all up hosts: the up-host
+    /// count times the per-host port count. Stable once discovery has
+    /// finished, i.e. before the first port is probed.
+    pub fn ports_total(&self) -> u64 {
+        self.up_count() as u64 * self.ports_per_host as u64
+    }
+
+    /// Live port-progress text, present once at least one port has been
+    /// probed and there is a non-zero total to report against.
+    pub fn port_progress(&self) -> Option<String> {
+        let total = self.ports_total();
+        if self.ports_probed > 0 && total > 0 {
+            Some(format!("Ports: {}/{}", self.ports_probed, total))
+        } else {
+            None
+        }
     }
 
     /// Apply one scanner event to the application state.
@@ -109,9 +132,11 @@ impl App {
             ScanEvent::Cancelled => self.scan = ScanState::Cancelled,
             ScanEvent::PortDiscovered { ip, port, state } => {
                 // The scanner emits this for every probed port (open or closed);
-                // the TUI records only open ports on the matching host. A host is
-                // always discovered before its ports are probed, so it is already
-                // present here; a miss is simply ignored.
+                // count each one for live port progress, and record only open
+                // ports on the matching host. A host is always discovered before
+                // its ports are probed, so it is already present here; a miss is
+                // simply ignored.
+                self.ports_probed += 1;
                 if state == PortState::Open {
                     if let Some(host) = self.hosts.iter_mut().find(|h| h.ip == ip) {
                         host.add_open_port(port);
@@ -142,8 +167,12 @@ impl App {
 }
 
 /// Run the terminal UI until the user quits, then restore the terminal.
+///
+/// `ports_per_host` is the number of TCP ports the scanner will probe on each
+/// up host, used to derive the live port-progress display.
 pub fn run(
     target: Option<ScanTarget>,
+    ports_per_host: usize,
     events: Receiver<ScanEvent>,
     cancel: Arc<AtomicBool>,
 ) -> io::Result<()> {
@@ -155,6 +184,7 @@ pub fn run(
 
     let mut app = App {
         target,
+        ports_per_host,
         ..Default::default()
     };
     let result = run_loop(&mut terminal, &mut app, &events, &cancel);
@@ -231,11 +261,11 @@ fn draw(frame: &mut Frame, app: &App) {
     let status = Paragraph::new(app.scan.label()).alignment(Alignment::Right);
     frame.render_widget(status, title_chunks[1]);
 
-    let status_line = Paragraph::new(format!(
-        "Hosts: {} up / {} scanned",
-        app.up_count(),
-        app.hosts.len()
-    ));
+    let mut status_text = format!("Hosts: {} up / {} scanned", app.up_count(), app.hosts.len());
+    if let Some(progress) = app.port_progress() {
+        status_text.push_str(&format!("  {progress}"));
+    }
+    let status_line = Paragraph::new(status_text);
     frame.render_widget(status_line, chunks[1]);
 
     if app.target.is_some() {
@@ -321,10 +351,12 @@ mod tests {
 
     #[test]
     fn cancel_key_sets_flag_and_state_while_scanning() {
-        let mut app = App::default();
-        app.scan = ScanState::Scanning {
-            completed: 1,
-            total: 4,
+        let mut app = App {
+            scan: ScanState::Scanning {
+                completed: 1,
+                total: 4,
+            },
+            ..Default::default()
         };
         let cancel = AtomicBool::new(false);
         app.handle_key(KeyCode::Char('c'), &cancel);
@@ -474,6 +506,83 @@ mod tests {
     }
 
     #[test]
+    fn ports_total_is_up_hosts_times_ports_per_host() {
+        let app = App {
+            ports_per_host: 3,
+            hosts: vec![
+                Host::up("10.0.0.1".parse().unwrap(), Duration::from_millis(1)),
+                Host::down("10.0.0.2".parse().unwrap()),
+                Host::up("10.0.0.3".parse().unwrap(), Duration::from_millis(2)),
+            ],
+            ..Default::default()
+        };
+        // 2 up hosts × 3 ports each.
+        assert_eq!(app.ports_total(), 6);
+    }
+
+    #[test]
+    fn ports_total_is_zero_with_no_up_hosts() {
+        let app = App {
+            ports_per_host: 5,
+            hosts: vec![Host::down("10.0.0.2".parse().unwrap())],
+            ..Default::default()
+        };
+        assert_eq!(app.ports_total(), 0);
+    }
+
+    #[test]
+    fn port_progress_hidden_before_any_port_probed() {
+        let app = App {
+            ports_per_host: 3,
+            hosts: vec![Host::up(
+                "10.0.0.1".parse().unwrap(),
+                Duration::from_millis(1),
+            )],
+            ..Default::default()
+        };
+        assert_eq!(app.port_progress(), None);
+    }
+
+    #[test]
+    fn port_progress_counts_open_and_closed_ports() {
+        let ip = "10.0.0.1".parse::<Ipv4Addr>().unwrap();
+        let mut app = App {
+            ports_per_host: 4,
+            hosts: vec![Host::up(ip, Duration::from_millis(1))],
+            ..Default::default()
+        };
+        // 2 open + 1 closed = 3 probed out of 4.
+        app.apply_event(ScanEvent::PortDiscovered {
+            ip,
+            port: Port::new(22).unwrap(),
+            state: PortState::Open,
+        });
+        app.apply_event(ScanEvent::PortDiscovered {
+            ip,
+            port: Port::new(80).unwrap(),
+            state: PortState::Open,
+        });
+        app.apply_event(ScanEvent::PortDiscovered {
+            ip,
+            port: Port::new(23).unwrap(),
+            state: PortState::Closed,
+        });
+        assert_eq!(app.port_progress(), Some("Ports: 3/4".to_owned()));
+    }
+
+    #[test]
+    fn port_progress_hidden_when_total_is_zero() {
+        // No up hosts, so the total is 0; the display stays hidden even if a
+        // count were somehow present.
+        let app = App {
+            ports_per_host: 4,
+            ports_probed: 5,
+            ..Default::default()
+        };
+        assert_eq!(app.port_progress(), None);
+    }
+
+    #[test]
     fn format_open_ports_joins_and_shows_dash_when_empty() {
         assert_eq!(format_open_ports(&[]), "-");
         let ports = vec![
@@ -578,12 +687,14 @@ mod tests {
 
     #[test]
     fn up_count_counts_only_up_hosts() {
-        let mut app = App::default();
-        app.hosts = vec![
-            Host::up("10.0.0.1".parse().unwrap(), Duration::from_millis(1)),
-            Host::down("10.0.0.2".parse().unwrap()),
-            Host::up("10.0.0.3".parse().unwrap(), Duration::from_millis(2)),
-        ];
+        let app = App {
+            hosts: vec![
+                Host::up("10.0.0.1".parse().unwrap(), Duration::from_millis(1)),
+                Host::down("10.0.0.2".parse().unwrap()),
+                Host::up("10.0.0.3".parse().unwrap(), Duration::from_millis(2)),
+            ],
+            ..Default::default()
+        };
         assert_eq!(app.up_count(), 2);
     }
 }

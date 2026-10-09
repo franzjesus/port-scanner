@@ -534,15 +534,15 @@ Results appear in the TUI while scanning.
     `--ports` in the linear flow and passes the resolved `PortConfig` to `run_scan`.
     Also removes `PortSpec::is_full` (test-only, no Phase-4 consumer).
 - [x]4.10 TUI: record open ports on the host + OPEN PORTS column.
-- [ ]4.11 TUI: live port progress.
+- [x]4.11 TUI: live port progress.
 - [ ]4.12 Update `PLAN.md`.
 
-Note: with the CLI wired (4.9) and the TUI recording open ports (4.10), `run_scan`, the
-`TcpPortScanner`/`PortScanner` items, `Host::add_open_port`, and the
-`ScanEvent::PortDiscovered` fields are all reachable/consumed. The only remaining
-`dead_code` warning is the public `PortSpec::len` accessor (used by tests and by later
-TUI/export work). The zero-warning state is a phase-end property: it holds after
-4.11–4.12, not before.
+Note: with the CLI wired (4.9), the TUI recording open ports (4.10), and live port
+progress (4.11), `run_scan`, the `TcpPortScanner`/`PortScanner` items,
+`Host::add_open_port`, the `ScanEvent::PortDiscovered` fields, and `PortSpec::len`
+(consumed by `main` via `port_config.ports.len()`) are all reachable/consumed. The TUI
+test module constructs `App` with struct-update syntax (e.g. `App { hosts,
+..Default::default() }`) so `cargo clippy --all-targets` is warning-free.
 
 ---
 
