@@ -165,4 +165,56 @@ mod tests {
         assert_eq!(worker_count(64, 64), 64);
         assert_eq!(worker_count(50, 100), 50);
     }
+
+    #[test]
+    fn scan_reports_open_and_closed_ports_on_loopback() {
+        use std::collections::BTreeMap;
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        use crate::ports::PortSpec;
+
+        // Bind a real listener on loopback; the OS assigns a free ephemeral
+        // port. The kernel completes the TCP handshake for connects to a
+        // listening socket, so the port reads as open without anyone calling
+        // `accept`.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let open_port = listener.local_addr().expect("listener address").port();
+
+        // Bind and immediately drop a second listener to obtain a guaranteed-free
+        // port to probe as closed.
+        let probe = TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+        let closed_port = probe.local_addr().expect("probe address").port();
+        drop(probe);
+        assert_ne!(open_port, closed_port);
+
+        let ip = Ipv4Addr::LOCALHOST;
+        let config = PortConfig {
+            ports: PortSpec::from_port_numbers([open_port, closed_port]),
+            timeout: Duration::from_millis(500),
+            concurrency: 4,
+        };
+
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        TcpPortScanner
+            .scan(ip, &config, &tx, &cancel)
+            .expect("port scan should complete without error");
+
+        // Drop the original sender so the channel closes once every worker's
+        // clone is dropped (they all are, since `scan` joins every worker).
+        drop(tx);
+
+        let mut states: BTreeMap<u16, PortState> = BTreeMap::new();
+        for event in rx {
+            if let ScanEvent::PortDiscovered { port, state, .. } = event {
+                states.insert(port.as_u16(), state);
+            }
+        }
+
+        assert_eq!(states.len(), 2, "expected one event per probed port");
+        assert_eq!(states.get(&open_port), Some(&PortState::Open));
+        assert_eq!(states.get(&closed_port), Some(&PortState::Closed));
+    }
 }

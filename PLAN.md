@@ -489,7 +489,7 @@ Results appear in the TUI while scanning.
 - [x]4.3 `PortSpec` range + mixed parsing, reversed-range normalization, `is_full` + tests.
 - [x]4.4 `PortProfile` (Quick/Common/Full lists) + `PortConfig` + `Default` + re-exports.
 - [x]4.5 `PortScanner` trait + `TcpPortScanner` (bounded worker pool, `connect_timeout`).
-- [ ]4.6 `TcpPortScanner` integration test against a local listener (open + closed).
+- [x]4.6 `TcpPortScanner` integration test against a local listener (open + closed).
 - [ ]4.7 Refactor `IcmpDiscovery` to expose a reusable `sweep`.
 - [ ]4.8 `run_scan` orchestrator (discovery + ports, single `Started`/`Finished`).
 - [ ]4.9 CLI `--ports`/`--profile` (default Quick; Full requires explicit selection) wired into `main`.
