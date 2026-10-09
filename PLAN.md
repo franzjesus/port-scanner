@@ -490,7 +490,16 @@ Results appear in the TUI while scanning.
 - [x]4.4 `PortProfile` (Quick/Common/Full lists) + `PortConfig` + `Default` + re-exports.
 - [x]4.5 `PortScanner` trait + `TcpPortScanner` (bounded worker pool, `connect_timeout`).
 - [x]4.6 `TcpPortScanner` integration test against a local listener (open + closed).
-- [ ]4.7 Refactor `IcmpDiscovery` to expose a reusable `sweep`.
+- [x]4.7 Refactor `IcmpDiscovery` to expose a reusable `sweep`.
+  - Extracted the batched ICMP loop from `discover` into a `pub(crate)` free
+    function `sweep(socket, addresses, config, events, cancel)` in `discovery.rs`.
+    It owns the loop, `HostDiscovered`/`Progress` emission, `Cancelled` on cancel,
+    and the socket-error path; it never emits `Started`/`Finished`.
+  - Returns `SweepOutcome::Completed(Vec<Host>)` (up-hosts, arrival order) or
+    `SweepOutcome::Cancelled` (unit: the caller stops, so partial hosts are dropped).
+  - `discover` is now a thin wrapper: open socket → emit `Started` → `match sweep`
+    → emit `Finished` on `Completed`. Behavior is identical (`discovers_localhost`
+    still passes). The `Completed` payload is consumed by the 4.8 orchestrator.
 - [ ]4.8 `run_scan` orchestrator (discovery + ports, single `Started`/`Finished`).
 - [ ]4.9 CLI `--ports`/`--profile` (default Quick; Full requires explicit selection) wired into `main`.
 - [ ]4.10 TUI: record open ports on the host + OPEN PORTS column.

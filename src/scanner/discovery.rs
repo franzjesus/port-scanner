@@ -32,6 +32,16 @@
 //! A late reply for a host already marked down in an earlier window is ignored
 //! (the host is no longer in flight). This is an accepted limitation of the
 //! bounded-batch design.
+//!
+//! ## Reusable core
+//!
+//! The batched probe loop is factored out as [`sweep`]. It performs the probing
+//! and emits [`ScanEvent::HostDiscovered`] / [`ScanEvent::Progress`] (and
+//! [`ScanEvent::Cancelled`] on cancellation) but deliberately does **not** emit
+//! [`ScanEvent::Started`] or [`ScanEvent::Finished`]. [`IcmpDiscovery::discover`]
+//! is a thin wrapper that frames the sweep with that single pair of events; an
+//! orchestrating scan (Phase 4) can instead call [`sweep`] directly so a whole
+//! run — discovery plus ports — is framed by one pair.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -47,6 +57,109 @@ use crate::target::ScanTarget;
 
 /// Poll interval for the receive loop while waiting on a batch window.
 const RECV_CHUNK: Duration = Duration::from_millis(50);
+
+/// The outcome of a discovery sweep.
+///
+/// On completion it carries the hosts that came up, letting the caller act on
+/// them without re-deriving them from the event stream (for example, to
+/// port-scan them in Phase 4). On cancellation it carries nothing: the caller
+/// stops, so the partially resolved hosts are not needed.
+pub(crate) enum SweepOutcome {
+    /// Every address was resolved to a terminal state; the list holds the hosts
+    /// that came up.
+    Completed(Vec<Host>),
+    /// Cancellation was requested before the sweep finished.
+    Cancelled,
+}
+
+/// Run the batched ICMP probe loop over `addresses`.
+///
+/// This is the reusable core of [`IcmpDiscovery::discover`]. It performs the
+/// probing and emits [`ScanEvent::HostDiscovered`] and [`ScanEvent::Progress`]
+/// as hosts resolve, but it does **not** emit [`ScanEvent::Started`] or
+/// [`ScanEvent::Finished`], so an orchestrating scan can frame a whole run —
+/// discovery plus ports — with a single pair of those events.
+///
+/// On completion the returned [`SweepOutcome::Completed`] holds the hosts that
+/// came up. Cancellation is cooperative: when `cancel` is set, the sweep emits
+/// [`ScanEvent::Cancelled`] and returns [`SweepOutcome::Cancelled`].
+pub(crate) fn sweep(
+    socket: &PingSocket,
+    addresses: &[Ipv4Addr],
+    config: &DiscoveryConfig,
+    events: &Sender<ScanEvent>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<SweepOutcome, ScanError> {
+    let batch = config.concurrency.max(1);
+    let total = addresses.len() as u64;
+    let mut completed: u64 = 0;
+    let mut up_hosts: Vec<Host> = Vec::new();
+
+    for chunk in addresses.chunks(batch) {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = events.send(ScanEvent::Cancelled);
+            return Ok(SweepOutcome::Cancelled);
+        }
+
+        // Send one echo request per address in the batch, remembering when
+        // each was sent so replies can be timed.
+        let window_start = Instant::now();
+        let mut in_flight: HashMap<(Ipv4Addr, u16), Instant> = HashMap::with_capacity(chunk.len());
+        for (i, addr) in chunk.iter().enumerate() {
+            let seq = i as u16;
+            if let Err(e) = socket.send(*addr, seq) {
+                // A send failure is a system error, not a normal network
+                // condition; it aborts the scan.
+                let _ = events.send(ScanEvent::Error(ScanError::Socket(e.to_string())));
+                return Err(ScanError::Socket(e.to_string()));
+            }
+            in_flight.insert((*addr, seq), Instant::now());
+        }
+
+        // Receive until the window closes, resolving hosts that reply.
+        let deadline = window_start + config.timeout;
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                let _ = events.send(ScanEvent::Cancelled);
+                return Ok(SweepOutcome::Cancelled);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match socket.recv(remaining.min(RECV_CHUNK)) {
+                RecvResult::Reply { src, seq } => {
+                    // A reply only matters if it matches a probe we sent in
+                    // this batch; a late reply from an earlier batch is a
+                    // no-op.
+                    if let Some(sent_at) = in_flight.remove(&(src, seq)) {
+                        let latency = Instant::now().saturating_duration_since(sent_at);
+                        let host = Host::up(src, latency);
+                        let _ = events.send(ScanEvent::HostDiscovered(host.clone()));
+                        completed += 1;
+                        let _ = events.send(ScanEvent::Progress { completed, total });
+                        up_hosts.push(host);
+                    }
+                }
+                // `recv` folds all receive errors into these two variants,
+                // so there is no separate error arm here.
+                RecvResult::Other | RecvResult::Timeout => {}
+            }
+        }
+
+        // The window has closed: mark every host that never answered as
+        // down, in sorted IP order so the output is deterministic.
+        let mut down: Vec<Ipv4Addr> = in_flight.keys().map(|(ip, _)| *ip).collect();
+        down.sort();
+        for ip in down {
+            let _ = events.send(ScanEvent::HostDiscovered(Host::down(ip)));
+            completed += 1;
+            let _ = events.send(ScanEvent::Progress { completed, total });
+        }
+    }
+
+    Ok(SweepOutcome::Completed(up_hosts))
+}
 
 /// Resolves hosts by ICMP echo.
 ///
@@ -81,72 +194,16 @@ impl HostDiscovery for IcmpDiscovery {
         };
         let _ = events.send(ScanEvent::Started { total });
 
-        let batch = config.concurrency.max(1);
-        let mut completed: u64 = 0;
-
-        for chunk in addresses.chunks(batch) {
-            if cancel.load(Ordering::Relaxed) {
-                let _ = events.send(ScanEvent::Cancelled);
-                return Ok(());
+        // Run the reusable probe sweep. It emits HostDiscovered/Progress (and
+        // Cancelled on cancellation) but never Started/Finished, so this wrapper
+        // frames the run with exactly one pair of those events.
+        match sweep(&socket, &addresses, config, events, cancel)? {
+            SweepOutcome::Completed(_) => {
+                let _ = events.send(ScanEvent::Finished);
             }
-
-            // Send one echo request per address in the batch, remembering when
-            // each was sent so replies can be timed.
-            let window_start = Instant::now();
-            let mut in_flight: HashMap<(Ipv4Addr, u16), Instant> =
-                HashMap::with_capacity(chunk.len());
-            for (i, addr) in chunk.iter().enumerate() {
-                let seq = i as u16;
-                if let Err(e) = socket.send(*addr, seq) {
-                    // A send failure is a system error, not a normal network
-                    // condition; it aborts the scan.
-                    let _ = events.send(ScanEvent::Error(ScanError::Socket(e.to_string())));
-                    return Err(ScanError::Socket(e.to_string()));
-                }
-                in_flight.insert((*addr, seq), Instant::now());
-            }
-
-            // Receive until the window closes, resolving hosts that reply.
-            let deadline = window_start + config.timeout;
-            loop {
-                if cancel.load(Ordering::Relaxed) {
-                    let _ = events.send(ScanEvent::Cancelled);
-                    return Ok(());
-                }
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                match socket.recv(remaining.min(RECV_CHUNK)) {
-                    RecvResult::Reply { src, seq } => {
-                        // A reply only matters if it matches a probe we sent in
-                        // this batch; a late reply from an earlier batch is a
-                        // no-op.
-                        if let Some(sent_at) = in_flight.remove(&(src, seq)) {
-                            let latency = Instant::now().saturating_duration_since(sent_at);
-                            let _ = events.send(ScanEvent::HostDiscovered(Host::up(src, latency)));
-                            completed += 1;
-                            let _ = events.send(ScanEvent::Progress { completed, total });
-                        }
-                    }
-                    // `recv` folds all receive errors into these two variants,
-                    // so there is no separate error arm here.
-                    RecvResult::Other | RecvResult::Timeout => {}
-                }
-            }
-
-            // The window has closed: mark every host that never answered as
-            // down, in sorted IP order so the output is deterministic.
-            let mut down: Vec<Ipv4Addr> = in_flight.keys().map(|(ip, _)| *ip).collect();
-            down.sort();
-            for ip in down {
-                let _ = events.send(ScanEvent::HostDiscovered(Host::down(ip)));
-                completed += 1;
-                let _ = events.send(ScanEvent::Progress { completed, total });
-            }
+            // The sweep already emitted Cancelled; nothing further to report.
+            SweepOutcome::Cancelled => {}
         }
-
-        let _ = events.send(ScanEvent::Finished);
         Ok(())
     }
 }
