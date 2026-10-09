@@ -533,16 +533,16 @@ Results appear in the TUI while scanning.
     `--ports` > `--profile` > Quick default) + `PortProfile: FromStr`; `main` validates
     `--ports` in the linear flow and passes the resolved `PortConfig` to `run_scan`.
     Also removes `PortSpec::is_full` (test-only, no Phase-4 consumer).
-- [ ]4.10 TUI: record open ports on the host + OPEN PORTS column.
+- [x]4.10 TUI: record open ports on the host + OPEN PORTS column.
 - [ ]4.11 TUI: live port progress.
 - [ ]4.12 Update `PLAN.md`.
 
-Note: with the CLI wired (4.9), `run_scan`, the `TcpPortScanner`/`PortScanner` items, and
-the port types are all reachable from `main`. The remaining `dead_code` warnings are
-transient until the TUI consumes the events (4.10–4.11): `Host::add_open_port` and the
-`ScanEvent::PortDiscovered` fields (both consumed by the TUI in 4.10), plus the public
-`PortSpec::len` accessor (used by tests and by later TUI/export work). The zero-warning
-state is a phase-end property: it holds after 4.10–4.12, not before.
+Note: with the CLI wired (4.9) and the TUI recording open ports (4.10), `run_scan`, the
+`TcpPortScanner`/`PortScanner` items, `Host::add_open_port`, and the
+`ScanEvent::PortDiscovered` fields are all reachable/consumed. The only remaining
+`dead_code` warning is the public `PortSpec::len` accessor (used by tests and by later
+TUI/export work). The zero-warning state is a phase-end property: it holds after
+4.11–4.12, not before.
 
 ---
 

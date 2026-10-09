@@ -23,7 +23,7 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use crate::network::{Host, HostState};
+use crate::network::{Host, HostState, Port, PortState};
 use crate::scanner::ScanEvent;
 use crate::target::ScanTarget;
 
@@ -107,10 +107,16 @@ impl App {
             }
             ScanEvent::Finished => self.scan = ScanState::Finished,
             ScanEvent::Cancelled => self.scan = ScanState::Cancelled,
-            ScanEvent::PortDiscovered { .. } => {
-                // Port results are recorded and displayed by the TUI port view
-                // (Phase 4, host-details/open-ports task). Until then the event
-                // is acknowledged so the state machine stays exhaustive.
+            ScanEvent::PortDiscovered { ip, port, state } => {
+                // The scanner emits this for every probed port (open or closed);
+                // the TUI records only open ports on the matching host. A host is
+                // always discovered before its ports are probed, so it is already
+                // present here; a miss is simply ignored.
+                if state == PortState::Open {
+                    if let Some(host) = self.hosts.iter_mut().find(|h| h.ip == ip) {
+                        host.add_open_port(port);
+                    }
+                }
             }
             ScanEvent::Error(err) => self.scan = ScanState::Failed(err.to_string()),
         }
@@ -245,7 +251,7 @@ fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn host_table(app: &App) -> Table<'_> {
-    let header = Row::new(vec!["IP", "STATE", "LATENCY"])
+    let header = Row::new(vec!["IP", "STATE", "LATENCY", "OPEN PORTS"])
         .style(Style::default().add_modifier(Modifier::BOLD));
     let rows: Vec<Row> = app
         .hosts
@@ -255,6 +261,7 @@ fn host_table(app: &App) -> Table<'_> {
                 Cell::from(host.ip.to_string()),
                 Cell::from(host.state.to_string()),
                 Cell::from(format_latency(host.latency)),
+                Cell::from(format_open_ports(&host.ports)),
             ])
         })
         .collect();
@@ -262,6 +269,7 @@ fn host_table(app: &App) -> Table<'_> {
         [header].into_iter().chain(rows),
         [
             Constraint::Length(18),
+            Constraint::Length(10),
             Constraint::Length(12),
             Constraint::Min(10),
         ],
@@ -272,6 +280,20 @@ fn format_latency(latency: Option<Duration>) -> String {
     match latency {
         Some(latency) => format!("{:.1} ms", latency.as_secs_f64() * 1000.0),
         None => "-".to_owned(),
+    }
+}
+
+/// Render a host's open ports as a comma-separated list (`22,80,443`), or a
+/// dash when none have been found yet. Display-only; the structured data is
+/// the host's sorted `ports` list.
+fn format_open_ports(ports: &[Port]) -> String {
+    match ports.len() {
+        0 => "-".to_owned(),
+        _ => ports
+            .iter()
+            .map(Port::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
     }
 }
 
@@ -402,6 +424,64 @@ mod tests {
             app.hosts[0],
             Host::up("10.0.0.1".parse().unwrap(), Duration::from_millis(3))
         );
+    }
+
+    #[test]
+    fn port_discovered_open_records_port_on_matching_host() {
+        let mut app = App::default();
+        let ip = "10.0.0.1".parse::<Ipv4Addr>().unwrap();
+        app.apply_event(ScanEvent::HostDiscovered(Host::up(
+            ip,
+            Duration::from_millis(3),
+        )));
+        for (port, state) in [
+            (Port::new(443).unwrap(), PortState::Open),
+            (Port::new(22).unwrap(), PortState::Open),
+            (Port::new(80).unwrap(), PortState::Open),
+        ] {
+            app.apply_event(ScanEvent::PortDiscovered { ip, port, state });
+        }
+        let ports: Vec<u16> = app.hosts[0].ports.iter().map(Port::as_u16).collect();
+        // Recorded in arrival order, kept sorted by `add_open_port`.
+        assert_eq!(ports, vec![22, 80, 443]);
+    }
+
+    #[test]
+    fn port_discovered_closed_is_not_recorded() {
+        let mut app = App::default();
+        let ip = "10.0.0.1".parse::<Ipv4Addr>().unwrap();
+        app.apply_event(ScanEvent::HostDiscovered(Host::up(
+            ip,
+            Duration::from_millis(3),
+        )));
+        app.apply_event(ScanEvent::PortDiscovered {
+            ip,
+            port: Port::new(23).unwrap(),
+            state: PortState::Closed,
+        });
+        assert!(app.hosts[0].ports.is_empty());
+    }
+
+    #[test]
+    fn port_discovered_for_unknown_host_is_ignored() {
+        let mut app = App::default();
+        app.apply_event(ScanEvent::PortDiscovered {
+            ip: "10.9.9.9".parse().unwrap(),
+            port: Port::new(80).unwrap(),
+            state: PortState::Open,
+        });
+        assert!(app.hosts.is_empty());
+    }
+
+    #[test]
+    fn format_open_ports_joins_and_shows_dash_when_empty() {
+        assert_eq!(format_open_ports(&[]), "-");
+        let ports = vec![
+            Port::new(22).unwrap(),
+            Port::new(80).unwrap(),
+            Port::new(443).unwrap(),
+        ];
+        assert_eq!(format_open_ports(&ports), "22,80,443");
     }
 
     #[test]
