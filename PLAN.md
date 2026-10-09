@@ -353,6 +353,18 @@ Invalid targets produce clear errors without panicking.
 
 Implement the first real scanner.
 
+## Tasks
+
+- [x]3.1 Add `ScanTarget::iter()` / `ScanTargetIter` to enumerate every address in a target.
+- [x]3.2 Add the `network` module: the structured `Host` model and `HostState`.
+- [x]3.3 Add the `scanner` module: the `ScanEvent` and `ScanError` event models.
+- [x]3.4 Add `DiscoveryConfig` and the `HostDiscovery` abstraction.
+- [x]3.5 Add ICMP echo primitives (`PingSocket`) over unprivileged ping sockets.
+- [x]3.6 Add `IcmpDiscovery` with a batched, bounded-concurrency sweep and a localhost integration test.
+- [x]3.7 Rework the TUI `App` to consume scan events, track scan state, and render a live host table.
+- [x]3.8 Wire the scanner onto a background thread from `main`, with cancellation and a guaranteed terminal event.
+- [x]3.9 Update this plan and record implementation notes.
+
 ## Initial discovery strategy
 
 Start with a simple mechanism that works reliably in normal user environments.
@@ -363,18 +375,21 @@ Primary initial mechanism:
 
 Design discovery behind an abstraction so additional mechanisms can be added later.
 
-Conceptually:
+Implemented as (blocking, run on a dedicated thread — see the notes):
 
 ```
-trait HostDiscovery {
-    async fn discover(
+trait HostDiscovery: Send {
+    fn discover(
         &self,
-        target: ScanTarget,
-    ) -> Result<Vec<Host>, DiscoveryError>;
+        target: &ScanTarget,
+        config: &DiscoveryConfig,
+        events: &Sender<ScanEvent>,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<(), ScanError>;
 }
 ```
 
-The exact trait/API can be adapted to the selected networking libraries.
+The trait reports progress through `ScanEvent`s on the `events` channel (rather than returning a `Vec<Host>`), so results appear incrementally and cancellation can be checked between probes. It is intentionally blocking: the scanner runs on its own `std::thread`, which keeps the scanner decoupled from any async runtime and the TUI responsive.
 
 ## Requirements
 
@@ -397,6 +412,20 @@ Scanning:
 produces live hosts as they are discovered.
 
 The TUI remains responsive during the scan.
+
+Both acceptance criteria are met (verified by a PTY smoke test scanning `127.0.0.1`: the live host is discovered, the host table and `Hosts: 1 up / 1 scanned` status line render, the label transitions `SCANNING` → `FINISHED`, and the TUI stays responsive throughout).
+
+## Notes
+
+- **Discovery mechanism:** ICMP echo over an unprivileged ping socket (`SOCK_DGRAM`/`IPPROTO_ICMP` via `libc`), not a raw socket. This works without `CAP_NET_RAW`/root in normal user environments (verified here: `SOCK_DGRAM`/ICMP opens and replies on loopback; `SOCK_RAW`/ICMP fails with `EPERM`).
+- **Per-socket identifier:** for `SOCK_DGRAM` ICMP sockets the kernel assigns and manages the identifier itself, so replies are matched to a host by `(source address, sequence number)` only — no identifier filtering is needed. (The echo header layout is type, code, checksum (bytes 2–4), identifier (bytes 4–6), sequence (bytes 6–8); the checksum and identifier fields are adjacent and easy to confuse.)
+- **Concurrency model:** `IcmpDiscovery` collects the target's addresses into a `Vec` and sweeps them in `chunks(concurrency)` (default 128). Each batch sends all of its probes, then receives replies in `RECV_CHUNK = 50ms` steps until `timeout` (default 300ms) elapses from the batch start; any address still in flight at expiry is marked `Down`. Cancellation is checked before each batch and between receive chunks.
+- **Event emission:** a `HostDiscovered` event is emitted for every host (both `Up` and `Down`), followed by a `Progress` event, so the TUI can render the full host table and drive its progress count from `Progress` alone.
+- **`HostState` simplified to `Up`/`Down`:** Phase 3 needs only a liveness verdict (plus optional latency for `Up` hosts); richer states are not required yet.
+- **Known limitation:** a reply that arrives for a host already marked `Down` in an earlier window is ignored (it is no longer tracked as in flight). Acceptable for the initial mechanism.
+- **Terminal-event guarantee:** `discover` always emits exactly one terminal event (`Finished`, `Cancelled`, or `Error`). The socket-creation failure path was fixed to emit an `Error` event before returning `Err`, so the TUI never gets stuck in `Idle`.
+- **Scanner/TUI separation preserved:** the scanner runs on a dedicated `std::thread` and communicates only through the `ScanEvent` channel and the shared `AtomicBool` cancellation flag. No tokio tasks are used; tokio remains only the `#[tokio::main]` entry point.
+- **Verified:** `cargo fmt --check`, `cargo check` (no warnings), `cargo test` (51 tests, including the `IcmpDiscovery` localhost integration test), `cargo clippy` (clean), and PTY smoke tests for both the no-target path and a live `127.0.0.1` scan.
 
 ---
 
@@ -1047,13 +1076,13 @@ Implement in this order:
 
 - [x]Project bootstrap.
 - [x]CLI and target parsing.
-- [ ]Core network data structures.
-- [ ]Scanner event model.
-- [ ]Basic host discovery.
-- [ ]Async/concurrent scanning.
-- [ ]TUI application state.
-- [ ]Live scan progress.
-- [ ]Host list.
+- [x]Core network data structures.
+- [x]Scanner event model.
+- [x]Basic host discovery.
+- [x]Async/concurrent scanning.
+- [x]TUI application state.
+- [x]Live scan progress.
+- [x]Host list.
 - [ ]Host detail view.
 - [ ]TCP port scanning.
 - [ ]Port profiles.
