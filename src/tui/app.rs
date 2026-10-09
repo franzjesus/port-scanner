@@ -107,6 +107,11 @@ impl App {
             }
             ScanEvent::Finished => self.scan = ScanState::Finished,
             ScanEvent::Cancelled => self.scan = ScanState::Cancelled,
+            ScanEvent::PortDiscovered { .. } => {
+                // Port results are recorded and displayed by the TUI port view
+                // (Phase 4, host-details/open-ports task). Until then the event
+                // is acknowledged so the state machine stays exhaustive.
+            }
             ScanEvent::Error(err) => self.scan = ScanState::Failed(err.to_string()),
         }
     }

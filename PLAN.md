@@ -482,6 +482,20 @@ Given a live host, the scanner can report:
 
 Results appear in the TUI while scanning.
 
+## Tasks
+
+- [x]4.1 Port data model (`Port`, `PortState`, `PortError`), `Host.ports`, and the `ScanEvent::PortDiscovered` event.
+- [ ]4.2 Port spec parsing (`PortSpec::parse`), predefined profiles (Quick/Common/Full), and `PortConfig`.
+- [ ]4.3 TCP connect scanner: `PortScanner` trait + `TcpPortScanner` with a bounded worker pool and `connect_timeout`.
+- [ ]4.4 Scan orchestrator `run_scan` (single `Started`/`Finished`) reusing the discovery sweep.
+- [ ]4.5 CLI `--ports`/`--profile` (default Quick; Full requires explicit selection) wired into `main`.
+- [ ]4.6 TUI open-ports column, live `PortDiscovered` updates, and per-port progress.
+- [ ]4.7 Update `PLAN.md`.
+
+Note: the port types introduced in 4.1–4.4 are not yet reachable from `main` until the
+pipeline is wired (4.5) and the TUI consumes the events (4.6). Until then `cargo check`
+reports transient `dead_code` for those items; the phase completes with zero warnings.
+
 ---
 
 # 11\. Phase 5 — Scanner Configuration

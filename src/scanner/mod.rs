@@ -10,12 +10,13 @@
 //! out-of-band (see Phase 3 in `PLAN.md`).
 
 use std::fmt;
+use std::net::Ipv4Addr;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{SendError, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::network::Host;
+use crate::network::{Host, Port, PortState};
 use crate::target::ScanTarget;
 
 /// ICMP echo (ping) primitives used by host discovery.
@@ -43,6 +44,18 @@ pub enum ScanEvent {
     Started { total: u64 },
     /// A host has been resolved to a terminal state (up or down).
     HostDiscovered(Host),
+    /// A TCP port has been probed and its state determined (open or closed).
+    ///
+    /// Emitted for every probed port so the TUI can update its view
+    /// incrementally; the TUI stores only open ports on the host.
+    PortDiscovered {
+        /// The host the probed port belongs to.
+        ip: Ipv4Addr,
+        /// The probed port.
+        port: Port,
+        /// Whether the port is open or closed.
+        state: PortState,
+    },
     /// Progress update: `completed` hosts resolved out of `total`.
     Progress { completed: u64, total: u64 },
     /// The scan completed normally.
