@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::network::{Host, Port, PortState};
+use crate::ports::PortConfig;
 use crate::target::ScanTarget;
 
 /// ICMP echo (ping) primitives used by host discovery.
@@ -30,6 +31,12 @@ mod discovery;
 // Re-exported so the discovery entry point is reachable as
 // `scanner::IcmpDiscovery` from `main.rs`.
 pub use discovery::IcmpDiscovery;
+
+/// TCP port scanning for hosts found by discovery.
+mod ports;
+// Re-exported so the scanner entry point is reachable as
+// `scanner::TcpPortScanner` from `main.rs`.
+pub use ports::TcpPortScanner;
 
 /// A structured message produced by the scanner as a scan progresses.
 ///
@@ -133,6 +140,33 @@ pub trait HostDiscovery {
         &self,
         target: &ScanTarget,
         config: &DiscoveryConfig,
+        events: &Sender<ScanEvent>,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<(), ScanError>;
+}
+
+/// A mechanism for probing the TCP ports of a single host.
+///
+/// Implementations connect to every configured port concurrently (bounded by
+/// [`PortConfig::concurrency`]) and report the state of each probed port as a
+/// [`ScanEvent::PortDiscovered`] through the provided channel. Scanning is
+/// blocking: the call returns once every port has been probed or the scan was
+/// cancelled.
+///
+/// Unlike [`HostDiscovery`], this trait does not emit [`ScanEvent::Started`]
+/// or [`ScanEvent::Finished`]; a whole scan (discovery plus ports) is framed by
+/// a single pair of those events, owned by the orchestrating scan (see Phase 4
+/// in `PLAN.md`).
+pub trait PortScanner {
+    /// Probe the configured ports on `ip`, reporting each result through
+    /// `events`.
+    ///
+    /// `cancel` is checked before each new connection is started; when set, no
+    /// further ports are probed (in-flight connections are allowed to finish).
+    fn scan(
+        &self,
+        ip: Ipv4Addr,
+        config: &PortConfig,
         events: &Sender<ScanEvent>,
         cancel: &Arc<AtomicBool>,
     ) -> Result<(), ScanError>;
