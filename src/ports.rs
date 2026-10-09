@@ -22,10 +22,11 @@ pub struct PortSpec(BTreeSet<Port>);
 impl PortSpec {
     /// Parse a user-supplied port specification.
     ///
-    /// Accepted forms: a single port (`22`) or a comma-separated list of single
-    /// ports (`22,80,443`). Surrounding whitespace around each item is ignored
-    /// and duplicate ports are collapsed. Ranges (`8000-8100`) are not accepted
-    /// yet (see `PLAN.md`, Phase 4).
+    /// Accepted forms: a single port (`22`), a comma-separated list of ports
+    /// (`22,80,443`), an inclusive range (`8000-8100`), and any mix of the
+    /// three (`22,80,8000-8100`). Surrounding whitespace around each item is
+    /// ignored, duplicate ports are collapsed, and a reversed range
+    /// (`8100-8000`) is normalized to ascending order.
     pub fn parse(input: &str) -> Result<Self, PortSpecError> {
         let input = input.trim();
         if input.is_empty() {
@@ -34,14 +35,17 @@ impl PortSpec {
 
         let mut ports = BTreeSet::new();
         for item in input.split(',') {
-            ports.insert(Self::parse_single(input, item)?);
+            for port in Self::parse_item(input, item)? {
+                ports.insert(port);
+            }
         }
 
         Ok(Self(ports))
     }
 
-    /// Parse a single port item (a run of digits) into a [`Port`].
-    fn parse_single(input: &str, item: &str) -> Result<Port, PortSpecError> {
+    /// Parse one comma-separated item: a single port (`22`) or an inclusive
+    /// range (`8000-8100`), returning the ports it denotes.
+    fn parse_item(input: &str, item: &str) -> Result<Vec<Port>, PortSpecError> {
         let item = item.trim();
         if item.is_empty() {
             return Err(PortSpecError::Parse {
@@ -50,18 +54,57 @@ impl PortSpec {
             });
         }
 
-        // A value that is either not a `u16` or outside 1–65535 is reported
-        // with the same message: in either case it is "not a valid port".
-        let port = item
+        // A single port has no dash; a range has exactly one dash with two
+        // non-empty ends. Two or more dashes (or an empty end) is malformed.
+        let mut parts = item.splitn(3, '-');
+        let low = parts.next().expect("splitn always yields a first part");
+        let high = parts.next();
+        let extra = parts.next();
+
+        match (high, extra) {
+            (None, None) => Ok(vec![Self::parse_port_value(input, low)?]),
+            (Some(high), None) if !low.trim().is_empty() && !high.trim().is_empty() => {
+                let low = Self::parse_port_value(input, low)?;
+                let high = Self::parse_port_value(input, high)?;
+                Ok(Self::expand_range(low, high))
+            }
+            _ => Err(PortSpecError::Parse {
+                input: input.to_owned(),
+                reason: format!(
+                    "'{item}' is not a valid port or range (expected e.g. 22 or 8000-8100)"
+                ),
+            }),
+        }
+    }
+
+    /// Parse a single numeric token into a [`Port`].
+    ///
+    /// A value that is either not a `u16` or outside 1–65535 is reported with
+    /// the same message: in either case it is "not a valid port".
+    fn parse_port_value(input: &str, token: &str) -> Result<Port, PortSpecError> {
+        let token = token.trim();
+        token
             .parse::<u16>()
             .ok()
             .and_then(|value| Port::new(value).ok())
             .ok_or_else(|| PortSpecError::Parse {
                 input: input.to_owned(),
-                reason: format!("'{item}' is not a valid port (expected 1-65535)"),
-            })?;
+                reason: format!("'{token}' is not a valid port (expected 1-65535)"),
+            })
+    }
 
-        Ok(port)
+    /// Expand an inclusive `[low, high]` pair into the ports it covers.
+    ///
+    /// A reversed range is normalized so the result is always ascending:
+    /// `8100-8000` yields the same ports as `8000-8100`. Both ends are already
+    /// validated to lie in 1–65535, so every value in between is a valid port.
+    fn expand_range(mut low: Port, mut high: Port) -> Vec<Port> {
+        if low.as_u16() > high.as_u16() {
+            std::mem::swap(&mut low, &mut high);
+        }
+        (low.as_u16()..=high.as_u16())
+            .map(|value| Port::new(value).expect("both ends were validated to 1-65535"))
+            .collect()
     }
 
     /// Number of distinct ports in the spec.
@@ -75,6 +118,15 @@ impl PortSpec {
     /// Iterate over the ports in ascending order.
     pub fn iter(&self) -> impl Iterator<Item = Port> + '_ {
         self.0.iter().copied()
+    }
+
+    /// Whether the spec covers every TCP port (1–65535).
+    ///
+    /// Because every stored port lies in 1–65535, there are at most 65535
+    /// distinct values a spec can hold; a spec whose length is 65535 therefore
+    /// necessarily contains the entire range.
+    pub fn is_full(&self) -> bool {
+        self.0.len() == 65535
     }
 }
 
@@ -235,11 +287,60 @@ mod tests {
         }
     }
 
+    // --- ranges -------------------------------------------------------------
+
     #[test]
-    fn rejects_ranges_not_supported_yet() {
-        // Range syntax is introduced in Phase 4, task 4.3.
-        let err = parse_err("8000-8100");
-        assert!(matches!(err, PortSpecError::Parse { .. }));
+    fn parses_a_range() {
+        let spec = parse_ok("8000-8002");
+        assert_eq!(ports_of(&spec), vec![8000, 8001, 8002]);
+    }
+
+    #[test]
+    fn parses_a_range_with_whitespace_around_the_dash() {
+        let spec = parse_ok("8000 - 8002");
+        assert_eq!(ports_of(&spec), vec![8000, 8001, 8002]);
+    }
+
+    #[test]
+    fn parses_a_degenerate_range_as_a_single_port() {
+        let spec = parse_ok("8000-8000");
+        assert_eq!(ports_of(&spec), vec![8000]);
+    }
+
+    #[test]
+    fn normalizes_a_reversed_range() {
+        let spec = parse_ok("8002-8000");
+        assert_eq!(ports_of(&spec), vec![8000, 8001, 8002]);
+    }
+
+    #[test]
+    fn parses_a_mixed_list_and_range() {
+        let spec = parse_ok("22,80,8000-8001,443");
+        assert_eq!(ports_of(&spec), vec![22, 80, 443, 8000, 8001]);
+    }
+
+    #[test]
+    fn dedupes_overlap_between_a_port_and_a_range() {
+        let spec = parse_ok("22,22-24");
+        assert_eq!(ports_of(&spec), vec![22, 23, 24]);
+    }
+
+    #[test]
+    fn is_full_for_the_entire_range() {
+        assert!(!parse_ok("1-65534").is_full());
+        assert!(parse_ok("1-65535").is_full());
+        assert!(!parse_ok("22,443").is_full());
+    }
+
+    #[test]
+    fn rejects_malformed_ranges() {
+        for input in ["8000-", "-8000", "8000-8001-8002", "8000--8001"] {
+            let err = parse_err(input);
+            assert!(
+                matches!(err, PortSpecError::Parse { .. }),
+                "expected Parse error for '{input}', got {err:?}"
+            );
+        }
     }
 
     // --- error messages -----------------------------------------------------
@@ -261,6 +362,12 @@ mod tests {
         assert!(
             err.to_string().contains("stray comma"),
             "message should explain the stray comma: {err}"
+        );
+
+        let err = parse_err("8000-");
+        assert!(
+            err.to_string().contains("8000-"),
+            "message should echo the malformed range: {err}"
         );
     }
 }
