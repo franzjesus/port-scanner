@@ -11,6 +11,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::str::FromStr;
 use std::time::Duration;
 
 use crate::network::Port;
@@ -150,15 +151,6 @@ impl PortSpec {
     pub fn iter(&self) -> impl Iterator<Item = Port> + '_ {
         self.0.iter().copied()
     }
-
-    /// Whether the spec covers every TCP port (1–65535).
-    ///
-    /// Because every stored port lies in 1–65535, there are at most 65535
-    /// distinct values a spec can hold; a spec whose length is 65535 therefore
-    /// necessarily contains the entire range.
-    pub fn is_full(&self) -> bool {
-        self.0.len() == 65535
-    }
 }
 
 impl fmt::Display for PortSpec {
@@ -238,6 +230,45 @@ impl PortProfile {
     }
 }
 
+/// Errors that can occur while parsing a [`PortProfile`] name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortProfileError {
+    /// The input did not name a known profile.
+    UnknownProfile {
+        /// The original (trimmed) input, for a helpful error message.
+        input: String,
+    },
+}
+
+impl fmt::Display for PortProfileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PortProfileError::UnknownProfile { input } => write!(
+                f,
+                "unknown port profile '{input}' (expected quick, common, or full)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PortProfileError {}
+
+impl FromStr for PortProfile {
+    type Err = PortProfileError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let trimmed = s.trim();
+        match trimmed.to_ascii_lowercase().as_str() {
+            "quick" => Ok(Self::Quick),
+            "common" => Ok(Self::Common),
+            "full" => Ok(Self::Full),
+            _ => Err(PortProfileError::UnknownProfile {
+                input: trimmed.to_owned(),
+            }),
+        }
+    }
+}
+
 /// Ports probed by [`PortProfile::Quick`]: a small, fast set of the most
 /// commonly exposed services.
 const QUICK_PORTS: [u16; 18] = [
@@ -297,7 +328,7 @@ const COMMON_MISC: [u16; 22] = [
 /// Bundles which ports to probe ([`PortConfig::ports`]), how long to wait for
 /// each connection ([`PortConfig::timeout`]), and how many to probe in
 /// parallel per host ([`PortConfig::concurrency`]).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortConfig {
     /// The set of ports to probe on each live host.
     pub ports: PortSpec,
@@ -474,13 +505,6 @@ mod tests {
     }
 
     #[test]
-    fn is_full_for_the_entire_range() {
-        assert!(!parse_ok("1-65534").is_full());
-        assert!(parse_ok("1-65535").is_full());
-        assert!(!parse_ok("22,443").is_full());
-    }
-
-    #[test]
     fn rejects_malformed_ranges() {
         for input in ["8000-", "-8000", "8000-8001-8002", "8000--8001"] {
             let err = parse_err(input);
@@ -560,7 +584,6 @@ mod tests {
     #[test]
     fn full_profile_covers_every_port() {
         let spec = PortProfile::Full.ports();
-        assert!(spec.is_full());
         assert_eq!(spec.len(), 65535);
     }
 
@@ -574,6 +597,49 @@ mod tests {
             "Quick ({quick}) should be < Common ({common})"
         );
         assert!(common < full, "Common ({common}) should be < Full ({full})");
+    }
+
+    // --- profile name parsing ------------------------------------------------
+
+    #[test]
+    fn profile_names_parse_case_insensitively() {
+        assert_eq!("quick".parse::<PortProfile>().unwrap(), PortProfile::Quick);
+        assert_eq!("Quick".parse::<PortProfile>().unwrap(), PortProfile::Quick);
+        assert_eq!("QUICK".parse::<PortProfile>().unwrap(), PortProfile::Quick);
+        assert_eq!(
+            "common".parse::<PortProfile>().unwrap(),
+            PortProfile::Common
+        );
+        assert_eq!("FULL".parse::<PortProfile>().unwrap(), PortProfile::Full);
+    }
+
+    #[test]
+    fn profile_names_trimm_surrounding_whitespace() {
+        assert_eq!(
+            "  common  ".parse::<PortProfile>().unwrap(),
+            PortProfile::Common
+        );
+    }
+
+    #[test]
+    fn unknown_profile_name_is_rejected() {
+        let err = "turbo".parse::<PortProfile>().unwrap_err();
+        assert!(matches!(
+            err,
+            PortProfileError::UnknownProfile { ref input } if input == "turbo"
+        ));
+        assert_eq!(
+            err.to_string(),
+            "unknown port profile 'turbo' (expected quick, common, or full)"
+        );
+    }
+
+    #[test]
+    fn empty_profile_name_is_rejected() {
+        assert!(matches!(
+            " ".parse::<PortProfile>(),
+            Err(PortProfileError::UnknownProfile { .. })
+        ));
     }
 
     // --- configuration ------------------------------------------------------

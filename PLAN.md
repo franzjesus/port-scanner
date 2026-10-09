@@ -423,7 +423,7 @@ Both acceptance criteria are met (verified by a PTY smoke test scanning `127.0.0
 - **Event emission:** a `HostDiscovered` event is emitted for every host (both `Up` and `Down`), followed by a `Progress` event, so the TUI can render the full host table and drive its progress count from `Progress` alone.
 - **`HostState` simplified to `Up`/`Down`:** Phase 3 needs only a liveness verdict (plus optional latency for `Up` hosts); richer states are not required yet.
 - **Known limitation:** a reply that arrives for a host already marked `Down` in an earlier window is ignored (it is no longer tracked as in flight). Acceptable for the initial mechanism.
-- **Terminal-event guarantee:** `discover` always emits exactly one terminal event (`Finished`, `Cancelled`, or `Error`). The socket-creation failure path was fixed to emit an `Error` event before returning `Err`, so the TUI never gets stuck in `Idle`.
+- **Terminal-event guarantee:** a single scan run emits exactly one terminal event (`Finished`, `Cancelled`, or `Error`); the socket-creation failure path emits an `Error` before returning `Err`, so the TUI never gets stuck in `Idle`. In Phase 3 this was owned by `discover`; since 4.9b the guarantee is owned by the `run_scan` orchestrator, and `discover`/`sweep` are the unframed core (they emit no `Started`/`Finished`; `sweep` may still emit a mid-sweep `Cancelled`).
 - **Scanner/TUI separation preserved:** the scanner runs on a dedicated `std::thread` and communicates only through the `ScanEvent` channel and the shared `AtomicBool` cancellation flag. No tokio tasks are used; tokio remains only the `#[tokio::main]` entry point.
 - **Verified:** `cargo fmt --check`, `cargo check` (no warnings), `cargo test` (51 tests, including the `IcmpDiscovery` localhost integration test), `cargo clippy` (clean), and PTY smoke tests for both the no-target path and a live `127.0.0.1` scan.
 
@@ -486,7 +486,7 @@ Results appear in the TUI while scanning.
 
 - [x]4.1 Port data model (`Port`, `PortState`, `PortError`), `Host.ports`, and the `ScanEvent::PortDiscovered` event.
 - [x]4.2 `PortSpec` type + single-port parsing + `PortSpecError` + tests.
-- [x]4.3 `PortSpec` range + mixed parsing, reversed-range normalization, `is_full` + tests.
+- [x]4.3 `PortSpec` range + mixed parsing, reversed-range normalization, + tests. (The `is_full` helper added here was removed in 4.9c: it was test-only with no Phase-4 consumer.)
 - [x]4.4 `PortProfile` (Quick/Common/Full lists) + `PortConfig` + `Default` + re-exports.
 - [x]4.5 `PortScanner` trait + `TcpPortScanner` (bounded worker pool, `connect_timeout`).
 - [x]4.6 `TcpPortScanner` integration test against a local listener (open + closed).
@@ -495,11 +495,13 @@ Results appear in the TUI while scanning.
     function `sweep(socket, addresses, config, events, cancel)` in `discovery.rs`.
     It owns the loop, `HostDiscovered`/`Progress` emission, `Cancelled` on cancel,
     and the socket-error path; it never emits `Started`/`Finished`.
-  - Returns `SweepOutcome::Completed(Vec<Host>)` (up-hosts, arrival order) or
-    `SweepOutcome::Cancelled` (unit: the caller stops, so partial hosts are dropped).
-  - `discover` is now a thin wrapper: open socket → emit `Started` → `match sweep`
-    → emit `Finished` on `Completed`. Behavior is identical (`discovers_localhost`
-    still passes). The `Completed` payload is consumed by the 4.8 orchestrator.
+  - Returns `DiscoveryOutcome::Completed(Vec<Host>)` (up-hosts, arrival order) or
+    `DiscoveryOutcome::Cancelled` (unit: the caller stops, so partial hosts are dropped).
+    (Renamed from `SweepOutcome` in 4.9a; now `pub` and re-exported from `scanner`.)
+  - `discover` is now the unframed core: it opens the raw ICMP socket, runs `sweep`,
+    and returns `Result<DiscoveryOutcome, ScanError>`. The run framing (`Started` and
+    the terminal `Finished`/`Cancelled`) is owned by `run_scan` (4.8/4.9b), not by
+    `discover` (`discovers_localhost` still passes).
 - [x]4.8 `run_scan` orchestrator (discovery + ports, single `Started`/`Finished`).
   - Added `pub fn run_scan(target, discovery, ports, events, cancel)` in `scanner/mod.rs`.
   - Opens the socket before announcing (so a socket failure is an `Error` event, not a
@@ -510,15 +512,21 @@ Results appear in the TUI while scanning.
     rather than `Finished`. On `Cancelled` the sweep already reported it, so it stops.
   - A loopback test asserts exactly one `Started`/`Finished` pair, the host up, and one
     `PortDiscovered` per probed port.
-- [ ]4.9 CLI `--ports`/`--profile` (default Quick; Full requires explicit selection) wired into `main`.
-  - Split into three commit-ready sub-tasks; each keeps the app compiling and working.
+  - (4.9b) `run_scan` is now the generic 7-arg orchestrator; it no longer opens the socket
+    or calls `sweep` directly — `discover` opens the socket and runs `sweep`, and `run_scan`
+    calls `discover` then port-scans via `P`. The single-`Started`/`Finished` framing above
+    still holds, but is now owned by `run_scan` alone.
+- [x]4.9 CLI `--ports`/`--profile` (default Quick; Full requires explicit selection) wired into `main`.
+  - Split into three commit-ready sub-tasks (4.9a/b/c), each committed separately so the app
+    kept compiling and working at every step.
   - 4.9a `refactor(scanner)`: `discover` returns `Result<DiscoveryOutcome, ScanError>`
     (renames `SweepOutcome` → `pub enum DiscoveryOutcome`, re-exported from `scanner/mod.rs`);
     `discover` still opens the socket, emits `Started`, and emits `Finished`/`Cancelled`, and
     `run_scan`'s match arms are renamed. `main.rs` untouched (the TUI still gets `Finished`).
   - 4.9b `refactor(scanner)`: `run_scan<D: HostDiscovery, P: PortScanner>` becomes a 7-arg
     orchestrator (calls `discovery.discover()`, port-scans each host, emits the terminal
-    `Finished`/`Cancelled` itself); `discover` drops `Finished`/`Cancelled`; `main` is rewired
+    `Finished`/`Cancelled` itself); `discover` drops `Started` and `Finished` (now the
+    unframed core returning `Result<DiscoveryOutcome, ScanError>`); `main` is rewired
     to `run_scan(..., &IcmpDiscovery, &PortConfig::default(), &TcpPortScanner, ...)`, so the
     app actually port-scans while the TUI still receives its `Finished`.
   - 4.9c `feat(cli)`: `--ports`/`--profile` flags + `resolve_port_config` (precedence
@@ -529,10 +537,12 @@ Results appear in the TUI while scanning.
 - [ ]4.11 TUI: live port progress.
 - [ ]4.12 Update `PLAN.md`.
 
-Note: the port types (4.1), the `TcpPortScanner`/`PortScanner` items (4.5), and the
-`run_scan` orchestrator (4.8) are not reachable from `main` until the CLI is wired (4.9)
-and the TUI consumes the events (4.10–4.11). Until then `cargo check` reports transient
-`dead_code` for those items; the phase completes with zero warnings.
+Note: with the CLI wired (4.9), `run_scan`, the `TcpPortScanner`/`PortScanner` items, and
+the port types are all reachable from `main`. The remaining `dead_code` warnings are
+transient until the TUI consumes the events (4.10–4.11): `Host::add_open_port` and the
+`ScanEvent::PortDiscovered` fields (both consumed by the TUI in 4.10), plus the public
+`PortSpec::len` accessor (used by tests and by later TUI/export work). The zero-warning
+state is a phase-end property: it holds after 4.10–4.12, not before.
 
 ---
 
