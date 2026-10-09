@@ -10,7 +10,8 @@ use std::sync::{mpsc, Arc};
 
 use clap::Parser;
 
-use crate::scanner::{DiscoveryConfig, HostDiscovery, IcmpDiscovery, ScanEvent};
+use crate::ports::PortConfig;
+use crate::scanner::{run_scan, DiscoveryConfig, IcmpDiscovery, ScanEvent, TcpPortScanner};
 use crate::target::ScanTarget;
 
 /// PORT-SCANNER — interactive terminal network exploration.
@@ -56,8 +57,17 @@ async fn main() -> ExitCode {
         let target = target.clone();
         let cancel = cancel.clone();
         std::thread::spawn(move || {
-            let config = DiscoveryConfig::default();
-            let _ = IcmpDiscovery.discover(&target, &config, &sender, &cancel);
+            let discovery_config = DiscoveryConfig::default();
+            let port_config = PortConfig::default();
+            let _ = run_scan(
+                &target,
+                &IcmpDiscovery,
+                &discovery_config,
+                &port_config,
+                &TcpPortScanner,
+                &sender,
+                &cancel,
+            );
         });
     } else {
         drop(sender);

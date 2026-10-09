@@ -181,10 +181,9 @@ impl HostDiscovery for IcmpDiscovery {
         // Enumerate every address up front (bounded by MAX_SUBNET_SIZE) so the
         // batch loop can index and count them.
         let addresses: Vec<Ipv4Addr> = target.iter().collect();
-        let total = addresses.len() as u64;
 
-        // Open the socket before announcing the scan so a socket failure is
-        // reported as an error event instead of a half-started scan.
+        // Open the socket before any probe so a socket failure is reported as
+        // an error event instead of a half-started scan.
         let socket = match PingSocket::new() {
             Ok(socket) => socket,
             Err(e) => {
@@ -193,19 +192,11 @@ impl HostDiscovery for IcmpDiscovery {
                 return Err(err);
             }
         };
-        let _ = events.send(ScanEvent::Started { total });
 
         // Run the reusable probe sweep. It emits HostDiscovered/Progress (and
-        // Cancelled on cancellation) but never Started/Finished, so this wrapper
-        // frames the run with exactly one pair of those events.
-        match sweep(&socket, &addresses, config, events, cancel)? {
-            DiscoveryOutcome::Completed(hosts) => {
-                let _ = events.send(ScanEvent::Finished);
-                Ok(DiscoveryOutcome::Completed(hosts))
-            }
-            // The sweep already emitted Cancelled; nothing further to report.
-            DiscoveryOutcome::Cancelled => Ok(DiscoveryOutcome::Cancelled),
-        }
+        // Cancelled on cancellation) but never Started/Finished; the scan
+        // orchestrator frames the whole run with exactly one pair of those.
+        sweep(&socket, &addresses, config, events, cancel)
     }
 }
 
@@ -241,13 +232,13 @@ mod tests {
         };
 
         let events: Vec<ScanEvent> = rx.try_iter().collect();
-        assert_eq!(events.len(), 4, "unexpected event sequence: {events:?}");
+
+        // `discover` is the unframed core: it emits no Started/Finished, only
+        // the discovered host and a progress report (framing is owned by
+        // `run_scan`).
+        assert_eq!(events.len(), 2, "unexpected event sequence: {events:?}");
 
         match &events[0] {
-            ScanEvent::Started { total } => assert_eq!(*total, 1),
-            other => panic!("expected Started, got {other:?}"),
-        }
-        match &events[1] {
             ScanEvent::HostDiscovered(host) => {
                 assert_eq!(host.ip, Ipv4Addr::LOCALHOST);
                 assert!(matches!(host.state, HostState::Up));
@@ -255,14 +246,13 @@ mod tests {
             }
             other => panic!("expected HostDiscovered, got {other:?}"),
         }
-        match &events[2] {
+        match &events[1] {
             ScanEvent::Progress { completed, total } => {
                 assert_eq!(*completed, 1);
                 assert_eq!(*total, 1);
             }
             other => panic!("expected Progress, got {other:?}"),
         }
-        assert!(matches!(&events[3], ScanEvent::Finished));
 
         // The returned outcome carries the same up host that was emitted, so an
         // orchestrator can act on it without re-deriving it from the event

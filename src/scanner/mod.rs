@@ -133,6 +133,12 @@ impl Default for DiscoveryConfig {
 /// results as [`ScanEvent`]s through the provided channel. Discovery is
 /// blocking: the call returns once the target has been fully probed, the
 /// scan was cancelled, or a fatal error occurred.
+///
+/// `discover` is the unframed core of a scan: it emits
+/// [`ScanEvent::HostDiscovered`], [`ScanEvent::Progress`], and (on
+/// cancellation) [`ScanEvent::Cancelled`], but not [`ScanEvent::Started`] or
+/// [`ScanEvent::Finished`]. A whole run is framed by a single pair of those
+/// events, owned by the orchestrating [`run_scan`] (see Phase 4 in `PLAN.md`).
 pub trait HostDiscovery {
     /// Probe `target`, reporting discovered hosts and progress through
     /// `events`.
@@ -186,42 +192,36 @@ pub trait PortScanner {
 /// every host that comes up.
 ///
 /// This is the orchestrating entry point for a whole scan. A single run is
-/// framed by exactly one [`ScanEvent::Started`] / [`ScanEvent::Finished`] pair;
-/// discovery and port scanning stream their intermediate events
-/// ([`ScanEvent::HostDiscovered`], [`ScanEvent::Progress`],
-/// [`ScanEvent::PortDiscovered`]) inside that frame.
+/// framed by exactly one [`ScanEvent::Started`] / [`ScanEvent::Finished`] (or
+/// [`ScanEvent::Cancelled`]) pair; the discovery and port-scanning stages stream
+/// their intermediate events ([`ScanEvent::HostDiscovered`],
+/// [`ScanEvent::Progress`], [`ScanEvent::PortDiscovered`]) inside that frame.
 ///
-/// `discovery` tunes the ICMP probe stage and `ports` tunes the TCP port stage.
+/// The discovery and port-scanning mechanisms are supplied as traits so this
+/// orchestrator stays independent of any concrete implementation.
+/// `discovery_config` tunes the host-discovery stage and `port_config` tunes
+/// the TCP port stage.
 ///
 /// Cancellation is cooperative: when `cancel` is set, discovery stops (and
 /// reports [`ScanEvent::Cancelled`]) and no further hosts are port-scanned;
 /// in-flight connections are allowed to finish. Both normal completion and
 /// cancellation return `Ok(())` — only a fatal error returns `Err`.
-pub fn run_scan(
+pub fn run_scan<D: HostDiscovery, P: PortScanner>(
     target: &ScanTarget,
-    discovery: &DiscoveryConfig,
-    ports: &PortConfig,
+    discovery: &D,
+    discovery_config: &DiscoveryConfig,
+    port_config: &PortConfig,
+    port_scanner: &P,
     events: &Sender<ScanEvent>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(), ScanError> {
-    // Enumerate every address up front (bounded by MAX_SUBNET_SIZE) so the
-    // progress display has a stable total.
-    let addresses: Vec<Ipv4Addr> = target.iter().collect();
-    let total = addresses.len() as u64;
+    // Count the addresses (bounded by MAX_SUBNET_SIZE) so the progress display
+    // has a stable total; the discovery stage enumerates them itself.
+    let total = target.iter().count() as u64;
 
-    // Open the socket before announcing the scan so a socket failure is
-    // reported as an error event instead of a half-started scan.
-    let socket = match icmp::PingSocket::new() {
-        Ok(socket) => socket,
-        Err(e) => {
-            let err = ScanError::Socket(e.to_string());
-            let _ = events.send(ScanEvent::Error(err.clone()));
-            return Err(err);
-        }
-    };
     let _ = events.send(ScanEvent::Started { total });
 
-    match discovery::sweep(&socket, &addresses, discovery, events, cancel)? {
+    match discovery.discover(target, discovery_config, events, cancel)? {
         DiscoveryOutcome::Completed(up_hosts) => {
             // Port-scan every host that came up. Cancellation is checked before
             // starting each host so a cancelled scan stops scheduling new work.
@@ -230,7 +230,7 @@ pub fn run_scan(
                     let _ = events.send(ScanEvent::Cancelled);
                     return Ok(());
                 }
-                if let Err(err) = TcpPortScanner.scan(host.ip, ports, events, cancel) {
+                if let Err(err) = port_scanner.scan(host.ip, port_config, events, cancel) {
                     let _ = events.send(ScanEvent::Error(err.clone()));
                     return Err(err);
                 }
@@ -243,7 +243,7 @@ pub fn run_scan(
                 let _ = events.send(ScanEvent::Finished);
             }
         }
-        // The sweep already emitted Cancelled; nothing further to report.
+        // Discovery already emitted Cancelled; nothing further to report.
         DiscoveryOutcome::Cancelled => {}
     }
     Ok(())
@@ -355,7 +355,15 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        let result = run_scan(&target, &discovery, &ports, &tx, &cancel);
+        let result = run_scan(
+            &target,
+            &IcmpDiscovery,
+            &discovery,
+            &ports,
+            &TcpPortScanner,
+            &tx,
+            &cancel,
+        );
         drop(tx);
 
         // Skip in environments where ICMP is unavailable.
