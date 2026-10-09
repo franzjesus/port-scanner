@@ -485,15 +485,20 @@ Results appear in the TUI while scanning.
 ## Tasks
 
 - [x]4.1 Port data model (`Port`, `PortState`, `PortError`), `Host.ports`, and the `ScanEvent::PortDiscovered` event.
-- [ ]4.2 Port spec parsing (`PortSpec::parse`), predefined profiles (Quick/Common/Full), and `PortConfig`.
-- [ ]4.3 TCP connect scanner: `PortScanner` trait + `TcpPortScanner` with a bounded worker pool and `connect_timeout`.
-- [ ]4.4 Scan orchestrator `run_scan` (single `Started`/`Finished`) reusing the discovery sweep.
-- [ ]4.5 CLI `--ports`/`--profile` (default Quick; Full requires explicit selection) wired into `main`.
-- [ ]4.6 TUI open-ports column, live `PortDiscovered` updates, and per-port progress.
-- [ ]4.7 Update `PLAN.md`.
+- [ ]4.2 `PortSpec` type + single-port parsing + `PortSpecError` + tests.
+- [ ]4.3 `PortSpec` range + mixed parsing, reversed-range normalization, `is_full` + tests.
+- [ ]4.4 `PortProfile` (Quick/Common/Full lists) + `PortConfig` + `Default` + re-exports.
+- [ ]4.5 `PortScanner` trait + `TcpPortScanner` (bounded worker pool, `connect_timeout`).
+- [ ]4.6 `TcpPortScanner` integration test against a local listener (open + closed).
+- [ ]4.7 Refactor `IcmpDiscovery` to expose a reusable `sweep`.
+- [ ]4.8 `run_scan` orchestrator (discovery + ports, single `Started`/`Finished`).
+- [ ]4.9 CLI `--ports`/`--profile` (default Quick; Full requires explicit selection) wired into `main`.
+- [ ]4.10 TUI: record open ports on the host + OPEN PORTS column.
+- [ ]4.11 TUI: live port progress.
+- [ ]4.12 Update `PLAN.md`.
 
-Note: the port types introduced in 4.1–4.4 are not yet reachable from `main` until the
-pipeline is wired (4.5) and the TUI consumes the events (4.6). Until then `cargo check`
+Note: the port types introduced in 4.1 are not reachable from `main` until the CLI is
+wired (4.9) and the TUI consumes the events (4.10–4.11). Until then `cargo check`
 reports transient `dead_code` for those items; the phase completes with zero warnings.
 
 ---
