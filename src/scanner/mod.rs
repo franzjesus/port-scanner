@@ -18,6 +18,12 @@ use std::time::Duration;
 use crate::network::Host;
 use crate::target::ScanTarget;
 
+/// ICMP echo (ping) primitives used by host discovery.
+///
+/// Kept private to the scanner module: it exposes only the low-level socket
+/// mechanics, while the discovery layer decides how those probes are scheduled.
+mod icmp;
+
 /// A structured message produced by the scanner as a scan progresses.
 ///
 /// Events flow from the scanner (on a background thread) to the TUI through a

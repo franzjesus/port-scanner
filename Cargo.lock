@@ -400,6 +400,7 @@ dependencies = [
  "clap",
  "crossterm",
  "ipnet",
+ "libc",
  "ratatui",
  "tokio",
 ]
