@@ -9,6 +9,7 @@ use std::sync::{mpsc, Arc};
 
 use clap::Parser;
 
+use crate::scanner::{DiscoveryConfig, HostDiscovery, IcmpDiscovery, ScanEvent};
 use crate::target::ScanTarget;
 
 /// PORT-SCANNER — interactive terminal network exploration.
@@ -42,12 +43,24 @@ async fn main() -> ExitCode {
         None => None,
     };
 
-    // The TUI always consumes scan events through a channel. The scanner
-    // thread that feeds it is wired up in a later task; until then the
-    // sender is dropped so the channel is disconnected from the start.
-    let (sender, receiver) = mpsc::channel();
-    drop(sender);
+    // The scanner runs on a dedicated background thread and reports progress
+    // to the TUI through this channel; cancellation is shared through the
+    // `cancel` flag. The sender handle is either moved into the scanner
+    // thread (so the channel disconnects when the scan finishes) or dropped
+    // up front when there is nothing to scan.
+    let (sender, receiver) = mpsc::channel::<ScanEvent>();
     let cancel = Arc::new(AtomicBool::new(false));
+
+    if let Some(target) = &target {
+        let target = target.clone();
+        let cancel = cancel.clone();
+        std::thread::spawn(move || {
+            let config = DiscoveryConfig::default();
+            let _ = IcmpDiscovery.discover(&target, &config, &sender, &cancel);
+        });
+    } else {
+        drop(sender);
+    }
 
     match tui::app::run(target, receiver, cancel) {
         Ok(()) => ExitCode::SUCCESS,

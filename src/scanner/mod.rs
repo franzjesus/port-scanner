@@ -27,10 +27,7 @@ mod icmp;
 /// Host discovery mechanisms built on the ICMP primitives above.
 mod discovery;
 // Re-exported so the discovery entry point is reachable as
-// `scanner::IcmpDiscovery`; `main.rs` starts consuming it in the scan-wiring
-// task. The `#[allow(unused_imports)]` is only needed until then: the
-// re-export is not yet referenced by any non-test code.
-#[allow(unused_imports)]
+// `scanner::IcmpDiscovery` from `main.rs`.
 pub use discovery::IcmpDiscovery;
 
 /// A structured message produced by the scanner as a scan progresses.

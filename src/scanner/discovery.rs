@@ -71,7 +71,14 @@ impl HostDiscovery for IcmpDiscovery {
 
         // Open the socket before announcing the scan so a socket failure is
         // reported as an error event instead of a half-started scan.
-        let socket = PingSocket::new().map_err(|e| ScanError::Socket(e.to_string()))?;
+        let socket = match PingSocket::new() {
+            Ok(socket) => socket,
+            Err(e) => {
+                let err = ScanError::Socket(e.to_string());
+                let _ = events.send(ScanEvent::Error(err.clone()));
+                return Err(err);
+            }
+        };
         let _ = events.send(ScanEvent::Started { total });
 
         let batch = config.concurrency.max(1);
