@@ -64,7 +64,8 @@ const RECV_CHUNK: Duration = Duration::from_millis(50);
 /// them without re-deriving them from the event stream (for example, to
 /// port-scan them in Phase 4). On cancellation it carries nothing: the caller
 /// stops, so the partially resolved hosts are not needed.
-pub(crate) enum SweepOutcome {
+#[derive(Debug)]
+pub enum DiscoveryOutcome {
     /// Every address was resolved to a terminal state; the list holds the hosts
     /// that came up.
     Completed(Vec<Host>),
@@ -80,16 +81,16 @@ pub(crate) enum SweepOutcome {
 /// [`ScanEvent::Finished`], so an orchestrating scan can frame a whole run —
 /// discovery plus ports — with a single pair of those events.
 ///
-/// On completion the returned [`SweepOutcome::Completed`] holds the hosts that
+/// On completion the returned [`DiscoveryOutcome::Completed`] holds the hosts that
 /// came up. Cancellation is cooperative: when `cancel` is set, the sweep emits
-/// [`ScanEvent::Cancelled`] and returns [`SweepOutcome::Cancelled`].
+/// [`ScanEvent::Cancelled`] and returns [`DiscoveryOutcome::Cancelled`].
 pub(crate) fn sweep(
     socket: &PingSocket,
     addresses: &[Ipv4Addr],
     config: &DiscoveryConfig,
     events: &Sender<ScanEvent>,
     cancel: &Arc<AtomicBool>,
-) -> Result<SweepOutcome, ScanError> {
+) -> Result<DiscoveryOutcome, ScanError> {
     let batch = config.concurrency.max(1);
     let total = addresses.len() as u64;
     let mut completed: u64 = 0;
@@ -98,7 +99,7 @@ pub(crate) fn sweep(
     for chunk in addresses.chunks(batch) {
         if cancel.load(Ordering::Relaxed) {
             let _ = events.send(ScanEvent::Cancelled);
-            return Ok(SweepOutcome::Cancelled);
+            return Ok(DiscoveryOutcome::Cancelled);
         }
 
         // Send one echo request per address in the batch, remembering when
@@ -121,7 +122,7 @@ pub(crate) fn sweep(
         loop {
             if cancel.load(Ordering::Relaxed) {
                 let _ = events.send(ScanEvent::Cancelled);
-                return Ok(SweepOutcome::Cancelled);
+                return Ok(DiscoveryOutcome::Cancelled);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -158,7 +159,7 @@ pub(crate) fn sweep(
         }
     }
 
-    Ok(SweepOutcome::Completed(up_hosts))
+    Ok(DiscoveryOutcome::Completed(up_hosts))
 }
 
 /// Resolves hosts by ICMP echo.
@@ -176,7 +177,7 @@ impl HostDiscovery for IcmpDiscovery {
         config: &DiscoveryConfig,
         events: &Sender<ScanEvent>,
         cancel: &Arc<AtomicBool>,
-    ) -> Result<(), ScanError> {
+    ) -> Result<DiscoveryOutcome, ScanError> {
         // Enumerate every address up front (bounded by MAX_SUBNET_SIZE) so the
         // batch loop can index and count them.
         let addresses: Vec<Ipv4Addr> = target.iter().collect();
@@ -198,13 +199,13 @@ impl HostDiscovery for IcmpDiscovery {
         // Cancelled on cancellation) but never Started/Finished, so this wrapper
         // frames the run with exactly one pair of those events.
         match sweep(&socket, &addresses, config, events, cancel)? {
-            SweepOutcome::Completed(_) => {
+            DiscoveryOutcome::Completed(hosts) => {
                 let _ = events.send(ScanEvent::Finished);
+                Ok(DiscoveryOutcome::Completed(hosts))
             }
             // The sweep already emitted Cancelled; nothing further to report.
-            SweepOutcome::Cancelled => {}
+            DiscoveryOutcome::Cancelled => Ok(DiscoveryOutcome::Cancelled),
         }
-        Ok(())
     }
 }
 
@@ -231,12 +232,13 @@ mod tests {
         let result = IcmpDiscovery.discover(&target, &config, &tx, &cancel);
         drop(tx);
 
-        // Skip in environments where ICMP is unavailable.
-        assert!(
-            result.is_ok(),
-            "ICMP echo unavailable in this environment; skipping: {:?}",
-            result.err()
-        );
+        // ICMP echo over an unprivileged datagram socket is not guaranteed on
+        // every platform (some sandboxes or hosts block it), so the test
+        // reports a clear message when it is unavailable.
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(err) => panic!("ICMP echo unavailable in this environment: {err:?}"),
+        };
 
         let events: Vec<ScanEvent> = rx.try_iter().collect();
         assert_eq!(events.len(), 4, "unexpected event sequence: {events:?}");
@@ -261,5 +263,18 @@ mod tests {
             other => panic!("expected Progress, got {other:?}"),
         }
         assert!(matches!(&events[3], ScanEvent::Finished));
+
+        // The returned outcome carries the same up host that was emitted, so an
+        // orchestrator can act on it without re-deriving it from the event
+        // stream.
+        match &outcome {
+            DiscoveryOutcome::Completed(hosts) => {
+                assert_eq!(hosts.len(), 1, "expected one up host: {hosts:?}");
+                assert_eq!(hosts[0].ip, Ipv4Addr::LOCALHOST);
+                assert!(matches!(hosts[0].state, HostState::Up));
+                assert!(hosts[0].latency.is_some());
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
     }
 }

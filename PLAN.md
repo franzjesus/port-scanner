@@ -511,6 +511,20 @@ Results appear in the TUI while scanning.
   - A loopback test asserts exactly one `Started`/`Finished` pair, the host up, and one
     `PortDiscovered` per probed port.
 - [ ]4.9 CLI `--ports`/`--profile` (default Quick; Full requires explicit selection) wired into `main`.
+  - Split into three commit-ready sub-tasks; each keeps the app compiling and working.
+  - 4.9a `refactor(scanner)`: `discover` returns `Result<DiscoveryOutcome, ScanError>`
+    (renames `SweepOutcome` → `pub enum DiscoveryOutcome`, re-exported from `scanner/mod.rs`);
+    `discover` still opens the socket, emits `Started`, and emits `Finished`/`Cancelled`, and
+    `run_scan`'s match arms are renamed. `main.rs` untouched (the TUI still gets `Finished`).
+  - 4.9b `refactor(scanner)`: `run_scan<D: HostDiscovery, P: PortScanner>` becomes a 7-arg
+    orchestrator (calls `discovery.discover()`, port-scans each host, emits the terminal
+    `Finished`/`Cancelled` itself); `discover` drops `Finished`/`Cancelled`; `main` is rewired
+    to `run_scan(..., &IcmpDiscovery, &PortConfig::default(), &TcpPortScanner, ...)`, so the
+    app actually port-scans while the TUI still receives its `Finished`.
+  - 4.9c `feat(cli)`: `--ports`/`--profile` flags + `resolve_port_config` (precedence
+    `--ports` > `--profile` > Quick default) + `PortProfile: FromStr`; `main` validates
+    `--ports` in the linear flow and passes the resolved `PortConfig` to `run_scan`.
+    Also removes `PortSpec::is_full` (test-only, no Phase-4 consumer).
 - [ ]4.10 TUI: record open ports on the host + OPEN PORTS column.
 - [ ]4.11 TUI: live port progress.
 - [ ]4.12 Update `PLAN.md`.

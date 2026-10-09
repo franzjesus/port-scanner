@@ -31,6 +31,9 @@ mod discovery;
 // Re-exported so the discovery entry point is reachable as
 // `scanner::IcmpDiscovery` from `main.rs`.
 pub use discovery::IcmpDiscovery;
+// Re-exported so the discovery outcome is reachable as
+// `scanner::DiscoveryOutcome`.
+pub use discovery::DiscoveryOutcome;
 
 /// TCP port scanning for hosts found by discovery.
 mod ports;
@@ -136,13 +139,20 @@ pub trait HostDiscovery {
     ///
     /// `cancel` is checked periodically; when set, discovery stops promptly
     /// without marking in-flight hosts down.
+    ///
+    /// Returns an error only for hard failures (e.g. the socket could not be
+    /// opened); normal network conditions (timeouts, no responses) are not
+    /// errors. On success the returned [`DiscoveryOutcome`] carries the up
+    /// hosts (or `Cancelled` if cancellation was requested), so the
+    /// orchestrator can drive port scanning without re-deriving the host list
+    /// from the event stream.
     fn discover(
         &self,
         target: &ScanTarget,
         config: &DiscoveryConfig,
         events: &Sender<ScanEvent>,
         cancel: &Arc<AtomicBool>,
-    ) -> Result<(), ScanError>;
+    ) -> Result<DiscoveryOutcome, ScanError>;
 }
 
 /// A mechanism for probing the TCP ports of a single host.
@@ -212,7 +222,7 @@ pub fn run_scan(
     let _ = events.send(ScanEvent::Started { total });
 
     match discovery::sweep(&socket, &addresses, discovery, events, cancel)? {
-        discovery::SweepOutcome::Completed(up_hosts) => {
+        DiscoveryOutcome::Completed(up_hosts) => {
             // Port-scan every host that came up. Cancellation is checked before
             // starting each host so a cancelled scan stops scheduling new work.
             for host in &up_hosts {
@@ -234,7 +244,7 @@ pub fn run_scan(
             }
         }
         // The sweep already emitted Cancelled; nothing further to report.
-        discovery::SweepOutcome::Cancelled => {}
+        DiscoveryOutcome::Cancelled => {}
     }
     Ok(())
 }
