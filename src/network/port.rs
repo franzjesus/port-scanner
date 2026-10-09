@@ -18,7 +18,7 @@ impl Port {
 
     /// Create a [`Port`] from a `u16`, rejecting values outside 1–65535.
     pub fn new(value: u16) -> Result<Self, PortError> {
-        if value < Self::MIN || value > Self::MAX {
+        if !(Self::MIN..=Self::MAX).contains(&value) {
             Err(PortError::InvalidPort(value))
         } else {
             Ok(Self(value))
