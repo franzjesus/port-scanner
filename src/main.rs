@@ -14,7 +14,7 @@ use crate::ports::{
     PortConfig, PortProfile, PortProfileError, PortSpec, PortSpecError, DEFAULT_CONCURRENCY,
     DEFAULT_TIMEOUT,
 };
-use crate::scanner::{run_scan, IcmpDiscovery, ScanConfig, ScanEvent, TcpPortScanner};
+use crate::scanner::{run_scan, IcmpDiscovery, ScanConfig, ScanEvent, ScanSpawner, TcpPortScanner};
 use crate::target::ScanTarget;
 
 /// PORT-SCANNER — interactive terminal network exploration.
@@ -72,6 +72,27 @@ fn resolve_port_config(
     })
 }
 
+/// Build a spawner that runs a scan on a dedicated background thread (Phase 10).
+///
+/// The TUI calls this spawner for every scan — the initial one and each
+/// rescan — so all scans go through the same code path. Each spawned thread
+/// receives its own clone of the master sender; the master sender itself stays
+/// alive for the lifetime of the TUI, so the event channel never disconnects
+/// mid-session.
+fn build_spawner() -> ScanSpawner {
+    Box::new(|config, master_tx, cancel| {
+        std::thread::spawn(move || {
+            let _ = run_scan(
+                &config,
+                &IcmpDiscovery,
+                &TcpPortScanner,
+                &master_tx,
+                &cancel,
+            );
+        });
+    })
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -101,32 +122,33 @@ async fn main() -> ExitCode {
         }
     };
 
-    // The scanner runs on a dedicated background thread and reports progress
-    // to the TUI through this channel; cancellation is shared through the
-    // `cancel` flag. The sender handle is either moved into the scanner
-    // thread (so the channel disconnects when the scan finishes) or dropped
-    // up front when there is nothing to scan.
-    let (sender, receiver) = mpsc::channel::<ScanEvent>();
-    let cancel = Arc::new(AtomicBool::new(false));
-
-    if let Some(target) = &target {
-        // The discovery stage keeps its defaults; only the port set (and its
-        // bounds) come from the CLI. The config is moved into the scanner
-        // thread below.
+    // Build the scan configuration up front when a target was given; the
+    // discovery stage keeps its defaults and only the port set comes from the
+    // CLI. The TUI launches the scan itself through the spawner (Phase 10).
+    let config = target.as_ref().map(|target| {
         let mut config = ScanConfig::new(target.clone());
         config.ports = port_config.clone();
-        let cancel = cancel.clone();
-        std::thread::spawn(move || {
-            let _ = run_scan(&config, &IcmpDiscovery, &TcpPortScanner, &sender, &cancel);
-        });
-    } else {
-        drop(sender);
-    }
+        config
+    });
+
+    // The scanner reports structured events through this channel; the TUI
+    // keeps the master sender alive for its whole lifetime so rescans can
+    // reuse the channel. Cancellation is shared through the `cancel` flag.
+    let (master_tx, events) = mpsc::channel::<ScanEvent>();
+    let cancel = Arc::new(AtomicBool::new(false));
 
     // The TUI derives live port progress from the number of ports it will
     // probe per up host, so pass that count through from the resolved config.
     let ports_per_host = port_config.ports.len();
-    match tui::app::run(target, ports_per_host, receiver, cancel) {
+    match tui::app::run(
+        target,
+        ports_per_host,
+        config,
+        build_spawner(),
+        master_tx,
+        events,
+        cancel,
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("port-scanner: {err}");

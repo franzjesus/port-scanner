@@ -11,7 +11,7 @@
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,7 +30,7 @@ use ratatui::{
 };
 
 use crate::network::{Host, HostState, PortState, ProbedPort};
-use crate::scanner::ScanEvent;
+use crate::scanner::{ScanConfig, ScanEvent, ScanSpawner};
 use crate::target::ScanTarget;
 
 /// The phase of the scan, as tracked by the TUI.
@@ -42,14 +42,18 @@ pub enum ScanState {
     /// No scan has been started yet.
     #[default]
     Idle,
-    /// A scan is running; counts come from progress events.
-    Scanning { completed: u64, total: u64 },
+    /// A scan was requested and the worker has not reported back yet.
+    Starting,
+    /// Host discovery is running; counts come from progress events.
+    Discovering { completed: u64, total: u64 },
+    /// Discovery is done and TCP ports are being probed.
+    ScanningPorts,
     /// The scan completed normally.
-    Finished,
+    Completed,
     /// The user cancelled the scan; the TUI stays open.
     Cancelled,
-    /// The scan failed; holds the error message.
-    Failed(String),
+    /// The scan failed; the message lives in [`App::scan_error`].
+    Error,
 }
 
 impl ScanState {
@@ -58,18 +62,23 @@ impl ScanState {
     pub fn label(&self) -> String {
         match self {
             ScanState::Idle => String::new(),
-            ScanState::Scanning { completed, total } => {
-                let percent = if *total > 0 {
-                    completed * 100 / total
-                } else {
-                    0
-                };
-                format!("SCANNING {percent}%")
-            }
-            ScanState::Finished => "FINISHED".to_owned(),
+            ScanState::Starting => "STARTING".to_owned(),
+            ScanState::Discovering { .. } => "DISCOVERING".to_owned(),
+            ScanState::ScanningPorts => "SCANNING PORTS".to_owned(),
+            ScanState::Completed => "COMPLETED".to_owned(),
             ScanState::Cancelled => "CANCELLED".to_owned(),
-            ScanState::Failed(_) => "FAILED".to_owned(),
+            ScanState::Error => "ERROR".to_owned(),
         }
+    }
+
+    /// True while a scan is actively running (starting, discovering, or
+    /// scanning ports). Terminal states (`Completed`, `Cancelled`, `Error`)
+    /// and `Idle` are not active.
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self,
+            ScanState::Starting | ScanState::Discovering { .. } | ScanState::ScanningPorts
+        )
     }
 }
 
@@ -83,6 +92,11 @@ pub struct App {
     pub hosts: Vec<Host>,
     /// The current phase of the scan.
     pub scan: ScanState,
+    /// The error message for the most recent failed scan, if any.
+    ///
+    /// Set when a `ScanEvent::Error` arrives (Phase 10) and cleared whenever a
+    /// new scan is started.
+    pub scan_error: Option<String>,
     /// Number of TCP ports to probe on each up host, from the resolved port
     /// configuration. Drives the live port-progress display.
     pub ports_per_host: usize,
@@ -125,6 +139,12 @@ pub struct App {
     /// `Esc` (cancel). While set, every key goes to [`App::handle_filter_input`]
     /// instead of the overview handlers.
     filter_mode: bool,
+    /// Whether a rescan has been requested with `r` and is waiting to be
+    /// started by the event loop (Phase 10).
+    ///
+    /// Set by `r` when no scan is active; the event loop consumes the flag and
+    /// starts a new scan on the next iteration.
+    rescan_requested: bool,
 }
 
 impl App {
@@ -216,10 +236,18 @@ impl App {
     }
 
     /// Apply one scanner event to the application state.
+    ///
+    /// This is the single place scan-state transitions happen (Phase 10):
+    /// `Starting` (set by the TUI when a scan is spawned) advances to
+    /// `Discovering` on `Started`, then to `ScanningPorts` on the first
+    /// `PortDiscovered`, and finally to a terminal state on `Finished`,
+    /// `Cancelled`, or `Error`.
     pub fn apply_event(&mut self, event: ScanEvent) {
         match event {
             ScanEvent::Started { total } => {
-                self.scan = ScanState::Scanning {
+                // Discovery begins: record the total host count and the start
+                // instant for elapsed/duration tracking.
+                self.scan = ScanState::Discovering {
                     completed: 0,
                     total,
                 };
@@ -229,13 +257,21 @@ impl App {
                 self.hosts.push(host);
             }
             ScanEvent::Progress { completed, total } => {
-                if matches!(self.scan, ScanState::Scanning { .. }) {
-                    self.scan = ScanState::Scanning { completed, total };
+                // Discovery progress only updates the `Discovering` counts; once
+                // port scanning has started the progress is derived from
+                // `ports_probed` instead.
+                if matches!(self.scan, ScanState::Discovering { .. }) {
+                    self.scan = ScanState::Discovering { completed, total };
                 }
             }
-            ScanEvent::Finished => self.end_scan(ScanState::Finished),
+            ScanEvent::Finished => self.end_scan(ScanState::Completed),
             ScanEvent::Cancelled => self.end_scan(ScanState::Cancelled),
             ScanEvent::PortDiscovered { ip, port, state } => {
+                // The first probed port marks the transition from discovery to
+                // port scanning.
+                if matches!(self.scan, ScanState::Discovering { .. }) {
+                    self.scan = ScanState::ScanningPorts;
+                }
                 // The scanner emits this for every probed port (open or closed);
                 // count each one for live port progress and record each probed
                 // port with its state on the matching host. A host is always
@@ -246,7 +282,12 @@ impl App {
                     host.add_probed_port(port, state);
                 }
             }
-            ScanEvent::Error(err) => self.end_scan(ScanState::Failed(err.to_string())),
+            ScanEvent::Error(err) => {
+                // Keep the message for the status line; the state only records
+                // that an error occurred.
+                self.scan_error = Some(err.to_string());
+                self.end_scan(ScanState::Error);
+            }
         }
     }
 
@@ -290,9 +331,13 @@ impl App {
         }
         match key {
             KeyCode::Char('q') => self.quit(cancel),
-            KeyCode::Char('c') if matches!(self.scan, ScanState::Scanning { .. }) => {
+            KeyCode::Char('c') if self.scan.is_active() => {
+                // Only raise the flag; the scanner's `Cancelled` event performs
+                // the terminal state transition (Phase 10).
                 cancel.store(true, Ordering::SeqCst);
-                self.end_scan(ScanState::Cancelled);
+            }
+            KeyCode::Char('r') if !self.scan.is_active() => {
+                self.rescan_requested = true;
             }
             KeyCode::Char('/') => {
                 self.filter_input.clear();
@@ -410,15 +455,49 @@ impl App {
         self.should_quit = true;
         cancel.store(true, Ordering::SeqCst);
     }
+
+    /// Start a new scan: reset per-scan state and launch the worker through the
+    /// provided spawner (Phase 10).
+    ///
+    /// Called for the first scan at the start of the event loop and again for
+    /// each rescan requested with `r`. The spawner, configuration, master
+    /// sender, and cancellation flag are owned by the caller rather than the
+    /// [`App`], so the app remains a plain, `Debug`/`Default` data container.
+    /// A fresh scan clears hosts, selection, error text, and the port count,
+    /// and re-raises the cancellation flag to a clean slate.
+    fn start_scan(
+        &mut self,
+        config: &ScanConfig,
+        spawner: &ScanSpawner,
+        master_tx: &Sender<ScanEvent>,
+        cancel: &Arc<AtomicBool>,
+    ) {
+        self.scan = ScanState::Starting;
+        self.hosts.clear();
+        self.selected_host = None;
+        self.scan_error = None;
+        self.ports_probed = 0;
+        self.started_at = None;
+        self.scan_duration = None;
+        // A prior scan may have left the flag raised (e.g. after a cancel);
+        // start from a clean slate.
+        cancel.store(false, Ordering::SeqCst);
+        spawner(config.clone(), master_tx.clone(), cancel.clone());
+    }
 }
 
 /// Run the terminal UI until the user quits, then restore the terminal.
 ///
 /// `ports_per_host` is the number of TCP ports the scanner will probe on each
-/// up host, used to derive the live port-progress display.
+/// up host, used to derive the live port-progress display. `config` together
+/// with `spawner` lets the event loop launch the first scan and any rescans;
+/// `config` is `None` (and scanning is unavailable) when no target was given.
 pub fn run(
     target: Option<ScanTarget>,
     ports_per_host: usize,
+    config: Option<ScanConfig>,
+    spawner: ScanSpawner,
+    master_tx: Sender<ScanEvent>,
     events: Receiver<ScanEvent>,
     cancel: Arc<AtomicBool>,
 ) -> io::Result<()> {
@@ -433,7 +512,15 @@ pub fn run(
         ports_per_host,
         ..Default::default()
     };
-    let result = run_loop(&mut terminal, &mut app, &events, &cancel);
+    let result = run_loop(
+        &mut terminal,
+        &mut app,
+        config.as_ref(),
+        &spawner,
+        &master_tx,
+        &events,
+        &cancel,
+    );
 
     // Restore the terminal even if the event loop failed.
     let restore = restore_terminal(&mut terminal);
@@ -448,9 +535,17 @@ pub fn run(
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
+    config: Option<&ScanConfig>,
+    spawner: &ScanSpawner,
+    master_tx: &Sender<ScanEvent>,
     events: &Receiver<ScanEvent>,
-    cancel: &AtomicBool,
+    cancel: &Arc<AtomicBool>,
 ) -> io::Result<()> {
+    // Launch the first scan if a target and its configuration are present.
+    if let Some(config) = config {
+        app.start_scan(config, spawner, master_tx, cancel);
+    }
+
     loop {
         // Drain scanner events first so new results appear on the next frame.
         // A disconnected channel simply means the scanner is done (or never
@@ -470,6 +565,16 @@ fn run_loop(
             // which re-queries the terminal size.
             if let Event::Key(key) = event::read()? {
                 app.handle_key(key.code, cancel);
+            }
+        }
+
+        // A rescan was requested with `r` while no scan was active; start it
+        // now (Phase 10). With no configuration (no target) the request is
+        // simply discarded.
+        if app.rescan_requested {
+            app.rescan_requested = false;
+            if let Some(config) = config {
+                app.start_scan(config, spawner, master_tx, cancel);
             }
         }
     }
@@ -517,11 +622,14 @@ fn draw(frame: &mut Frame, app: &App) {
     if let Some(progress) = app.port_progress() {
         parts.push(progress);
     }
-    if let ScanState::Scanning { completed, total } = app.scan {
+    if let ScanState::Discovering { completed, total } = app.scan {
         parts.push(format!("Progress: {completed}/{total}"));
     }
     if let Some(elapsed) = app.elapsed(Instant::now()) {
         parts.push(format!("Elapsed: {}", format_duration(elapsed)));
+    }
+    if let Some(err) = &app.scan_error {
+        parts.push(format!("Error: {err}"));
     }
     let status_line = Paragraph::new(parts.join("  "));
     frame.render_widget(status_line, chunks[1]);
@@ -685,6 +793,7 @@ fn draw_help_overlay(frame: &mut Frame) {
         "  ↓/j    Down",
         "  /      Filter",
         "  ?      Help",
+        "  r      Rescan",
         "  c      Cancel",
         "  q      Quit",
     ];
@@ -789,9 +898,9 @@ mod tests {
     }
 
     #[test]
-    fn cancel_key_sets_flag_and_state_while_scanning() {
+    fn cancel_key_sets_flag_but_leaves_active_state() {
         let mut app = App {
-            scan: ScanState::Scanning {
+            scan: ScanState::Discovering {
                 completed: 1,
                 total: 4,
             },
@@ -800,8 +909,16 @@ mod tests {
         let cancel = AtomicBool::new(false);
         app.handle_key(KeyCode::Char('c'), &cancel);
         assert!(!app.should_quit);
+        // Only the flag is raised here; the scanner's `Cancelled` event performs
+        // the terminal transition, so the state is still active (Phase 10).
         assert!(cancel.load(Ordering::SeqCst));
-        assert_eq!(app.scan, ScanState::Cancelled);
+        assert_eq!(
+            app.scan,
+            ScanState::Discovering {
+                completed: 1,
+                total: 4
+            }
+        );
     }
 
     #[test]
@@ -840,12 +957,12 @@ mod tests {
     }
 
     #[test]
-    fn started_event_sets_scanning() {
+    fn started_event_sets_discovering() {
         let mut app = App::default();
         app.apply_event(ScanEvent::Started { total: 4 });
         assert_eq!(
             app.scan,
-            ScanState::Scanning {
+            ScanState::Discovering {
                 completed: 0,
                 total: 4
             }
@@ -862,7 +979,7 @@ mod tests {
         });
         assert_eq!(
             app.scan,
-            ScanState::Scanning {
+            ScanState::Discovering {
                 completed: 2,
                 total: 4
             }
@@ -877,6 +994,108 @@ mod tests {
             total: 4,
         });
         assert_eq!(app.scan, ScanState::Idle);
+    }
+
+    #[test]
+    fn first_port_discovered_transitions_to_scanning_ports() {
+        let mut app = App::default();
+        app.apply_event(ScanEvent::Started { total: 1 });
+        app.apply_event(ScanEvent::HostDiscovered(Host::up(
+            "10.0.0.1".parse::<Ipv4Addr>().unwrap(),
+            Duration::from_millis(1),
+        )));
+        app.apply_event(ScanEvent::PortDiscovered {
+            ip: "10.0.0.1".parse().unwrap(),
+            port: Port::new(22).unwrap(),
+            state: PortState::Open,
+        });
+        assert_eq!(app.scan, ScanState::ScanningPorts);
+    }
+
+    #[test]
+    fn port_discovered_keeps_scanning_ports_state() {
+        let mut app = App::default();
+        app.apply_event(ScanEvent::Started { total: 1 });
+        app.apply_event(ScanEvent::HostDiscovered(Host::up(
+            "10.0.0.1".parse::<Ipv4Addr>().unwrap(),
+            Duration::from_millis(1),
+        )));
+        let ip = "10.0.0.1".parse::<Ipv4Addr>().unwrap();
+        app.apply_event(ScanEvent::PortDiscovered {
+            ip,
+            port: Port::new(22).unwrap(),
+            state: PortState::Open,
+        });
+        app.apply_event(ScanEvent::PortDiscovered {
+            ip,
+            port: Port::new(23).unwrap(),
+            state: PortState::Closed,
+        });
+        assert_eq!(app.scan, ScanState::ScanningPorts);
+        assert_eq!(app.ports_probed, 2);
+    }
+
+    #[test]
+    fn progress_event_ignored_during_port_scanning() {
+        let mut app = App::default();
+        app.apply_event(ScanEvent::Started { total: 1 });
+        app.apply_event(ScanEvent::HostDiscovered(Host::up(
+            "10.0.0.1".parse::<Ipv4Addr>().unwrap(),
+            Duration::from_millis(1),
+        )));
+        let ip = "10.0.0.1".parse::<Ipv4Addr>().unwrap();
+        app.apply_event(ScanEvent::PortDiscovered {
+            ip,
+            port: Port::new(22).unwrap(),
+            state: PortState::Open,
+        });
+        app.apply_event(ScanEvent::Progress {
+            completed: 1,
+            total: 1,
+        });
+        assert_eq!(app.scan, ScanState::ScanningPorts);
+    }
+
+    #[test]
+    fn rescan_key_sets_flag_when_idle() {
+        let mut app = App::default();
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('r'), &cancel);
+        assert!(app.rescan_requested);
+        assert!(!app.should_quit);
+        assert!(!cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn rescan_key_ignored_while_scan_active() {
+        let mut app = App {
+            scan: ScanState::Discovering {
+                completed: 0,
+                total: 4,
+            },
+            ..Default::default()
+        };
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('r'), &cancel);
+        assert!(!app.rescan_requested);
+        assert_eq!(
+            app.scan,
+            ScanState::Discovering {
+                completed: 0,
+                total: 4
+            }
+        );
+    }
+
+    #[test]
+    fn rescan_key_works_after_scan_ends() {
+        let mut app = App::default();
+        app.apply_event(ScanEvent::Started { total: 1 });
+        app.apply_event(ScanEvent::Finished);
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('r'), &cancel);
+        assert!(app.rescan_requested);
+        assert_eq!(app.scan, ScanState::Completed);
     }
 
     #[test]
@@ -1378,10 +1597,10 @@ mod tests {
     }
 
     #[test]
-    fn finished_event_sets_finished() {
+    fn finished_event_sets_completed() {
         let mut app = App::default();
         app.apply_event(ScanEvent::Finished);
-        assert_eq!(app.scan, ScanState::Finished);
+        assert_eq!(app.scan, ScanState::Completed);
     }
 
     #[test]
@@ -1392,14 +1611,15 @@ mod tests {
     }
 
     #[test]
-    fn error_event_sets_failed_with_message() {
+    fn error_event_sets_error_state_and_message() {
         let mut app = App::default();
         app.apply_event(ScanEvent::Error(ScanError::Socket("boom".to_owned())));
-        assert_eq!(app.scan, ScanState::Failed("socket error: boom".to_owned()));
+        assert_eq!(app.scan, ScanState::Error);
+        assert_eq!(app.scan_error.as_deref(), Some("socket error: boom"));
     }
 
     #[test]
-    fn full_scan_sequence_reaches_finished() {
+    fn full_scan_sequence_reaches_completed() {
         let mut app = app_with_target();
         app.apply_event(ScanEvent::Started { total: 1 });
         app.apply_event(ScanEvent::HostDiscovered(Host::up(
@@ -1411,50 +1631,24 @@ mod tests {
             total: 1,
         });
         app.apply_event(ScanEvent::Finished);
-        assert_eq!(app.scan, ScanState::Finished);
+        assert_eq!(app.scan, ScanState::Completed);
         assert_eq!(app.hosts.len(), 1);
         assert_eq!(app.up_count(), 1);
-        assert_eq!(app.scan.label(), "FINISHED");
+        assert_eq!(app.scan.label(), "COMPLETED");
     }
 
     #[test]
-    fn scanning_label_shows_percentage() {
+    fn active_states_have_labels() {
+        assert_eq!(ScanState::Starting.label(), "STARTING");
         assert_eq!(
-            ScanState::Scanning {
+            ScanState::Discovering {
                 completed: 2,
                 total: 4
             }
             .label(),
-            "SCANNING 50%"
+            "DISCOVERING"
         );
-        assert_eq!(
-            ScanState::Scanning {
-                completed: 1,
-                total: 3
-            }
-            .label(),
-            "SCANNING 33%"
-        );
-        assert_eq!(
-            ScanState::Scanning {
-                completed: 0,
-                total: 1
-            }
-            .label(),
-            "SCANNING 0%"
-        );
-    }
-
-    #[test]
-    fn scanning_label_handles_zero_total() {
-        assert_eq!(
-            ScanState::Scanning {
-                completed: 0,
-                total: 0
-            }
-            .label(),
-            "SCANNING 0%"
-        );
+        assert_eq!(ScanState::ScanningPorts.label(), "SCANNING PORTS");
     }
 
     #[test]
@@ -1464,9 +1658,9 @@ mod tests {
 
     #[test]
     fn terminal_states_have_labels() {
-        assert_eq!(ScanState::Finished.label(), "FINISHED");
+        assert_eq!(ScanState::Completed.label(), "COMPLETED");
         assert_eq!(ScanState::Cancelled.label(), "CANCELLED");
-        assert_eq!(ScanState::Failed("x".to_owned()).label(), "FAILED");
+        assert_eq!(ScanState::Error.label(), "ERROR");
     }
 
     #[test]
@@ -1613,7 +1807,7 @@ mod tests {
     fn navigation_and_cancel_are_ignored_while_help_is_open() {
         let mut app = App {
             show_help: true,
-            scan: ScanState::Scanning {
+            scan: ScanState::Discovering {
                 completed: 1,
                 total: 4,
             },
@@ -1629,7 +1823,7 @@ mod tests {
         app.handle_key(KeyCode::Char('c'), &cancel);
         assert!(app.show_help);
         assert_eq!(app.selected_host, None);
-        assert!(matches!(app.scan, ScanState::Scanning { .. }));
+        assert!(matches!(app.scan, ScanState::Discovering { .. }));
         assert!(!cancel.load(Ordering::SeqCst));
     }
 
@@ -1689,7 +1883,7 @@ mod tests {
         let mut app = app_with_hosts(3);
         app.show_detail = true;
         app.selected_host = Some(1);
-        app.scan = ScanState::Scanning {
+        app.scan = ScanState::Discovering {
             completed: 1,
             total: 4,
         };
@@ -1702,7 +1896,7 @@ mod tests {
         app.handle_key(KeyCode::Enter, &cancel);
         assert!(app.show_detail);
         assert_eq!(app.selected_host, Some(1));
-        assert!(matches!(app.scan, ScanState::Scanning { .. }));
+        assert!(matches!(app.scan, ScanState::Discovering { .. }));
         assert!(!app.show_help);
         assert!(!cancel.load(Ordering::SeqCst));
     }
@@ -1759,7 +1953,7 @@ mod tests {
     #[test]
     fn finished_event_freezes_elapsed() {
         let (app, _) = frozen_elapsed_after(ScanEvent::Finished);
-        assert_eq!(app.scan, ScanState::Finished);
+        assert_eq!(app.scan, ScanState::Completed);
     }
 
     #[test]
@@ -1771,7 +1965,8 @@ mod tests {
     #[test]
     fn error_event_freezes_elapsed() {
         let (app, _) = frozen_elapsed_after(ScanEvent::Error(ScanError::Socket("boom".to_owned())));
-        assert_eq!(app.scan, ScanState::Failed("socket error: boom".to_owned()));
+        assert_eq!(app.scan, ScanState::Error);
+        assert_eq!(app.scan_error.as_deref(), Some("socket error: boom"));
     }
 
     #[test]

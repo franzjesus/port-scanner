@@ -152,6 +152,21 @@ pub struct ScanConfig {
     pub ports: PortConfig,
 }
 
+/// Builds and runs one scan in a background thread.
+///
+/// The closure receives the scan configuration, the sender used to deliver
+/// structured [`ScanEvent`]s, and the cancellation flag shared with the TUI.
+/// Keeping the spawn logic behind a trait object lets the TUI start, cancel,
+/// and rescan without knowing how scans are actually launched, which makes the
+/// full lifecycle testable without touching the network.
+pub type ScanSpawner = Box<
+    dyn Fn(
+            ScanConfig,
+            std::sync::mpsc::Sender<ScanEvent>,
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ) + Send,
+>;
+
 impl ScanConfig {
     /// Create a configuration for `target` using the default discovery and
     /// port settings.

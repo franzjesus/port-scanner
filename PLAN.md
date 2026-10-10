@@ -623,7 +623,7 @@ Avoid exposing every internal scanner option to users initially.
   on that stage (`DiscoveryConfig::timeout`/`concurrency` for discovery,
   `PortConfig::timeout`/`concurrency` for ports). This is a deliberate deviation from the
   conceptual sketch.
-- **Discovery method stays a generic param:** the discovery *method* (a
+- **Discovery method stays a generic param:** the discovery _method_ (a
   `D: HostDiscovery` strategy) is passed to `run_scan` as a generic parameter rather than
   stored in `ScanConfig`. There is currently a single stateless method (`IcmpDiscovery`),
   so storing an enum in the config would be premature. When a second method lands (e.g.
@@ -825,7 +825,7 @@ Do not display information that has not actually been discovered.
 ## Tasks
 
 - [x]8.1 Store the state of every probed port on `Host`: new `ProbedPort { port,
-  state }` (kept sorted ascending by port, unique) with `Host::add_probed_port`,
+state }` (kept sorted ascending by port, unique) with `Host::add_probed_port`,
   recording both open and closed results.
 - [x]8.2 `Enter` opens the host detail screen when a host is selected (no-op for
   a missing or stale selection): a `Host` block (IP, state, latency) and a
@@ -834,7 +834,7 @@ Do not display information that has not actually been discovered.
 - [x]8.3 Gate keys while the detail screen is open: only `Esc` (back) and `q`
   (quit) act; navigation, cancel, help, and `Enter` are ignored.
 - [x]8.4 Context-sensitive bottom hint: the detail screen shows `Esc Back  q
-  Quit`; the overview key list gains `Enter Detail`.
+Quit`; the overview key list gains `Enter Detail`.
 - [x]8.5 `format_open_ports` filters to ports probed open, so the overview's
   OPEN PORTS column keeps showing only open ports (e.g. `22,80,443`).
 - [x]8.6 Tests: `Enter`/`Esc`/key gating (including a stale selection),
@@ -910,12 +910,12 @@ Filtering should operate on the UI model and must not trigger a new scan.
 - [x]9.4 Live preview: `effective_filter()` prefers a non-empty `filter_input`
   over the committed filter, so the table filters as the user types.
 - [x]9.5 Selection anchoring: `move_selection(direction)` steps within the
-  *visible* hosts (clamped at the ends); if the selection is not visible it
+  _visible_ hosts (clamped at the ends); if the selection is not visible it
   anchors to the first (`> 0`) or last (`< 0`) visible host. `sync_selection`
   clears a selection hidden by the filter.
 - [x]9.6 `Esc` in the overview clears the committed filter; context-sensitive
   bottom hint: `Filter: <input>` while typing, `Filter: <f>  / Edit  Esc Clear
-  ...` when committed, the default key list (with `/ Filter`) otherwise.
+...` when committed, the default key list (with `/ Filter`) otherwise.
 - [x]9.7 No-match message: when a filter is active and nothing matches, the
   table area renders `No hosts match the filter.`
 - [x]9.8 Tests: input mode (commit, discard, empty commit), `host_matches`
@@ -974,6 +974,73 @@ The user must be able to:
 Cancellation must propagate to scanner tasks.
 
 No orphaned network tasks should remain after cancellation.
+
+## Tasks
+
+- [x]10.1 `ScanState` enum with the seven plan states (`Idle`, `Starting`,
+  `Discovering { completed, total }`, `ScanningPorts`, `Completed`,
+  `Cancelled`, `Error`), a `label()` for the title row, and `is_active()` to
+  gate the `c`/`r` keys.
+- [x]10.2 Scan lifecycle fields on `App`: `scan`, `started_at`,
+  `scan_duration`, `scan_error: Option<String>` (message for the `Error`
+  state), and `rescan_requested`.
+- [x]10.3 Event → state transitions in `apply_event` (the single place they
+  happen): `Started` → `Discovering` (recording the total and start instant),
+  the first `PortDiscovered` → `ScanningPorts`, and `Finished`/`Cancelled`/
+  `Error` → their terminal states via `end_scan` (which freezes
+  `scan_duration`). `Progress` only updates the discovery counts while
+  still discovering.
+- [x]10.4 `c` key: while a scan is active it only raises the shared
+  cancellation flag; the scanner's `Cancelled` event performs the terminal
+  state transition, keeping the TUI event-driven.
+- [x]10.5 `r` key: when no scan is active it sets `rescan_requested`; the
+  event loop consumes the flag and starts a new scan — so a rescan works
+  after completion, after cancellation, and after an error.
+- [x]10.6 `start_scan`: resets the host list, selection, error text, port
+  count, and elapsed-time state, lowers the cancellation flag (a prior scan
+  may have left it raised), and launches the scanner through a
+  `ScanSpawner` closure.
+- [x]10.7 Restructure `run`/`run_loop`: the `ScanConfig`, spawner, master
+  event sender, and cancellation flag are owned by the caller rather than
+  stored on `App` (the app stays a plain `Debug`/`Default` data container);
+  the first scan launches when a target is present and rescans launch from
+  the loop. The master sender lives for the TUI's whole lifetime, so the
+  channel stays open between scans.
+- [x]10.8 Status display: the phase label renders right-aligned in the title
+  row; `Error: {message}` is appended to the summary line while
+  `scan_error` is set.
+- [x]10.9 Rebuild `main`: build the `Option<ScanConfig>` and a
+  `ScanSpawner`, and hand them (with the master sender, event receiver, and
+  cancellation flag) to `tui::app::run`; a missing target simply means no
+  scan starts.
+- [x]10.10 Document `r Rescan` and `c Cancel` in the `?` help overlay.
+- [x]10.11 Tests: the first `PortDiscovered` transitioning to
+  `ScanningPorts`, subsequent ports keeping that state, `Progress` being
+  ignored during port scanning, and the `r` key being accepted only when no
+  scan is active (idle and after a scan ends, rejected while active).
+- [x]10.12 Update `PLAN.md`.
+
+## Notes
+
+- The TUI never mutates scan state when the user cancels: `c` only sets the
+  shared flag and the scanner's `Cancelled` event performs the transition,
+  so state changes stay exclusively event-driven (per AGENTS.md).
+- Cancellation propagates through the scanner's own checks (between
+  discovery batches and before each host's port scan); in-flight
+  connections are allowed to finish and no tasks outlive the scan.
+- Discovery keeps its batch window open for the full timeout even when
+  replies arrive early, so even a single-host scan takes roughly the
+  discovery timeout (~300 ms by default) — a comfortable, reliable window
+  to cancel mid-scan.
+- `start_scan` lowers the cancellation flag because a previous scan may have
+  left it raised (e.g. after a cancel), so every new scan starts from a
+  clean slate.
+- **Verified:** `cargo fmt --check` (clean), `cargo check` (no warnings),
+  `cargo test` (172 passed), `cargo clippy --all-targets` (no warnings),
+  `cargo build` (clean); a PTY smoke test with a minimal VT emulator
+  confirmed the full lifecycle — the initial CLI scan reaching COMPLETED,
+  `r` then `c` mid-scan producing CANCELLED, `r` after cancellation reaching
+  COMPLETED again, and a clean `q` exit (status 0).
 
 ---
 
@@ -1089,7 +1156,7 @@ Add persistent scan storage.
 
 Possible initial implementation:
 
-- SQLite.
+- File storage.
 
 Store:
 
@@ -1414,8 +1481,8 @@ The MVP is complete when all of the following are true:
 - [ ]Host details can be viewed.
 - [ ]Open ports are displayed.
 - [x]Results can be filtered.
-- [ ]Scans can be cancelled.
-- [ ]A new scan can be started without restarting the application.
+- [x]Scans can be cancelled.
+- [x]A new scan can be started without restarting the application.
 - [ ]Results can be exported as JSON.
 - [ ]Network errors do not crash the application.
 - [ ]Core scanner functionality has automated tests.
