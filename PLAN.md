@@ -895,6 +895,57 @@ Do not implement a complex query language until simple filtering proves insuffic
 
 Filtering should operate on the UI model and must not trigger a new scan.
 
+## Tasks
+
+- [x]9.1 Filter state on `App`: committed `filter: Option<String>` (`None` = no
+  filter) plus private `filter_input: String` and `filter_mode: bool` for the
+  interactive input mode.
+- [x]9.2 `/` enters filter input mode (not gated on scan state, so filtering
+  works while a scan runs); in input mode `Char` appends, `Backspace` deletes,
+  `Enter` commits (an empty buffer commits `None`), and `Esc` discards the
+  buffer while keeping the committed filter.
+- [x]9.3 `host_matches(host, needle)`: case-insensitive substring match against
+  the host's IP, its state string, and every probed port number; an empty
+  needle matches every host.
+- [x]9.4 Live preview: `effective_filter()` prefers a non-empty `filter_input`
+  over the committed filter, so the table filters as the user types.
+- [x]9.5 Selection anchoring: `move_selection(direction)` steps within the
+  *visible* hosts (clamped at the ends); if the selection is not visible it
+  anchors to the first (`> 0`) or last (`< 0`) visible host. `sync_selection`
+  clears a selection hidden by the filter.
+- [x]9.6 `Esc` in the overview clears the committed filter; context-sensitive
+  bottom hint: `Filter: <input>` while typing, `Filter: <f>  / Edit  Esc Clear
+  ...` when committed, the default key list (with `/ Filter`) otherwise.
+- [x]9.7 No-match message: when a filter is active and nothing matches, the
+  table area renders `No hosts match the filter.`
+- [x]9.8 Tests: input mode (commit, discard, empty commit), `host_matches`
+  (ip/state/port, case-insensitivity, empty needle), live preview, selection
+  anchoring and clamping, selection clearing, and the no-match rendering.
+- [x]9.9 Update `PLAN.md`.
+
+## Notes
+
+- **Match scope:** IP, host state, and probed port numbers (as decimal
+  strings). Service names are not matched yet: `/ ssh` deliberately matches
+  nothing until Phase 17 adds service detection. The spec's `/ 192.168.1.42`
+  and `/ up` examples work as-is.
+- **No new scan:** filtering only changes which hosts the TUI renders; the
+  scanner is untouched, satisfying "must not trigger a new scan".
+- **Filtering during a scan:** because `/` is not gated on scan state, results
+  keep streaming into the filtered view; `sync_selection` runs on every input
+  change so the selection can never point at a hidden row.
+- **Selection safety:** the committed filter is only ever applied to an
+  already-consistent selection (`/` is pressed from a valid selection and
+  hosts only get added while scanning), so `sync_selection` is needed on
+  input changes, not on `Enter`/`Esc`.
+- **Verified:** `cargo fmt --check` (clean), `cargo check` (no warnings),
+  `cargo test` (167 passed), `cargo clippy --all-targets` (no warnings),
+  `cargo build` (clean); a PTY smoke test with a minimal VT emulator confirmed
+  the full flow — live preview hint, committed hint, `Esc` clears the filter,
+  the no-match message, `Esc` in input mode discarding the buffer, and a clean
+  `q` quit. (Byte-stream matching is unreliable here: ratatui's diff renderer
+  emits only changed cells, so complete hint strings never appear verbatim.)
+
 ---
 
 # 16\. Phase 10 — Scan Lifecycle
@@ -1329,7 +1380,7 @@ Implement in this order:
 - [x]Host detail view.
 - [x]TCP port scanning.
 - [x]Port profiles.
-- [ ]Filtering.
+- [x]Filtering.
 - [ ]Cancellation.
 - [ ]JSON export.
 - [ ]Improve error handling.
@@ -1362,7 +1413,7 @@ The MVP is complete when all of the following are true:
 - [ ]Hosts can be selected.
 - [ ]Host details can be viewed.
 - [ ]Open ports are displayed.
-- [ ]Results can be filtered.
+- [x]Results can be filtered.
 - [ ]Scans can be cancelled.
 - [ ]A new scan can be started without restarting the application.
 - [ ]Results can be exported as JSON.

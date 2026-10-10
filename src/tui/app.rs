@@ -3,6 +3,11 @@
 //! The TUI renders application state and handles keyboard input. It consumes
 //! scanner events from a channel but never performs network operations itself
 //! (see AGENTS.md).
+//!
+//! Filtering (`/`) is applied in the presentation layer only: it changes which
+//! hosts are visible and how navigation works, without modifying the stored
+//! results or triggering new scans (see AGENTS.md: "filtering operates on the
+//! UI model").
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -89,11 +94,12 @@ pub struct App {
     /// screen (Phase 8). An out-of-range index is treated as no selection by
     /// [`App::selected`].
     pub selected_host: Option<usize>,
-    /// Filter text for the host list, if any.
+    /// The committed filter text for the host list, if any.
     ///
-    /// Written by the interactive filter (Phase 9); until then the value is
-    /// stored but not yet applied to the displayed host list.
-    #[allow(dead_code)] // consumed by Phase 9 (filtering)
+    /// Set when the user commits the filter input with `Enter` (Phase 9) and
+    /// cleared by `Esc` on the overview screen. While the filter input is
+    /// active, the typed text takes precedence (see
+    /// [`App::effective_filter`]).
     pub filter: Option<String>,
     /// When the current scan started, set on `ScanEvent::Started`.
     started_at: Option<Instant>,
@@ -107,6 +113,18 @@ pub struct App {
     /// Set by `Enter` on the overview screen (only when a host is selected)
     /// and cleared by `Esc`. While open, only `Esc` (back) and `q` (quit) act.
     show_detail: bool,
+    /// Text typed into the filter input since `/` was pressed.
+    ///
+    /// While non-empty it takes precedence over the committed
+    /// [`App::filter`] (live preview); committed on `Enter`, discarded on
+    /// `Esc` (Phase 9).
+    filter_input: String,
+    /// Whether the filter input is active (the user is typing a filter).
+    ///
+    /// Set by `/` on the overview screen, cleared by `Enter` (commit) or
+    /// `Esc` (cancel). While set, every key goes to [`App::handle_filter_input`]
+    /// instead of the overview handlers.
+    filter_mode: bool,
 }
 
 impl App {
@@ -151,6 +169,38 @@ impl App {
     /// host is selected or the index is out of range.
     pub fn selected(&self) -> Option<&Host> {
         self.selected_host.and_then(|index| self.hosts.get(index))
+    }
+
+    /// The filter text currently in effect for the host list, if any.
+    ///
+    /// While the filter input is active, the typed text takes precedence so
+    /// the list updates as the user types; otherwise the committed filter
+    /// (if any) is used. Empty text is treated as no filter (see
+    /// [`App::visible_indices`]).
+    pub fn effective_filter(&self) -> Option<&str> {
+        if !self.filter_input.is_empty() {
+            Some(&self.filter_input)
+        } else {
+            self.filter.as_deref()
+        }
+    }
+
+    /// Indices into [`App::hosts`] of the hosts that match the effective
+    /// filter, in their original order.
+    ///
+    /// With no effective filter every host is visible. Matching is a
+    /// case-insensitive substring test over the IP, the state, and the port
+    /// numbers (Phase 9: simple filtering, no query language).
+    pub fn visible_indices(&self) -> Vec<usize> {
+        let Some(filter) = self.effective_filter() else {
+            return (0..self.hosts.len()).collect();
+        };
+        self.hosts
+            .iter()
+            .enumerate()
+            .filter(|(_, host)| host_matches(host, filter))
+            .map(|(index, _)| index)
+            .collect()
     }
 
     /// Elapsed time of the current or most recent scan.
@@ -211,6 +261,12 @@ impl App {
     /// While the host detail screen is open, only `Esc` (back) and `q` (quit)
     /// act; every other key is ignored until it is closed. On the overview
     /// screen, `Enter` opens the detail screen for the selected host.
+    ///
+    /// While filter input is active (started with `/` on the overview
+    /// screen), every key is routed to `handle_filter_input` instead of the
+    /// overview handlers (Phase 9): characters and backspace edit the filter,
+    /// `Enter` commits it, and `Esc` discards the buffer and leaves input
+    /// mode.
     pub fn handle_key(&mut self, key: KeyCode, cancel: &AtomicBool) {
         if self.show_help {
             match key {
@@ -228,12 +284,21 @@ impl App {
             }
             return;
         }
+        if self.filter_mode {
+            self.handle_filter_input(key);
+            return;
+        }
         match key {
             KeyCode::Char('q') => self.quit(cancel),
             KeyCode::Char('c') if matches!(self.scan, ScanState::Scanning { .. }) => {
                 cancel.store(true, Ordering::SeqCst);
                 self.end_scan(ScanState::Cancelled);
             }
+            KeyCode::Char('/') => {
+                self.filter_input.clear();
+                self.filter_mode = true;
+            }
+            KeyCode::Esc => self.filter = None,
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
@@ -242,35 +307,91 @@ impl App {
         }
     }
 
-    /// Move the host selection by `direction` (-1 up, +1 down).
+    /// Move the host selection by `direction` (-1 up, +1 down) among the
+    /// hosts that are currently visible (not hidden by the filter).
     ///
-    /// A no-op with an empty host list. With no current selection, down
-    /// selects the first host and up selects the last. Otherwise the selection
-    /// steps by one, clamped at both ends; a stale out-of-range index is first
-    /// clamped into range.
+    /// With no visible hosts the selection is cleared. With no visible
+    /// selection, down anchors on the first visible host and up on the last.
+    /// Otherwise the selection steps to the adjacent visible host, clamped at
+    /// the visible ends; a stale (out-of-range) or hidden index is treated as
+    /// no selection.
     fn move_selection(&mut self, direction: i8) {
-        let len = self.hosts.len();
-        if len == 0 || direction == 0 {
+        if direction == 0 {
             return;
         }
-        let last = len - 1;
+        let visible = self.visible_indices();
+        if visible.is_empty() {
+            // Nothing matches the filter: there is no host to select.
+            self.selected_host = None;
+            return;
+        }
+        let first = visible[0];
+        let last = *visible.last().expect("visible checked non-empty");
         let next = match self.selected_host {
-            // No selection yet: anchor at the end we are moving towards, so
-            // the first down selects the first host and the first up selects
-            // the last.
-            None if direction > 0 => 0,
-            None => last,
-            Some(index) => {
-                // Clamp a stale out-of-range index into range before stepping.
-                let current = index.min(last);
+            // A selection that is still visible steps to the adjacent visible
+            // host, skipping hidden ones, clamped at the visible ends.
+            Some(index) if visible.contains(&index) => {
+                let position = visible
+                    .iter()
+                    .position(|&visible_index| visible_index == index)
+                    .expect("selection is a visible index");
                 if direction > 0 {
-                    (current + 1).min(last)
+                    *visible.get(position + 1).unwrap_or(&last)
                 } else {
-                    current.saturating_sub(1)
+                    *visible.get(position.saturating_sub(1)).unwrap_or(&first)
                 }
             }
+            // No selection, or a stale/hidden index: anchor at the end we are
+            // moving towards, so the first down selects the first visible
+            // host and the first up selects the last.
+            _ if direction > 0 => first,
+            _ => last,
         };
         self.selected_host = Some(next);
+    }
+
+    /// Drop the current selection if its host is hidden by the effective
+    /// filter, so the selection always refers to a visible host.
+    ///
+    /// Called while the filter input is being edited.
+    fn sync_selection(&mut self) {
+        if let Some(index) = self.selected_host {
+            if !self.visible_indices().contains(&index) {
+                self.selected_host = None;
+            }
+        }
+    }
+
+    /// Handle a keypress while the filter input is active (Phase 9).
+    ///
+    /// Characters and backspace edit the filter text (with a live preview in
+    /// the host list); `Enter` commits the text as the filter (an empty
+    /// commit clears it) and `Esc` cancels the edit, keeping the previously
+    /// committed filter. Every other key is consumed as input.
+    fn handle_filter_input(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Char(c) => {
+                self.filter_input.push(c);
+                self.sync_selection();
+            }
+            KeyCode::Backspace => {
+                self.filter_input.pop();
+                self.sync_selection();
+            }
+            KeyCode::Enter => {
+                self.filter = if self.filter_input.is_empty() {
+                    None
+                } else {
+                    Some(std::mem::take(&mut self.filter_input))
+                };
+                self.filter_mode = false;
+            }
+            KeyCode::Esc => {
+                self.filter_input.clear();
+                self.filter_mode = false;
+            }
+            _ => {}
+        }
     }
 
     /// Transition to a terminal scan state, freezing the elapsed time.
@@ -409,7 +530,12 @@ fn draw(frame: &mut Frame, app: &App) {
         if app.show_detail {
             draw_host_detail(frame, app, chunks[2]);
         } else {
-            frame.render_widget(host_table(app, chunks[2]), chunks[2]);
+            let visible = app.visible_indices();
+            if app.effective_filter().is_some() && visible.is_empty() {
+                frame.render_widget(Paragraph::new("No hosts match the filter."), chunks[2]);
+            } else {
+                frame.render_widget(host_table(app, &visible, chunks[2]), chunks[2]);
+            }
         }
     } else {
         let hint =
@@ -418,9 +544,13 @@ fn draw(frame: &mut Frame, app: &App) {
     }
 
     let hint = if app.show_detail {
-        "Esc Back  q Quit"
+        "Esc Back  q Quit".to_string()
+    } else if app.filter_mode {
+        format!("Filter: {}", app.filter_input)
+    } else if let Some(filter) = app.filter.as_deref() {
+        format!("Filter: {filter}  / Edit  Esc Clear  ? Help  q Quit")
     } else {
-        "↑/k Up  ↓/j Down  Enter Detail  ? Help  c Cancel  q Quit"
+        "↑/k Up  ↓/j Down  Enter Detail  / Filter  ? Help  c Cancel  q Quit".to_string()
     };
     frame.render_widget(Paragraph::new(hint), chunks[3]);
 
@@ -429,22 +559,27 @@ fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
-fn host_table(app: &App, area: Rect) -> Table<'_> {
+fn host_table<'a>(app: &'a App, visible: &'a [usize], area: Rect) -> Table<'a> {
     let header = Row::new(vec!["", "IP", "STATE", "LATENCY", "OPEN PORTS"])
         .style(Style::default().add_modifier(Modifier::BOLD));
 
     // Only render the rows that fit in the visible area, keeping the selected
     // host in view. `area.height` includes the header row, so one row of data
     // is visible per remaining line.
-    let visible = area.height.saturating_sub(1) as usize;
-    let start = window_start(app.hosts.len(), app.selected_host, visible);
-    let rows: Vec<Row> = app
-        .hosts
+    let row_space = area.height.saturating_sub(1) as usize;
+    let selected_position = app.selected_host.and_then(|index| {
+        visible
+            .iter()
+            .position(|&visible_index| visible_index == index)
+    });
+    let start = window_start(visible.len(), selected_position, row_space);
+    let rows: Vec<Row> = visible
         .iter()
-        .enumerate()
+        .copied()
         .skip(start)
-        .take(visible)
-        .map(|(index, host)| {
+        .take(row_space)
+        .map(|index| {
+            let host = &app.hosts[index];
             let selected = app.selected_host == Some(index);
             let style = if selected {
                 Style::default().add_modifier(Modifier::REVERSED)
@@ -474,6 +609,29 @@ fn host_table(app: &App, area: Rect) -> Table<'_> {
             Constraint::Min(10),
         ],
     )
+}
+
+/// Whether a host matches a case-insensitive filter needle.
+///
+/// An empty needle matches every host. Otherwise the needle is matched as a
+/// substring against the IP address, the state name, and each probed port
+/// number (Phase 9). Matching is done on the display form of each field, so
+/// the needle never needs to know about the underlying types.
+fn host_matches(host: &Host, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let needle = needle.to_ascii_lowercase();
+    host.ip.to_string().to_ascii_lowercase().contains(&needle)
+        || host
+            .state
+            .to_string()
+            .to_ascii_lowercase()
+            .contains(&needle)
+        || host
+            .ports
+            .iter()
+            .any(|probed| probed.port.to_string().contains(&needle))
 }
 
 /// First visible row index for a scrollable host list.
@@ -512,7 +670,7 @@ fn format_duration(duration: Duration) -> String {
 fn draw_help_overlay(frame: &mut Frame) {
     let area = frame.area();
     let width = 26u16.min(area.width);
-    let height = 9u16.min(area.height);
+    let height = 10u16.min(area.height);
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let overlay_area = Rect {
@@ -525,6 +683,7 @@ fn draw_help_overlay(frame: &mut Frame) {
     let keys = [
         "  ↑/k    Up",
         "  ↓/j    Down",
+        "  /      Filter",
         "  ?      Help",
         "  c      Cancel",
         "  q      Quit",
@@ -743,6 +902,8 @@ mod tests {
         let app = App::default();
         assert!(app.selected_host.is_none());
         assert!(app.filter.is_none());
+        assert!(app.filter_input.is_empty());
+        assert!(!app.filter_mode);
         assert!(app.selected().is_none());
     }
 
@@ -791,6 +952,269 @@ mod tests {
         assert_eq!(app.filter.as_deref(), Some("10.0.0."));
         app.filter = None;
         assert!(app.filter.is_none());
+    }
+
+    #[test]
+    fn host_matches_ip_substring() {
+        let host = Host::up("10.0.0.1".parse().unwrap(), Duration::from_millis(1));
+        assert!(host_matches(&host, "10.0.0"));
+        assert!(host_matches(&host, "0.0.1"));
+        assert!(!host_matches(&host, "10.0.1"));
+        assert!(!host_matches(&host, "192.168"));
+    }
+
+    #[test]
+    fn host_matches_state_case_insensitively() {
+        let up = Host::up("10.0.0.1".parse().unwrap(), Duration::from_millis(1));
+        let down = Host::down("10.0.0.2".parse().unwrap());
+        assert!(host_matches(&up, "up"));
+        assert!(host_matches(&up, "UP"));
+        assert!(host_matches(&up, "Up"));
+        assert!(!host_matches(&up, "down"));
+        assert!(host_matches(&down, "down"));
+        assert!(host_matches(&down, "DOWN"));
+    }
+
+    #[test]
+    fn host_matches_probed_port_numbers() {
+        let mut host = Host::up("10.0.0.1".parse().unwrap(), Duration::from_millis(1));
+        host.add_probed_port(Port::new(22).unwrap(), PortState::Open);
+        host.add_probed_port(Port::new(443).unwrap(), PortState::Closed);
+        assert!(host_matches(&host, "22"));
+        assert!(host_matches(&host, "443"));
+        // Service names are not matched until service detection (Phase 17).
+        assert!(!host_matches(&host, "ssh"));
+        assert!(!host_matches(&host, "8080"));
+    }
+
+    #[test]
+    fn host_matches_empty_needle_matches_everything() {
+        let up = Host::up("10.0.0.1".parse().unwrap(), Duration::from_millis(1));
+        let down = Host::down("10.0.0.2".parse().unwrap());
+        assert!(host_matches(&up, ""));
+        assert!(host_matches(&down, ""));
+    }
+
+    #[test]
+    fn effective_filter_none_when_no_filter_or_input() {
+        let app = App::default();
+        assert_eq!(app.effective_filter(), None);
+    }
+
+    #[test]
+    fn effective_filter_falls_back_to_committed_filter() {
+        let app = App {
+            filter: Some("10.0.0.".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(app.effective_filter(), Some("10.0.0."));
+    }
+
+    #[test]
+    fn effective_filter_prefers_live_input_over_committed_filter() {
+        let app = App {
+            filter: Some("10.0.0.".to_owned()),
+            filter_input: "192".to_owned(),
+            filter_mode: true,
+            ..Default::default()
+        };
+        assert_eq!(app.effective_filter(), Some("192"));
+    }
+
+    #[test]
+    fn visible_indices_all_hosts_without_filter() {
+        let app = app_with_hosts(3);
+        assert_eq!(app.visible_indices(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn visible_indices_returns_matching_subset() {
+        let mut app = app_with_hosts(3);
+        app.filter_input = "10.0.0.1".to_owned();
+        assert_eq!(app.visible_indices(), vec![1]);
+    }
+
+    #[test]
+    fn visible_indices_empty_when_nothing_matches() {
+        let mut app = app_with_hosts(3);
+        app.filter_input = "192.168".to_owned();
+        assert!(app.visible_indices().is_empty());
+    }
+
+    /// Three hosts where the filter `"1.1"` matches only the first and third.
+    fn app_with_three_hosts() -> App {
+        App {
+            hosts: vec![
+                Host::up("192.168.1.1".parse().unwrap(), Duration::from_millis(1)),
+                Host::up("192.168.1.2".parse().unwrap(), Duration::from_millis(2)),
+                Host::up("192.168.1.11".parse().unwrap(), Duration::from_millis(3)),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn move_selection_skips_hidden_hosts() {
+        let mut app = app_with_three_hosts();
+        app.filter = Some("1.1".to_owned());
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        assert_eq!(app.selected_host, Some(0));
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        // Host 1 is hidden by the filter, so the next visible host is 2.
+        assert_eq!(app.selected_host, Some(2));
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        // Clamped at the last visible host.
+        assert_eq!(app.selected_host, Some(2));
+        app.handle_key(KeyCode::Char('k'), &cancel);
+        assert_eq!(app.selected_host, Some(0));
+    }
+
+    #[test]
+    fn move_selection_treats_hidden_selection_as_no_selection() {
+        let mut app = app_with_three_hosts();
+        app.filter = Some("1.1".to_owned());
+        let cancel = AtomicBool::new(false);
+        // Host 1 is hidden, so the selection is invalid against the filter.
+        app.selected_host = Some(1);
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        assert_eq!(app.selected_host, Some(0));
+
+        app.selected_host = Some(1);
+        app.handle_key(KeyCode::Char('k'), &cancel);
+        assert_eq!(app.selected_host, Some(2));
+    }
+
+    #[test]
+    fn move_selection_clears_selection_when_nothing_visible() {
+        let mut app = app_with_three_hosts();
+        app.filter = Some("no-such-host".to_owned());
+        let cancel = AtomicBool::new(false);
+        app.selected_host = Some(0);
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        assert_eq!(app.selected_host, None);
+    }
+
+    #[test]
+    fn slash_starts_filter_input_mode_with_empty_buffer() {
+        let mut app = app_with_three_hosts();
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('/'), &cancel);
+        assert!(app.filter_mode);
+        assert!(app.filter_input.is_empty());
+        assert!(app.filter.is_none());
+    }
+
+    #[test]
+    fn typed_filter_text_filters_live_and_clears_hidden_selection() {
+        let mut app = app_with_three_hosts();
+        app.selected_host = Some(1);
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('/'), &cancel);
+        app.handle_key(KeyCode::Char('1'), &cancel);
+        app.handle_key(KeyCode::Char('1'), &cancel);
+        // "192.168.1.11" is the only host containing "11".
+        assert_eq!(app.filter_input, "11");
+        assert_eq!(app.visible_indices(), vec![2]);
+        // The previously selected host is now hidden.
+        assert_eq!(app.selected_host, None);
+    }
+
+    #[test]
+    fn enter_commits_filter_and_leaves_input_mode() {
+        let mut app = app_with_hosts(3);
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('/'), &cancel);
+        app.handle_key(KeyCode::Char('1'), &cancel);
+        app.handle_key(KeyCode::Char('0'), &cancel);
+        app.handle_key(KeyCode::Enter, &cancel);
+        assert_eq!(app.filter.as_deref(), Some("10"));
+        assert!(app.filter_input.is_empty());
+        assert!(!app.filter_mode);
+    }
+
+    #[test]
+    fn enter_with_empty_buffer_clears_committed_filter() {
+        let mut app = app_with_hosts(3);
+        app.filter = Some("10".to_owned());
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('/'), &cancel);
+        app.handle_key(KeyCode::Enter, &cancel);
+        assert!(app.filter.is_none());
+        assert!(app.filter_input.is_empty());
+        assert!(!app.filter_mode);
+    }
+
+    #[test]
+    fn esc_in_input_mode_discards_buffer_and_keeps_committed_filter() {
+        let mut app = app_with_hosts(3);
+        app.filter = Some("10".to_owned());
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('/'), &cancel);
+        app.handle_key(KeyCode::Char('a'), &cancel);
+        app.handle_key(KeyCode::Char('b'), &cancel);
+        app.handle_key(KeyCode::Esc, &cancel);
+        assert_eq!(app.filter.as_deref(), Some("10"));
+        assert!(app.filter_input.is_empty());
+        assert!(!app.filter_mode);
+    }
+
+    #[test]
+    fn esc_on_overview_clears_committed_filter() {
+        let mut app = app_with_hosts(3);
+        app.filter = Some("10".to_owned());
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Esc, &cancel);
+        assert!(app.filter.is_none());
+        assert!(!app.filter_mode);
+    }
+
+    #[test]
+    fn esc_on_overview_without_filter_is_a_noop() {
+        let mut app = app_with_hosts(3);
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Esc, &cancel);
+        assert!(app.filter.is_none());
+        assert!(!app.filter_mode);
+    }
+
+    #[test]
+    fn backspace_edits_filter_buffer() {
+        let mut app = app_with_hosts(3);
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('/'), &cancel);
+        app.handle_key(KeyCode::Char('a'), &cancel);
+        app.handle_key(KeyCode::Char('b'), &cancel);
+        app.handle_key(KeyCode::Backspace, &cancel);
+        assert_eq!(app.filter_input, "a");
+        app.handle_key(KeyCode::Backspace, &cancel);
+        assert!(app.filter_input.is_empty());
+        // A further backspace past the start is a no-op.
+        app.handle_key(KeyCode::Backspace, &cancel);
+        assert!(app.filter_input.is_empty());
+    }
+
+    #[test]
+    fn overview_keys_are_consumed_as_filter_input() {
+        let mut app = app_with_hosts(3);
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('/'), &cancel);
+        for key in [
+            KeyCode::Char('q'),
+            KeyCode::Char('c'),
+            KeyCode::Char('?'),
+            KeyCode::Char('j'),
+            KeyCode::Up,
+        ] {
+            app.handle_key(key, &cancel);
+        }
+        assert_eq!(app.filter_input, "qc?j");
+        assert!(app.filter_mode);
+        // None of the overview handlers ran.
+        assert!(!app.should_quit);
+        assert!(!cancel.load(Ordering::SeqCst));
+        assert!(!app.show_help);
+        assert_eq!(app.selected_host, None);
     }
 
     #[test]
@@ -1143,18 +1567,20 @@ mod tests {
     }
 
     #[test]
-    fn move_selection_clamps_stale_index_into_range() {
+    fn move_selection_treats_stale_index_as_no_selection() {
         let cancel = AtomicBool::new(false);
-        // Two hosts, but the selection points past the end.
+        // Two hosts, but the selection points past the end, so it is treated
+        // as no selection: down anchors on the first visible host...
         let mut app = app_with_hosts(2);
         app.selected_host = Some(9);
         app.handle_key(KeyCode::Char('j'), &cancel);
-        assert_eq!(app.selected_host, Some(1));
+        assert_eq!(app.selected_host, Some(0));
 
+        // ...and up anchors on the last.
         let mut app = app_with_hosts(2);
         app.selected_host = Some(9);
         app.handle_key(KeyCode::Char('k'), &cancel);
-        assert_eq!(app.selected_host, Some(0));
+        assert_eq!(app.selected_host, Some(1));
     }
 
     #[test]
