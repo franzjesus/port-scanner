@@ -1086,6 +1086,68 @@ Example:
 
 The exact schema should be treated as a versioned public format once released.
 
+## Tasks
+
+- [x]11.1 Dedicated serde export types in a new `src/export.rs` module:
+  `ExportDocument`, `ExportHost`, and `ExportPort`. The network model itself
+  carries no serde derives — the JSON document is the application's export
+  format and is owned by the export module so it can be versioned
+  independently of the internal model.
+- [x]11.2 `ExportDocument::from_scan`: converts the target plus discovered
+  hosts into the export format — lowercase states (`"up"`/`"down"`,
+  `"open"`/`"closed"`), latency in milliseconds, and an explicit
+  `protocol: "tcp"` on every port.
+- [x]11.3 `latency_ms` is an `f64` omitted entirely for down hosts
+  (`skip_serializing_if`), so a down host serializes as
+  `{"ip", "state": "down", "ports": []}` with no latency key.
+- [x]11.4 Deterministic file naming: base name `port-scanner-export.json`
+  (no clock or timezone), and the file is never overwritten — an existing
+  file causes the numeric suffix to increment
+  (`port-scanner-export-2.json`, `-3.json`, ...).
+- [x]11.5 `export_to(dir, …)` writes pretty-printed JSON into an explicit
+  directory (testable); `export(…)` is the cwd wrapper the TUI uses.
+- [x]11.6 TUI: the `e` key in the overview context exports the current
+  results whenever a target exists (it also works while a scan is running,
+  exporting whatever has been discovered so far); without a target it is a
+  no-op. The result shows on the status line as `Exported <path>` or
+  `Export failed: <error>`, and `start_scan` clears a stale export status.
+  In filter mode `e` is typed into the filter input, not exported.
+- [x]11.7 Document `e Export` in the hint line and the `?` help overlay.
+- [x]11.8 Tests: the JSON shape matches the plan example exactly (lowercase
+  states, `protocol`, millisecond latency), `latency_ms` is absent for down
+  hosts, the filename suffix increments on collision, `export_to` writes
+  valid JSON without overwriting an existing file, and the TUI treats `e` as
+  a no-op without a target and as filter input while filtering.
+- [ ]11.9 Headless CLI `--json` mode: run a scan from the command line and
+  write the same JSON document to a file or stdout without launching the
+  TUI. Deferred — the TUI route (`e`) is sufficient for the MVP.
+- [x]11.10 Update `PLAN.md`.
+
+## Notes
+
+- **Scope decision:** the plan's example shows a headless CLI invocation
+  (`port-scanner scan … --json`); only the TUI route was implemented. The
+  headless CLI mode is recorded as task 11.9 and is not required for the MVP
+  ("Results can be exported as JSON" is satisfied by the TUI export).
+- The network model deliberately has no serde derives: the export types are
+  a separate public contract, so changing internal field types or names does
+  not silently change the exported format.
+- Host state must not be reused from `HostState`'s `Display` (uppercase
+  `"UP"`/`"DOWN"`); the export conversion maps the enum explicitly to the
+  lowercase strings the format specifies.
+- Export writes to the process's current working directory; the file name
+  carries no timestamp, so repeated exports are distinguished only by the
+  incrementing suffix.
+- **Verified:** `cargo fmt --check` (clean), `cargo check` (no warnings),
+  `cargo test` (180 passed), `cargo clippy --all-targets` (no warnings),
+  `cargo build` (clean); a PTY smoke test with a minimal VT emulator
+  confirmed the full flow — a CLI-targeted scan reaching COMPLETED, `e`
+  producing `Exported <path>` on the status line and a file whose JSON
+  matches the plan's shape (`target`, one `up` host with `latency_ms`, both
+  requested ports with `protocol: "tcp"`), a second `e` creating
+  `port-scanner-export-2.json` without overwriting the first, and a clean `q`
+  exit (status 0).
+
 ---
 
 # 18\. Phase 12 — Service Detection
@@ -1483,7 +1545,7 @@ The MVP is complete when all of the following are true:
 - [x]Results can be filtered.
 - [x]Scans can be cancelled.
 - [x]A new scan can be started without restarting the application.
-- [ ]Results can be exported as JSON.
+- [x]Results can be exported as JSON.
 - [ ]Network errors do not crash the application.
 - [ ]Core scanner functionality has automated tests.
 - [ ]The scanner has no dependency on the TUI.

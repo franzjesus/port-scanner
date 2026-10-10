@@ -145,6 +145,9 @@ pub struct App {
     /// Set by `r` when no scan is active; the event loop consumes the flag and
     /// starts a new scan on the next iteration.
     rescan_requested: bool,
+    /// A short message about the most recent export attempt (Phase 11), shown
+    /// on the status line until a new scan is started.
+    export_status: Option<String>,
 }
 
 impl App {
@@ -339,6 +342,7 @@ impl App {
             KeyCode::Char('r') if !self.scan.is_active() => {
                 self.rescan_requested = true;
             }
+            KeyCode::Char('e') => self.export_results(),
             KeyCode::Char('/') => {
                 self.filter_input.clear();
                 self.filter_mode = true;
@@ -439,6 +443,22 @@ impl App {
         }
     }
 
+    /// Export the current scan results to a JSON file (Phase 11).
+    ///
+    /// Only acts when a target exists; otherwise it is a no-op. The results of
+    /// the current scan state (however far the scan has progressed) are
+    /// written to a file in the current directory, and the outcome is reported
+    /// on the status line via [`App::export_status`].
+    fn export_results(&mut self) {
+        let Some(target) = &self.target else {
+            return;
+        };
+        match crate::export::export(target, &self.hosts) {
+            Ok(path) => self.export_status = Some(format!("Exported {}", path.display())),
+            Err(err) => self.export_status = Some(format!("Export failed: {err}")),
+        }
+    }
+
     /// Transition to a terminal scan state, freezing the elapsed time.
     ///
     /// The start instant recorded on `ScanEvent::Started` is captured as the
@@ -476,6 +496,7 @@ impl App {
         self.hosts.clear();
         self.selected_host = None;
         self.scan_error = None;
+        self.export_status = None;
         self.ports_probed = 0;
         self.started_at = None;
         self.scan_duration = None;
@@ -631,6 +652,9 @@ fn draw(frame: &mut Frame, app: &App) {
     if let Some(err) = &app.scan_error {
         parts.push(format!("Error: {err}"));
     }
+    if let Some(status) = &app.export_status {
+        parts.push(status.clone());
+    }
     let status_line = Paragraph::new(parts.join("  "));
     frame.render_widget(status_line, chunks[1]);
 
@@ -658,7 +682,7 @@ fn draw(frame: &mut Frame, app: &App) {
     } else if let Some(filter) = app.filter.as_deref() {
         format!("Filter: {filter}  / Edit  Esc Clear  ? Help  q Quit")
     } else {
-        "↑/k Up  ↓/j Down  Enter Detail  / Filter  ? Help  c Cancel  q Quit".to_string()
+        "↑/k Up  ↓/j Down  Enter Detail  / Filter  e Export  ? Help  c Cancel  q Quit".to_string()
     };
     frame.render_widget(Paragraph::new(hint), chunks[3]);
 
@@ -792,6 +816,7 @@ fn draw_help_overlay(frame: &mut Frame) {
         "  ↑/k    Up",
         "  ↓/j    Down",
         "  /      Filter",
+        "  e      Export",
         "  ?      Help",
         "  r      Rescan",
         "  c      Cancel",
@@ -1096,6 +1121,28 @@ mod tests {
         app.handle_key(KeyCode::Char('r'), &cancel);
         assert!(app.rescan_requested);
         assert_eq!(app.scan, ScanState::Completed);
+    }
+
+    #[test]
+    fn export_key_is_noop_without_target() {
+        let mut app = App::default();
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('e'), &cancel);
+        assert!(app.export_status.is_none());
+        assert!(!cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn export_key_types_into_filter_input_while_filtering() {
+        let mut app = App {
+            target: Some(ScanTarget::parse("127.0.0.1").unwrap()),
+            ..Default::default()
+        };
+        app.filter_mode = true;
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('e'), &cancel);
+        assert!(app.export_status.is_none());
+        assert_eq!(app.filter_input, "e");
     }
 
     #[test]
