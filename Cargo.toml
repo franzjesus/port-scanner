@@ -12,6 +12,7 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ipnet = "2.12.2"
 libc = "0.2"
+rsmanuf = "2026.10.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

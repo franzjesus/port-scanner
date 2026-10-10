@@ -4,6 +4,7 @@ use std::fmt;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
+use super::mac::MacAddress;
 use super::port::{Port, PortState, ProbedPort};
 
 /// The liveness state of a host, as determined by the scanner.
@@ -31,9 +32,15 @@ impl fmt::Display for HostState {
 
 /// A host discovered by the scanner and its current state.
 ///
-/// Fields whose functionality has not yet been implemented (hostname, MAC
-/// address, vendor) are intentionally omitted; see `PLAN.md` for the full
-/// conceptual model.
+/// The enrichment fields ([`hostname`], [`mac`], and [`vendor`]) are
+/// populated after discovery, when the optional enrichment stage (see
+/// `PLAN.md` Phase 13) fills them in. They are `None` until then. A vendor
+/// is derived from the MAC's OUI and therefore only exists when a MAC is
+/// present.
+///
+/// [`hostname`]: Host::hostname
+/// [`mac`]: Host::mac
+/// [`vendor`]: Host::vendor
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Host {
     /// The host's IPv4 address.
@@ -45,6 +52,13 @@ pub struct Host {
     /// TCP ports probed on this host and the state each probe found, kept
     /// sorted ascending by port and unique.
     pub ports: Vec<ProbedPort>,
+    /// The host's reverse-DNS name, present only if a name was resolved.
+    pub hostname: Option<String>,
+    /// The host's link-layer (MAC) address, present only if one was learned.
+    pub mac: Option<MacAddress>,
+    /// The vendor for the MAC's OUI, present only if a MAC is known and its
+    /// OUI resolved to a vendor.
+    pub vendor: Option<String>,
 }
 
 impl Host {
@@ -56,6 +70,9 @@ impl Host {
             state: HostState::Up,
             latency: Some(latency),
             ports: Vec::new(),
+            hostname: None,
+            mac: None,
+            vendor: None,
         }
     }
 
@@ -66,6 +83,9 @@ impl Host {
             state: HostState::Down,
             latency: None,
             ports: Vec::new(),
+            hostname: None,
+            mac: None,
+            vendor: None,
         }
     }
 

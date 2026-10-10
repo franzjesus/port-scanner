@@ -1308,6 +1308,62 @@ Important:
 - Do not fail an entire scan because enrichment fails.
 - Clearly distinguish discovered information from inferred information.
 
+## Tasks
+
+- [ ]13.1 Add the `MacAddress` type in `src/network/mac.rs`: six bytes,
+  `Display` as `AA:BB:CC:DD:EE:FF`, `FromStr`, OUI extraction (first three
+  bytes), `is_zero()`, and `Copy`/`Eq`/`Hash` derives. Wire it into the
+  `network` module.
+- [ ]13.2 `Host` gains `hostname: Option<String>`, `mac: Option<MacAddress>`,
+  and `vendor: Option<String>`, all `None` from `Host::up`. Update the
+  "intentionally omitted" doc comment to reflect that these are now optional
+  enrichment fields.
+- [ ]13.3 Add `src/scanner/enrichment.rs`: the `HostEnricher: Send + Sync`
+  trait (`fn enrich(&self, ip: Ipv4Addr) -> Result<Option<HostEnrichment>,
+  EnrichmentError>`), the `HostEnrichment { hostname, mac }` carrier, and the
+  `EnrichmentError { Timeout, Lookup(String) }` error — mirroring
+  `ServiceDetector`.
+- [ ]13.4 Implement `ReverseDnsEnricher` using `libc::getnameinfo` with
+  `NI_NAMEREQD` on an IPv4 `sockaddr`. Because the lookup blocks with no
+  timeout, run it on a short-lived worker thread and bound it with a channel
+  `recv_timeout`; a timeout or `EAI_NONAME` yields `Ok(None)`, other failures
+  yield `Err(EnrichmentError)`.
+- [ ]13.5 Implement `ArpEnricher` reading an injectable path (default
+  `/proc/net/arp`), matching the host's IP and returning its hardware
+  address. Skip incomplete `00:00:00:00:00:00` entries; an unreadable or
+  malformed file yields `Err(EnrichmentError::Lookup)`.
+- [ ]13.6 Add `vendor_for(&MacAddress) -> Option<String>` mapping the OUI to a
+  vendor via the `rsmanuf` crate, returning `None` for an empty or
+  `"unknown"` result (vendor is *inferred*, not discovered).
+- [ ]13.7 Add the `ScanEvent::HostEnriched { ip, hostname, mac, vendor }`
+  variant.
+- [ ]13.8 `ScanConfig` gains `enrich: bool`, defaulting to `true` (enrichment
+  is on by default, consistent with target → hosts → services). Update
+  `ScanConfig::new`.
+- [ ]13.9 `run_scan` takes `enrichers: &[Box<dyn HostEnricher>]` and, for each
+  up host, runs them after its port scan (interleaved per host, bounded, with
+  a cancellation check before the stage). It merges any returned hostname/MAC,
+  derives the vendor from the MAC, and emits `HostEnriched` only when at least
+  one field is present. An enricher failure is dropped, never fatal.
+- [ ]13.10 CLI: a `--no-enrichment` flag disables enrichment; the spawner
+  captures the default enrichers and passes them to `run_scan`.
+- [ ]13.11 TUI: `apply_event` handles `HostEnriched` by attaching
+  hostname/mac/vendor to the matching host. No scan-state transition.
+- [ ]13.12 TUI: the host detail shows the enrichment, clearly labelling
+  discovered information (hostname, MAC) separately from inferred information
+  (vendor). The host table stays focused on port numbers.
+- [ ]13.13 TUI: `host_matches` also matches hostnames and vendors
+  case-insensitively.
+- [ ]13.14 JSON export: include `hostname`, `mac`, and `vendor` on
+  `ExportHost` (absent when unknown).
+- [ ]13.15 Tests: `MacAddress` round-trip and OUI extraction; the reverse-DNS
+  and ARP enrichers against injected fixtures (no network); `vendor_for`;
+  `run_scan` with enrichment on and off using a fake enricher (no network);
+  and TUI attach/filter behavior.
+- [ ]13.16 Verify: `cargo fmt --check`, `cargo check`, `cargo test`,
+  `cargo clippy --all-targets`, and a PTY smoke test confirming enrichment
+  shows in the host detail without disturbing progress. Update `PLAN.md`.
+
 ---
 
 # 20\. Phase 14 — Persistence
