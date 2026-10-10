@@ -6,6 +6,8 @@
 
 pub mod host;
 pub mod port;
+pub mod service;
 
 pub use host::{Host, HostState};
 pub use port::{Port, PortState, ProbedPort};
+pub use service::ServiceInfo;

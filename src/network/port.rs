@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use super::service::ServiceInfo;
+
 /// A TCP port number, validated to the 1–65535 range.
 ///
 /// A newtype over `u16` so a port value cannot be confused with a plain
@@ -84,18 +86,26 @@ impl fmt::Display for PortState {
 /// The scanner reports a [`PortState`] for every probed port (both open and
 /// closed); this pairs the two so a host can record the full set of ports it
 /// actually probed, not just the ones found open.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbedPort {
     /// The port that was probed.
     pub port: Port,
     /// The state the probe found.
     pub state: PortState,
+    /// The service detected on this port, when detection was run and a
+    /// detector identified one.
+    pub service: Option<ServiceInfo>,
 }
 
 impl ProbedPort {
-    /// Pair a probed port with the state the probe found.
+    /// Pair a probed port with the state the probe found; no service is
+    /// recorded yet.
     pub const fn new(port: Port, state: PortState) -> Self {
-        Self { port, state }
+        Self {
+            port,
+            state,
+            service: None,
+        }
     }
 }
 
@@ -160,5 +170,6 @@ mod tests {
         let probed = ProbedPort::new(Port::new(443).unwrap(), PortState::Closed);
         assert_eq!(probed.port, Port::new(443).unwrap());
         assert_eq!(probed.state, PortState::Closed);
+        assert_eq!(probed.service, None);
     }
 }

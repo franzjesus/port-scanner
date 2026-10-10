@@ -29,7 +29,7 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use crate::network::{Host, HostState, PortState, ProbedPort};
+use crate::network::{Host, HostState, PortState, ProbedPort, ServiceInfo};
 use crate::scanner::{ScanConfig, ScanEvent, ScanSpawner};
 use crate::target::ScanTarget;
 
@@ -283,6 +283,17 @@ impl App {
                 self.ports_probed += 1;
                 if let Some(host) = self.hosts.iter_mut().find(|h| h.ip == ip) {
                     host.add_probed_port(port, state);
+                }
+            }
+            ScanEvent::ServiceDiscovered { ip, port, service } => {
+                // Attach the detected service to the probed-port record. The
+                // port was already reported open before any service event, so
+                // neither the scan state nor the progress counts change here;
+                // a missing host or port entry is simply ignored.
+                if let Some(host) = self.hosts.iter_mut().find(|h| h.ip == ip) {
+                    if let Some(probed) = host.ports.iter_mut().find(|p| p.port == port) {
+                        probed.service = Some(service);
+                    }
                 }
             }
             ScanEvent::Error(err) => {
@@ -746,9 +757,10 @@ fn host_table<'a>(app: &'a App, visible: &'a [usize], area: Rect) -> Table<'a> {
 /// Whether a host matches a case-insensitive filter needle.
 ///
 /// An empty needle matches every host. Otherwise the needle is matched as a
-/// substring against the IP address, the state name, and each probed port
-/// number (Phase 9). Matching is done on the display form of each field, so
-/// the needle never needs to know about the underlying types.
+/// substring against the IP address, the state name, each probed port number
+/// (Phase 9), and each detected service name (Phase 12). Matching is done on
+/// the display form of each field, so the needle never needs to know about
+/// the underlying types.
 fn host_matches(host: &Host, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
@@ -764,6 +776,12 @@ fn host_matches(host: &Host, needle: &str) -> bool {
             .ports
             .iter()
             .any(|probed| probed.port.to_string().contains(&needle))
+        || host.ports.iter().any(|probed| {
+            probed
+                .service
+                .as_ref()
+                .is_some_and(|service| service.name.to_ascii_lowercase().contains(&needle))
+        })
 }
 
 /// First visible row index for a scrollable host list.
@@ -853,11 +871,16 @@ fn draw_host_detail(frame: &mut Frame, app: &App, area: Rect) {
                 host.ports
                     .iter()
                     .map(|p| {
-                        format!(
+                        let mut line = format!(
                             "{:<12}{}",
                             format!("{}/tcp", p.port),
                             p.state.to_string().to_uppercase()
-                        )
+                        );
+                        if let Some(service) = &p.service {
+                            line.push(' ');
+                            line.push_str(&service_label(service));
+                        }
+                        line
                     })
                     .collect()
             },
@@ -880,6 +903,16 @@ fn format_latency(latency: Option<Duration>) -> String {
     match latency {
         Some(latency) => format!("{:.1} ms", latency.as_secs_f64() * 1000.0),
         None => "-".to_owned(),
+    }
+}
+
+/// The display label for a detected service: its name, with the version
+/// appended when known (for example `ssh 9.0`). Only detected information is
+/// shown; a port without a detected service is not labelled (Phase 12).
+fn service_label(service: &ServiceInfo) -> String {
+    match &service.version {
+        Some(version) => format!("{} {}", service.name, version),
+        None => service.name.clone(),
     }
 }
 
@@ -1248,9 +1281,100 @@ mod tests {
         host.add_probed_port(Port::new(443).unwrap(), PortState::Closed);
         assert!(host_matches(&host, "22"));
         assert!(host_matches(&host, "443"));
-        // Service names are not matched until service detection (Phase 17).
+        // No service has been detected on either port, so a service needle
+        // does not match; an unprobed port number never matches either.
         assert!(!host_matches(&host, "ssh"));
         assert!(!host_matches(&host, "8080"));
+    }
+
+    #[test]
+    fn host_matches_detected_service_names() {
+        let mut host = Host::up("10.0.0.1".parse().unwrap(), Duration::from_millis(1));
+        host.add_probed_port(Port::new(22).unwrap(), PortState::Open);
+        host.ports
+            .iter_mut()
+            .find(|p| p.port == Port::new(22).unwrap())
+            .unwrap()
+            .service = Some(ServiceInfo::new("ssh"));
+        // Case-insensitive substring match against the detected service name.
+        assert!(host_matches(&host, "ssh"));
+        assert!(host_matches(&host, "SSH"));
+        assert!(host_matches(&host, "sh"));
+        assert!(!host_matches(&host, "http"));
+        assert!(!host_matches(&host, "telnet"));
+    }
+
+    #[test]
+    fn service_label_omits_version_when_absent() {
+        assert_eq!(service_label(&ServiceInfo::new("http")), "http");
+    }
+
+    #[test]
+    fn service_label_includes_version_when_present() {
+        let mut service = ServiceInfo::new("ssh");
+        service.version = Some("OpenSSH_9.6p1".to_string());
+        assert_eq!(service_label(&service), "ssh OpenSSH_9.6p1");
+    }
+
+    #[test]
+    fn service_discovered_attaches_to_matching_host_and_port() {
+        let mut app = App::default();
+        let ip = "10.0.0.1".parse::<Ipv4Addr>().unwrap();
+        // Mirror the real event order: Started moves Idle -> Discovering,
+        // which is the state the first PortDiscovered transitions out of.
+        app.apply_event(ScanEvent::Started { total: 1 });
+        app.apply_event(ScanEvent::HostDiscovered(Host::up(
+            ip,
+            Duration::from_millis(1),
+        )));
+        app.apply_event(ScanEvent::PortDiscovered {
+            ip,
+            port: Port::new(22).unwrap(),
+            state: PortState::Open,
+        });
+        app.apply_event(ScanEvent::ServiceDiscovered {
+            ip,
+            port: Port::new(22).unwrap(),
+            service: ServiceInfo::new("ssh"),
+        });
+
+        let host = &app.hosts[0];
+        let probed = host
+            .ports
+            .iter()
+            .find(|p| p.port == Port::new(22).unwrap())
+            .unwrap();
+        assert_eq!(probed.service, Some(ServiceInfo::new("ssh")));
+        // The service event attaches data only; it does not change the scan
+        // state or the probed-port count (the port event already did).
+        assert_eq!(app.scan, ScanState::ScanningPorts);
+        assert_eq!(app.ports_probed, 1);
+    }
+
+    #[test]
+    fn service_discovered_for_unknown_host_or_port_is_ignored() {
+        let mut app = App::default();
+        // Unknown host: nothing to attach to, and no host is created.
+        app.apply_event(ScanEvent::ServiceDiscovered {
+            ip: "10.0.0.9".parse().unwrap(),
+            port: Port::new(22).unwrap(),
+            service: ServiceInfo::new("ssh"),
+        });
+        assert!(app.hosts.is_empty());
+
+        // Known host, unprobed port: silently ignored.
+        let ip = "10.0.0.1".parse::<Ipv4Addr>().unwrap();
+        app.apply_event(ScanEvent::HostDiscovered(Host::up(
+            ip,
+            Duration::from_millis(1),
+        )));
+        app.apply_event(ScanEvent::ServiceDiscovered {
+            ip,
+            port: Port::new(8080).unwrap(),
+            service: ServiceInfo::new("http"),
+        });
+        assert!(app.hosts[0].ports.is_empty());
+        assert_eq!(app.ports_probed, 0);
     }
 
     #[test]

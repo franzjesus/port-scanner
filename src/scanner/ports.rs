@@ -27,7 +27,7 @@
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::network::{Port, PortState};
@@ -62,7 +62,7 @@ impl PortScanner for TcpPortScanner {
         config: &PortConfig,
         events: &Sender<ScanEvent>,
         cancel: &Arc<AtomicBool>,
-    ) -> Result<(), ScanError> {
+    ) -> Result<Vec<Port>, ScanError> {
         // The ports to probe, in ascending order. `PortSpec` guarantees they
         // are sorted and unique, so the shared counter below walks a stable
         // list.
@@ -70,20 +70,23 @@ impl PortScanner for TcpPortScanner {
         let workers = worker_count(config.concurrency, ports.len());
         if workers == 0 {
             // An empty port selection has nothing to probe.
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         // All workers share one `Arc` over the port list (cheap to clone per
         // worker even for a full scan) and one atomic counter of the next index
-        // to claim.
+        // to claim. Open ports are collected into a shared `Vec` so the result
+        // can be returned once every worker has drained its share.
         let ports = Arc::new(ports);
         let next = Arc::new(AtomicUsize::new(0));
+        let open = Arc::new(Mutex::new(Vec::new()));
         let timeout = config.timeout;
 
         let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {
             let ports = Arc::clone(&ports);
             let next = Arc::clone(&next);
+            let open = Arc::clone(&open);
             let events = events.clone();
             let cancel = Arc::clone(cancel);
 
@@ -107,6 +110,13 @@ impl PortScanner for TcpPortScanner {
                         Err(_) => PortState::Closed,
                     };
                     let _ = events.send(ScanEvent::PortDiscovered { ip, port, state });
+                    if state == PortState::Open {
+                        // Record the open port so the caller can act on the
+                        // result (for example, service detection).
+                        if let Ok(mut open) = open.lock() {
+                            open.push(port);
+                        }
+                    }
                 }
             });
             handles.push(handle);
@@ -121,7 +131,16 @@ impl PortScanner for TcpPortScanner {
             let _ = handle.join();
         }
 
-        Ok(())
+        // Every worker has finished, so the collected list is complete. The
+        // ports were discovered concurrently, so sort them into a stable,
+        // ascending order before returning. A poisoned lock means a worker
+        // panicked mid-push; the (possibly partial) list is still usable.
+        let mut open_ports = match open.lock() {
+            Ok(open) => open.to_vec(),
+            Err(poisoned) => poisoned.into_inner().to_vec(),
+        };
+        open_ports.sort_unstable();
+        Ok(open_ports)
     }
 }
 
@@ -198,9 +217,12 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        TcpPortScanner
+        let open_ports = TcpPortScanner
             .scan(ip, &config, &tx, &cancel)
             .expect("port scan should complete without error");
+
+        // The scan returns exactly the ports it found open.
+        assert_eq!(open_ports, vec![Port::new(open_port).unwrap()]);
 
         // Drop the original sender so the channel closes once every worker's
         // clone is dropped (they all are, since `scan` joins every worker).

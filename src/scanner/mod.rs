@@ -16,7 +16,7 @@ use std::sync::mpsc::{SendError, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::network::{Host, Port, PortState};
+use crate::network::{Host, Port, PortState, ServiceInfo};
 use crate::ports::PortConfig;
 use crate::target::ScanTarget;
 
@@ -40,6 +40,14 @@ mod ports;
 // Re-exported so the scanner entry point is reachable as
 // `scanner::TcpPortScanner` from `main.rs`.
 pub use ports::TcpPortScanner;
+
+/// Service detection for open ports (HTTP, HTTPS, SSH banners).
+mod services;
+// Used by [`run_scan`] to accept the detector set; the trait itself stays
+// reachable as `scanner::services::ServiceDetector`.
+use services::ServiceDetector;
+// Re-exported so `main.rs` can build the default detector set for a scan.
+pub use services::default_detectors;
 
 /// A structured message produced by the scanner as a scan progresses.
 ///
@@ -65,6 +73,19 @@ pub enum ScanEvent {
         port: Port,
         /// Whether the port is open or closed.
         state: PortState,
+    },
+    /// A service listening on an open port was identified.
+    ///
+    /// Emitted after a port is found open and a detector recognizes the
+    /// service on it; the TUI attaches it to the host's probed-port record.
+    /// Ports with no recognized service produce no event.
+    ServiceDiscovered {
+        /// The host the service was detected on.
+        ip: Ipv4Addr,
+        /// The port the service is listening on.
+        port: Port,
+        /// The identified service.
+        service: ServiceInfo,
     },
     /// Progress update: `completed` hosts resolved out of `total`.
     Progress { completed: u64, total: u64 },
@@ -150,6 +171,10 @@ pub struct ScanConfig {
     pub discovery: DiscoveryConfig,
     /// Tunables for the TCP port stage.
     pub ports: PortConfig,
+    /// Whether to attempt service detection on open ports after the port
+    /// stage. Enabled by default; can be turned off with the
+    /// `--no-services` CLI flag.
+    pub detect_services: bool,
 }
 
 /// Builds and runs one scan in a background thread.
@@ -169,12 +194,13 @@ pub type ScanSpawner = Box<
 
 impl ScanConfig {
     /// Create a configuration for `target` using the default discovery and
-    /// port settings.
+    /// port settings, with service detection enabled.
     pub fn new(target: ScanTarget) -> Self {
         Self {
             target,
             discovery: DiscoveryConfig::default(),
             ports: PortConfig::default(),
+            detect_services: true,
         }
     }
 }
@@ -221,6 +247,10 @@ pub trait HostDiscovery {
 /// blocking: the call returns once every port has been probed or the scan was
 /// cancelled.
 ///
+/// The returned `Vec<Port>` is the list of ports that were found **open**, in
+/// ascending order. The orchestrator uses it to drive service detection without
+/// re-deriving the open set from the event stream.
+///
 /// Unlike [`HostDiscovery`], this trait does not emit [`ScanEvent::Started`]
 /// or [`ScanEvent::Finished`]; a whole scan (discovery plus ports) is framed by
 /// a single pair of those events, owned by the orchestrating scan (see Phase 4
@@ -231,36 +261,49 @@ pub trait PortScanner {
     ///
     /// `cancel` is checked before each new connection is started; when set, no
     /// further ports are probed (in-flight connections are allowed to finish).
+    ///
+    /// Returns the ports that came up open, sorted ascending, so the caller can
+    /// probe their services without re-scanning.
     fn scan(
         &self,
         ip: Ipv4Addr,
         config: &PortConfig,
         events: &Sender<ScanEvent>,
         cancel: &Arc<AtomicBool>,
-    ) -> Result<(), ScanError>;
+    ) -> Result<Vec<Port>, ScanError>;
 }
 
-/// Run a full scan of `target`: discover which hosts are up, then port-scan
-/// every host that comes up.
+/// Run a full scan of `target`: discover which hosts are up, port-scan every
+/// host that comes up, and (when enabled) detect the service on each open port.
 ///
 /// This is the orchestrating entry point for a whole scan. A single run is
 /// framed by exactly one [`ScanEvent::Started`] / [`ScanEvent::Finished`] (or
-/// [`ScanEvent::Cancelled`]) pair; the discovery and port-scanning stages stream
-/// their intermediate events ([`ScanEvent::HostDiscovered`],
-/// [`ScanEvent::Progress`], [`ScanEvent::PortDiscovered`]) inside that frame.
+/// [`ScanEvent::Cancelled`]) pair; the discovery, port-scanning, and
+/// service-detection stages stream their intermediate events
+/// ([`ScanEvent::HostDiscovered`], [`ScanEvent::Progress`],
+/// [`ScanEvent::PortDiscovered`], [`ScanEvent::ServiceDiscovered`]) inside
+/// that frame.
 ///
-/// The discovery and port-scanning mechanisms are supplied as traits so this
-/// orchestrator stays independent of any concrete implementation. `config`
-/// carries the target and the per-stage tunables (see [`ScanConfig`]).
+/// The discovery, port-scanning, and service-detection mechanisms are supplied
+/// as traits so this orchestrator stays independent of any concrete
+/// implementation. `config` carries the target and the per-stage tunables
+/// (see [`ScanConfig`]).
+///
+/// Service detection runs only when [`ScanConfig::detect_services`] is set and
+/// `detectors` is non-empty; it probes each open port in turn and stops at the
+/// first detector that recognizes the service. A detector failure never fails
+/// the scan: the failed detector is skipped and the next one is tried.
 ///
 /// Cancellation is cooperative: when `cancel` is set, discovery stops (and
-/// reports [`ScanEvent::Cancelled`]) and no further hosts are port-scanned;
-/// in-flight connections are allowed to finish. Both normal completion and
-/// cancellation return `Ok(())` — only a fatal error returns `Err`.
+/// reports [`ScanEvent::Cancelled`]) and no further hosts are port-scanned or
+/// service-probed; in-flight connections are allowed to finish. Both normal
+/// completion and cancellation return `Ok(())` — only a fatal error returns
+/// `Err`.
 pub fn run_scan<D: HostDiscovery, P: PortScanner>(
     config: &ScanConfig,
     discovery: &D,
     port_scanner: &P,
+    detectors: &[Box<dyn ServiceDetector>],
     events: &Sender<ScanEvent>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(), ScanError> {
@@ -279,9 +322,36 @@ pub fn run_scan<D: HostDiscovery, P: PortScanner>(
                     let _ = events.send(ScanEvent::Cancelled);
                     return Ok(());
                 }
-                if let Err(err) = port_scanner.scan(host.ip, &config.ports, events, cancel) {
-                    let _ = events.send(ScanEvent::Error(err.clone()));
-                    return Err(err);
+                let open_ports = match port_scanner.scan(host.ip, &config.ports, events, cancel) {
+                    Ok(open_ports) => open_ports,
+                    Err(err) => {
+                        let _ = events.send(ScanEvent::Error(err.clone()));
+                        return Err(err);
+                    }
+                };
+                // Service detection on the ports that came up open. Skipped
+                // entirely when disabled or when no detectors are configured.
+                // Cancellation is checked before each new probe so a cancelled
+                // scan stops scheduling further probes.
+                if config.detect_services && !detectors.is_empty() {
+                    for &port in &open_ports {
+                        if cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        for detector in detectors {
+                            // First recognition wins for this port. Anything
+                            // else (no match, or a probe failure) falls
+                            // through to the next detector.
+                            if let Ok(Some(service)) = detector.detect(host.ip, port) {
+                                let _ = events.send(ScanEvent::ServiceDiscovered {
+                                    ip: host.ip,
+                                    port,
+                                    service,
+                                });
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             // The last host's scan may have started before cancellation was
@@ -377,6 +447,7 @@ mod tests {
         assert_eq!(config.target, ScanTarget::Host(Ipv4Addr::LOCALHOST));
         assert_eq!(config.discovery, DiscoveryConfig::default());
         assert_eq!(config.ports, PortConfig::default());
+        assert!(config.detect_services, "service detection is on by default");
     }
 
     /// Runs a full scan against loopback and checks that the whole run — host
@@ -411,11 +482,14 @@ mod tests {
                 timeout: Duration::from_millis(500),
                 concurrency: 4,
             },
+            // Service detection stays off: this test only checks the scan
+            // framing, and empty detectors would make detection a no-op anyway.
+            detect_services: false,
         };
 
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        let result = run_scan(&config, &IcmpDiscovery, &TcpPortScanner, &tx, &cancel);
+        let result = run_scan(&config, &IcmpDiscovery, &TcpPortScanner, &[], &tx, &cancel);
         drop(tx);
 
         // Skip in environments where ICMP is unavailable.
@@ -466,6 +540,265 @@ mod tests {
         assert_eq!(
             port_events, 2,
             "expected one event per probed port: {events:?}"
+        );
+    }
+
+    // --- Hermetic fakes for the service-detection orchestration -----------
+
+    /// A [`HostDiscovery`] that reports the target's address as a single up
+    /// host without touching the network, so the orchestrator can be tested
+    /// independently of ICMP availability.
+    struct FakeDiscovery;
+
+    impl HostDiscovery for FakeDiscovery {
+        fn discover(
+            &self,
+            target: &ScanTarget,
+            _config: &DiscoveryConfig,
+            events: &Sender<ScanEvent>,
+            _cancel: &Arc<AtomicBool>,
+        ) -> Result<DiscoveryOutcome, ScanError> {
+            let ip = match target {
+                ScanTarget::Host(ip) => *ip,
+                ScanTarget::Subnet(net) => net.network(),
+            };
+            let host = Host::up(ip, Duration::from_millis(1));
+            let _ = events.send(ScanEvent::HostDiscovered(host.clone()));
+            let _ = events.send(ScanEvent::Progress {
+                completed: 1,
+                total: 1,
+            });
+            Ok(DiscoveryOutcome::Completed(vec![host]))
+        }
+    }
+
+    /// A [`PortScanner`] that reports fixed open (80, 22) and closed (23)
+    /// ports without touching the network.
+    struct FakePortScanner;
+
+    impl PortScanner for FakePortScanner {
+        fn scan(
+            &self,
+            ip: Ipv4Addr,
+            _config: &PortConfig,
+            events: &Sender<ScanEvent>,
+            _cancel: &Arc<AtomicBool>,
+        ) -> Result<Vec<Port>, ScanError> {
+            let open = [Port::new(80).unwrap(), Port::new(22).unwrap()];
+            for port in open {
+                let _ = events.send(ScanEvent::PortDiscovered {
+                    ip,
+                    port,
+                    state: PortState::Open,
+                });
+            }
+            let closed = Port::new(23).unwrap();
+            let _ = events.send(ScanEvent::PortDiscovered {
+                ip,
+                port: closed,
+                state: PortState::Closed,
+            });
+            Ok(open.to_vec())
+        }
+    }
+
+    /// A [`ServiceDetector`] that recognizes one port with a fixed service
+    /// name and nothing else.
+    struct RecognizingDetector {
+        port: Port,
+        name: &'static str,
+    }
+
+    impl ServiceDetector for RecognizingDetector {
+        fn detect(
+            &self,
+            _ip: Ipv4Addr,
+            port: Port,
+        ) -> Result<Option<ServiceInfo>, super::services::ServiceError> {
+            if port == self.port {
+                Ok(Some(ServiceInfo::new(self.name)))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    /// A [`ServiceDetector`] that never recognizes a service.
+    struct NoMatchDetector;
+
+    impl ServiceDetector for NoMatchDetector {
+        fn detect(
+            &self,
+            _ip: Ipv4Addr,
+            _port: Port,
+        ) -> Result<Option<ServiceInfo>, super::services::ServiceError> {
+            Ok(None)
+        }
+    }
+
+    /// A [`ServiceDetector`] that always fails; the orchestrator must skip it
+    /// without failing the scan.
+    struct FailingDetector;
+
+    impl ServiceDetector for FailingDetector {
+        fn detect(
+            &self,
+            _ip: Ipv4Addr,
+            _port: Port,
+        ) -> Result<Option<ServiceInfo>, super::services::ServiceError> {
+            Err(super::services::ServiceError::Io(
+                "forced failure".to_string(),
+            ))
+        }
+    }
+
+    /// Runs the orchestrator against the hermetic fakes and returns the
+    /// result plus every event that was produced.
+    fn run_fake_scan(
+        detect_services: bool,
+        detectors: Vec<Box<dyn ServiceDetector>>,
+    ) -> (Result<(), ScanError>, Vec<ScanEvent>) {
+        use std::sync::mpsc;
+
+        let config = ScanConfig {
+            target: ScanTarget::Host(Ipv4Addr::LOCALHOST),
+            discovery: DiscoveryConfig::default(),
+            ports: PortConfig::default(),
+            detect_services,
+        };
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = run_scan(
+            &config,
+            &FakeDiscovery,
+            &FakePortScanner,
+            &detectors,
+            &tx,
+            &cancel,
+        );
+        drop(tx);
+        (result, rx.try_iter().collect())
+    }
+
+    /// Collects the `(port, service)` pairs from `ServiceDiscovered` events.
+    fn service_events(events: &[ScanEvent]) -> Vec<(Port, ServiceInfo)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ScanEvent::ServiceDiscovered { port, service, .. } => {
+                    Some((*port, service.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn run_scan_detects_services_on_open_ports_when_enabled() {
+        let detectors: Vec<Box<dyn ServiceDetector>> = vec![Box::new(RecognizingDetector {
+            port: Port::new(80).unwrap(),
+            name: "http",
+        })];
+        let (result, events) = run_fake_scan(true, detectors);
+        assert!(result.is_ok(), "scan must succeed: {result:?}");
+
+        // Only the open port the detector recognizes gets a service; the
+        // other open port (22) and the closed port (23) do not.
+        let services = service_events(&events);
+        assert_eq!(services.len(), 1, "events: {events:?}");
+        assert_eq!(services[0].0, Port::new(80).unwrap());
+        assert_eq!(services[0].1.name, "http");
+
+        assert!(
+            matches!(events.last(), Some(ScanEvent::Finished)),
+            "scan still finishes: {events:?}"
+        );
+    }
+
+    #[test]
+    fn run_scan_skips_service_detection_when_disabled() {
+        let detectors: Vec<Box<dyn ServiceDetector>> = vec![Box::new(RecognizingDetector {
+            port: Port::new(80).unwrap(),
+            name: "http",
+        })];
+        let (result, events) = run_fake_scan(false, detectors);
+        assert!(result.is_ok(), "scan must succeed: {result:?}");
+        assert!(
+            service_events(&events).is_empty(),
+            "detection must not run when disabled: {events:?}"
+        );
+    }
+
+    #[test]
+    fn run_scan_skips_service_detection_without_detectors() {
+        let (result, events) = run_fake_scan(true, vec![]);
+        assert!(result.is_ok(), "scan must succeed: {result:?}");
+        assert!(
+            service_events(&events).is_empty(),
+            "no detectors means no detection: {events:?}"
+        );
+    }
+
+    #[test]
+    fn run_scan_first_recognizing_detector_wins() {
+        let detectors: Vec<Box<dyn ServiceDetector>> = vec![
+            Box::new(RecognizingDetector {
+                port: Port::new(80).unwrap(),
+                name: "alpha",
+            }),
+            Box::new(RecognizingDetector {
+                port: Port::new(80).unwrap(),
+                name: "beta",
+            }),
+        ];
+        let (result, events) = run_fake_scan(true, detectors);
+        assert!(result.is_ok(), "scan must succeed: {result:?}");
+
+        let services = service_events(&events);
+        assert_eq!(services.len(), 1, "one service per port: {events:?}");
+        assert_eq!(services[0].1.name, "alpha", "first recognizer wins");
+    }
+
+    #[test]
+    fn run_scan_detector_failure_is_skipped_not_fatal() {
+        let detectors: Vec<Box<dyn ServiceDetector>> = vec![
+            Box::new(FailingDetector),
+            Box::new(RecognizingDetector {
+                port: Port::new(80).unwrap(),
+                name: "http",
+            }),
+        ];
+        let (result, events) = run_fake_scan(true, detectors);
+        assert!(
+            result.is_ok(),
+            "a detector failure must not fail the scan: {result:?}"
+        );
+
+        // The failing detector is skipped and the next one still reports.
+        let services = service_events(&events);
+        assert_eq!(services.len(), 1, "events: {events:?}");
+        assert_eq!(services[0].1.name, "http");
+
+        // A detector failure is not a scan error.
+        assert!(
+            !events.iter().any(|e| matches!(e, ScanEvent::Error(_))),
+            "no Error event expected: {events:?}"
+        );
+    }
+
+    #[test]
+    fn run_scan_no_service_when_no_detector_recognizes() {
+        let detectors: Vec<Box<dyn ServiceDetector>> =
+            vec![Box::new(NoMatchDetector), Box::new(FailingDetector)];
+        let (result, events) = run_fake_scan(true, detectors);
+        assert!(result.is_ok(), "scan must succeed: {result:?}");
+        assert!(
+            service_events(&events).is_empty(),
+            "no recognition means no service: {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(ScanEvent::Finished)),
+            "scan still finishes: {events:?}"
         );
     }
 }

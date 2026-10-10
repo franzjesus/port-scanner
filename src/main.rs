@@ -15,7 +15,9 @@ use crate::ports::{
     PortConfig, PortProfile, PortProfileError, PortSpec, PortSpecError, DEFAULT_CONCURRENCY,
     DEFAULT_TIMEOUT,
 };
-use crate::scanner::{run_scan, IcmpDiscovery, ScanConfig, ScanEvent, ScanSpawner, TcpPortScanner};
+use crate::scanner::{
+    default_detectors, run_scan, IcmpDiscovery, ScanConfig, ScanEvent, ScanSpawner, TcpPortScanner,
+};
 use crate::target::ScanTarget;
 
 /// PORT-SCANNER — interactive terminal network exploration.
@@ -40,6 +42,10 @@ struct Cli {
     /// Ignored when `--ports` is given.
     #[arg(long, value_parser = parse_profile)]
     profile: Option<PortProfile>,
+
+    /// Skip service detection on open ports.
+    #[arg(long)]
+    no_services: bool,
 }
 
 /// Parse the `--profile` argument into a [`PortProfile`].
@@ -80,13 +86,23 @@ fn resolve_port_config(
 /// receives its own clone of the master sender; the master sender itself stays
 /// alive for the lifetime of the TUI, so the event channel never disconnects
 /// mid-session.
+///
+/// The spawner captures the default service detectors once and hands them to
+/// every scan; whether detection actually runs is decided per scan by
+/// [`ScanConfig::detect_services`] (set from the `--no-services` flag). The
+/// detector set lives behind an `Arc` because the spawner is an `Fn` closure
+/// invoked for every scan and the `ServiceDetector` trait objects themselves
+/// cannot be cloned.
 fn build_spawner() -> ScanSpawner {
-    Box::new(|config, master_tx, cancel| {
+    let detectors = Arc::new(default_detectors());
+    Box::new(move |config, master_tx, cancel| {
+        let detectors = Arc::clone(&detectors);
         std::thread::spawn(move || {
             let _ = run_scan(
                 &config,
                 &IcmpDiscovery,
                 &TcpPortScanner,
+                &detectors,
                 &master_tx,
                 &cancel,
             );
@@ -129,6 +145,7 @@ async fn main() -> ExitCode {
     let config = target.as_ref().map(|target| {
         let mut config = ScanConfig::new(target.clone());
         config.ports = port_config.clone();
+        config.detect_services = !cli.no_services;
         config
     });
 

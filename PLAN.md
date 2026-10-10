@@ -612,6 +612,10 @@ Avoid exposing every internal scanner option to users initially.
 - [x]5.3 Wire `main` to build a `ScanConfig` and pass `&config` to `run_scan`.
 - [x]5.4 Tests: `ScanConfig::new` defaults + `run_scan` framing via a `ScanConfig`.
 - [x]5.5 Update `PLAN.md`.
+- [ ]5.6 Make the scan timeout user-configurable from the CLI (e.g. a
+  `--timeout` flag); `src/main.rs` currently pins both stages to
+  `DEFAULT_TIMEOUT`/`DEFAULT_CONCURRENCY`, so the MVP DoD item "Scan timeout is
+  configurable" is not met.
 
 ## Notes
 
@@ -1186,6 +1190,100 @@ trait ServiceDetector {
 
 Do not make service detection mandatory for basic port scanning.
 
+## Tasks
+
+- [x]12.1 `ServiceInfo` in a new `src/network/service.rs` module: `name`
+  (e.g. `"http"`), optional `version`, optional `extra` (e.g. the HTTP status
+  line), plus a `ServiceInfo::new(name)` helper; registered and re-exported
+  from `src/network/mod.rs`.
+- [x]12.2 `ProbedPort` gains a `service: Option<ServiceInfo>` field. `new`
+  keeps its 2-argument signature (it sets `service: None` and stays a
+  `const fn`), so no existing call site changes; `ProbedPort` drops `Copy`
+  and `Hash` because the field is not `Copy`.
+- [x]12.3 `ServiceDetector` trait and `ServiceError` in a new
+  `src/scanner/services.rs` module. `detect(&self, ip: Ipv4Addr, port: Port)`
+  is synchronous, matching the scanner's thread-based design; `Ok(None)`
+  means "not this service"; a detection failure must never fail the scan.
+- [x]12.4 HTTP detector: sends `GET / HTTP/1.0` with a `Host:` header and
+  claims the port when the response starts with `HTTP/`; the status line goes
+  into `extra`.
+- [x]12.5 HTTPS/TLS detector: sends a hand-crafted minimal TLS 1.0
+  ClientHello and claims the port when the first reply is a TLS record
+  (byte `0x16`) carrying a ServerHello (handshake type `0x02`).
+- [x]12.6 SSH detector: reads the server banner and claims the port when it
+  starts with `SSH-2.0` or `SSH-1.99`; the software token goes into
+  `version`.
+- [x]12.7 `default_detectors()` returning the HTTP, HTTPS, and SSH
+  detectors, each probe bounded by a ~2 s timeout so a slow or silent port
+  cannot stall the scan.
+- [x]12.8 `PortScanner::scan` returns `Result<Vec<Port>, ScanError>` — the
+  ports found open, sorted ascending — instead of `()`. Update
+  `TcpPortScanner` (collect results, sort at the end) and its tests.
+- [x]12.9 `ScanEvent::ServiceDiscovered { ip, port, service }` variant.
+- [x]12.10 `ScanConfig` gains `detect_services: bool`, defaulting to `true`
+  (service detection is on by default, consistent with
+  target → hosts → services).
+- [x]12.11 `run_scan` takes `detectors: &[Box<dyn ServiceDetector>]` (the
+  trait declares `Send + Sync` supertraits, which is all `run_scan` needs for
+  the host's scan thread) and, for each up host, runs them over that host's
+  open ports right after its port scan (interleaved per host, sequential per
+  port, bounded). Cancellation is checked between probes; a detector failure
+  is dropped, not propagated.
+- [x]12.12 CLI: a `--no-services` flag disables detection; the spawner
+  captures `default_detectors()` and passes them to `run_scan`.
+- [x]12.13 TUI: `apply_event` handles `ServiceDiscovered` by attaching the
+  service to the host's open `ProbedPort`. No scan-state transition and no
+  change to `ports_probed`.
+- [x]12.14 TUI: the host detail port lines show the detected service name;
+  the host table keeps showing port numbers only.
+- [x]12.15 TUI: `host_matches` also matches service names
+  case-insensitively; update the filter test that previously asserted `"ssh"`
+  did not match.
+- [x]12.16 Tests: each detector against a local fake TCP server, the
+  ClientHello byte prefix, `run_scan` with detection on and off using a fake
+  detector (no network), and TUI attach/filter behavior.
+- [x]12.17 Verify: `cargo fmt --check`, `cargo check`, `cargo test`,
+  `cargo clippy --all-targets`, and a PTY smoke test — a local HTTP server
+  plus a scan of 127.0.0.1 shows the service on the host detail without
+  disturbing port progress.
+- [x]12.18 Update `PLAN.md`.
+
+## Notes
+
+- The conceptual sketch above shows `async fn detect(&self, host: &Host,
+  port: &Port)`. The implementation is synchronous
+  (`fn detect(&self, ip: Ipv4Addr, port: Port)`), matching the scanner's
+  thread-based design, and passes the address rather than the whole `Host`
+  because a detector only needs the destination.
+- Every probe sets a read timeout before its I/O, and `io_error` maps both
+  `ErrorKind::TimedOut` and `ErrorKind::WouldBlock` to
+  `ServiceError::Timeout`: on this Linux toolchain a timed-out read on a
+  timeout-armed socket surfaces as `WouldBlock` (EAGAIN) rather than
+  `TimedOut`.
+- The TLS ClientHello is hand-crafted (TLS 1.0, a fixed zeroed 32-byte
+  random, the single cipher suite `0x002f`) so no `rand` dependency is
+  needed. The HTTPS detector matches strictly on record byte `0x16` plus
+  handshake type `0x02`; a TLS fatal alert (`0x15`) is deliberately not
+  claimed as TLS, keeping detection conservative.
+- The spawner is a `Fn` closure invoked for the initial scan and every
+  rescan, and the detector `Vec` is not `Clone`, so `build_spawner` wraps
+  `default_detectors()` in an `Arc` and clones it per invocation, moving
+  each clone into the scan thread.
+- TUI attach is a plain double `find` (host by IP, then port) with no new
+  `App` state; an unknown host or unprobed port is silently ignored. The
+  filter matches detected service names (name only, not version or extra).
+- The `run_scan` detection tests are hermetic: `FakeDiscovery` and
+  `FakePortScanner` stand in for ICMP/bounded TCP listeners, and fake
+  detectors (recognizing, no-match, failing) exercise the orchestration
+  rules. Detector tests use a local fake TCP server per case.
+- **Verified:** `cargo fmt --check` (clean), `cargo check` (no warnings),
+  `cargo test` (207 passed), `cargo clippy --all-targets` (no warnings),
+  `cargo build` (clean); a PTY smoke test with a local HTTP server on
+  127.0.0.1:8080 and a scan of 127.0.0.1 (`--ports 8080`) confirmed the
+  host detail shows the port row as `8080/tcp OPEN http` — detection
+  attached to the discovered port without disturbing port progress, and a
+  clean `q` exit followed.
+
 ---
 
 # 19\. Phase 13 — Hostname, MAC and Vendor Information
@@ -1510,11 +1608,11 @@ Implement in this order:
 - [x]TCP port scanning.
 - [x]Port profiles.
 - [x]Filtering.
-- [ ]Cancellation.
-- [ ]JSON export.
+- [x]Cancellation.
+- [x]JSON export.
 - [ ]Improve error handling.
 - [ ]Add tests and integration tests.
-- [ ]Service detection.
+- [x]Service detection.
 - [ ]Hostname/MAC/vendor enrichment.
 - [ ]Persistence.
 - [ ]Scan history.
@@ -1530,25 +1628,28 @@ Do not jump ahead to persistence, visualization, or service detection until the 
 
 The MVP is complete when all of the following are true:
 
-- [ ]`port-scanner 192.168.1.0/24` launches the TUI.
-- [ ]Single IPv4 addresses can be scanned.
-- [ ]IPv4 CIDR subnets can be scanned.
-- [ ]Live hosts are discovered.
-- [ ]TCP ports can be scanned.
-- [ ]Scan concurrency is bounded.
+- [x]`port-scanner 192.168.1.0/24` launches the TUI.
+- [x]Single IPv4 addresses can be scanned.
+- [x]IPv4 CIDR subnets can be scanned.
+- [x]Live hosts are discovered.
+- [x]TCP ports can be scanned.
+- [x]Scan concurrency is bounded.
 - [ ]Scan timeout is configurable.
-- [ ]Progress is displayed in real time.
-- [ ]The UI remains responsive during scans.
-- [ ]Hosts can be selected.
-- [ ]Host details can be viewed.
-- [ ]Open ports are displayed.
+  - Per-stage timeouts exist in the config model (`DiscoveryConfig::timeout`,
+    `PortConfig::timeout`) but the CLI pins them to `DEFAULT_TIMEOUT`; see
+    task 5.6.
+- [x]Progress is displayed in real time.
+- [x]The UI remains responsive during scans.
+- [x]Hosts can be selected.
+- [x]Host details can be viewed.
+- [x]Open ports are displayed.
 - [x]Results can be filtered.
 - [x]Scans can be cancelled.
 - [x]A new scan can be started without restarting the application.
 - [x]Results can be exported as JSON.
-- [ ]Network errors do not crash the application.
-- [ ]Core scanner functionality has automated tests.
-- [ ]The scanner has no dependency on the TUI.
+- [x]Network errors do not crash the application.
+- [x]Core scanner functionality has automated tests.
+- [x]The scanner has no dependency on the TUI.
 
 ---
 
