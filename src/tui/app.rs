@@ -82,6 +82,19 @@ pub struct App {
     pub ports_per_host: usize,
     /// Number of ports probed so far, one per `PortDiscovered` event.
     pub ports_probed: u64,
+    /// Index into [`App::hosts`] of the host the user has selected, if any.
+    ///
+    /// Written by keyboard navigation (Phase 7) and read by the host detail
+    /// screen (Phase 8). An out-of-range index is treated as no selection by
+    /// [`App::selected`].
+    #[allow(dead_code)] // consumed by Phase 7 (navigation) and Phase 8 (detail screen)
+    pub selected_host: Option<usize>,
+    /// Filter text for the host list, if any.
+    ///
+    /// Written by the interactive filter (Phase 9); until then the value is
+    /// stored but not yet applied to the displayed host list.
+    #[allow(dead_code)] // consumed by Phase 9 (filtering)
+    pub filter: Option<String>,
 }
 
 impl App {
@@ -109,6 +122,16 @@ impl App {
         } else {
             None
         }
+    }
+
+    /// The host at the [`App::selected_host`] index, if a host is selected
+    /// and the index is in range.
+    ///
+    /// This is what the host detail screen (Phase 8) renders; `None` when no
+    /// host is selected or the index is out of range.
+    #[allow(dead_code)] // consumed by the host detail screen (Phase 8)
+    pub fn selected(&self) -> Option<&Host> {
+        self.selected_host.and_then(|index| self.hosts.get(index))
     }
 
     /// Apply one scanner event to the application state.
@@ -456,6 +479,61 @@ mod tests {
             app.hosts[0],
             Host::up("10.0.0.1".parse().unwrap(), Duration::from_millis(3))
         );
+    }
+
+    #[test]
+    fn default_app_has_no_selection_or_filter() {
+        let app = App::default();
+        assert!(app.selected_host.is_none());
+        assert!(app.filter.is_none());
+        assert!(app.selected().is_none());
+    }
+
+    #[test]
+    fn selected_returns_host_at_selected_index() {
+        let mut app = App::default();
+        app.apply_event(ScanEvent::HostDiscovered(Host::up(
+            "10.0.0.1".parse().unwrap(),
+            Duration::from_millis(1),
+        )));
+        app.apply_event(ScanEvent::HostDiscovered(Host::down(
+            "10.0.0.2".parse().unwrap(),
+        )));
+        app.selected_host = Some(1);
+        let selected = app.selected().expect("index 1 is in range");
+        assert_eq!(selected, &app.hosts[1]);
+    }
+
+    #[test]
+    fn selected_returns_none_when_index_out_of_range() {
+        let mut app = App::default();
+        app.apply_event(ScanEvent::HostDiscovered(Host::up(
+            "10.0.0.1".parse().unwrap(),
+            Duration::from_millis(1),
+        )));
+        // One host exists, so index 1 is out of range.
+        app.selected_host = Some(1);
+        assert!(app.selected().is_none());
+    }
+
+    #[test]
+    fn selected_returns_none_with_empty_host_list() {
+        let app = App {
+            selected_host: Some(0),
+            ..Default::default()
+        };
+        assert!(app.selected().is_none());
+    }
+
+    #[test]
+    fn filter_is_stored_and_can_be_cleared() {
+        let mut app = App {
+            filter: Some("10.0.0.".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(app.filter.as_deref(), Some("10.0.0."));
+        app.filter = None;
+        assert!(app.filter.is_none());
     }
 
     #[test]

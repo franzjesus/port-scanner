@@ -667,6 +667,37 @@ The TUI should consume `ScanEvent`s and update state.
 
 The TUI must not directly perform network operations.
 
+## Tasks
+
+- [x]6.1 Verify `App` is the single central state: it consumes `ScanEvent`s via
+  `apply_event`, holds no scan logic of its own, and the TUI performs no network
+  operations.
+- [x]6.2 Add `selected_host: Option<usize>` to `App`, with an in-range
+  `selected()` accessor for the host detail screen (Phase 8).
+- [x]6.3 Add `filter: Option<String>` to `App`; stored for the interactive filter
+  (Phase 9), not yet applied to the displayed host list.
+- [x]6.4 Tests for the new state fields (defaults, in-range selection,
+  out-of-range/empty selection, filter stored and cleared).
+- [x]6.5 Update `PLAN.md`.
+
+## Notes
+
+- **Navigation, detail rendering, and filtering belong to later phases:**
+  keyboard navigation (Phase 7), the host detail screen (Phase 8), and applying
+  the filter to the displayed list (Phase 9) are out of scope here. Phase 6 only
+  introduces the state those phases will read and write.
+- **`selected_host` is an index into `hosts`:** hosts are only ever appended, so
+  an in-range index stays valid for the life of the current results.
+  `App::selected()` returns the host at that index, or `None` when no host is
+  selected or the index is out of range.
+- **`filter` is stored but not yet applied:** the value round-trips through the
+  state unchanged; applying it to the displayed host list is Phase 9.
+- **Staged code carries `#[allow(dead_code)]`** until Phases 7–9 consume the new
+  fields and `selected()`; remove the attributes when that happens.
+- **Verified:** `cargo fmt --check` (clean), `cargo check` (no warnings),
+  `cargo test` (116 passed), `cargo clippy --all-targets` (no warnings),
+  `cargo build` (clean).
+
 ---
 
 # 13\. Phase 7 — Overview Screen
@@ -1213,8 +1244,8 @@ Implement in this order:
 - [x]Live scan progress.
 - [x]Host list.
 - [ ]Host detail view.
-- [ ]TCP port scanning.
-- [ ]Port profiles.
+- [x]TCP port scanning.
+- [x]Port profiles.
 - [ ]Filtering.
 - [ ]Cancellation.
 - [ ]JSON export.
