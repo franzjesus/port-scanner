@@ -1310,11 +1310,11 @@ Important:
 
 ## Tasks
 
-- [ ]13.1 Add the `MacAddress` type in `src/network/mac.rs`: six bytes,
+- [x]13.1 Add the `MacAddress` type in `src/network/mac.rs`: six bytes,
   `Display` as `AA:BB:CC:DD:EE:FF`, `FromStr`, OUI extraction (first three
   bytes), `is_zero()`, and `Copy`/`Eq`/`Hash` derives. Wire it into the
   `network` module.
-- [ ]13.2 `Host` gains `hostname: Option<String>`, `mac: Option<MacAddress>`,
+- [x]13.2 `Host` gains `hostname: Option<String>`, `mac: Option<MacAddress>`,
   and `vendor: Option<String>`, all `None` from `Host::up`. Update the
   "intentionally omitted" doc comment to reflect that these are now optional
   enrichment fields.
