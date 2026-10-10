@@ -748,6 +748,46 @@ q           Quit
 
 Follow normal terminal/TUI conventions where possible.
 
+## Tasks
+
+- [x]7.1 Render the scan summary: the target, host up/down counts, progress
+  (`completed / total`, shown only while a scan is running), and elapsed time.
+- [x]7.2 Render the discovered-host list below the summary (IP, state, latency),
+  with a leading selection column.
+- [x]7.3 Move the host selection with `↑`/`k` and `↓`/`j`; a stale out-of-range
+  index is clamped into range before stepping.
+- [x]7.4 Keep the selected row visible (scroll-to-selection) and mark it with a
+  `▸` prefix and reversed styling.
+- [x]7.5 Toggle a static help overlay with `?`; while it is open only `?`/`Esc`
+  close it and `q` still quits, all other keys are ignored.
+- [x]7.6 Track scan elapsed time: record the start instant on `Started` and freeze
+  the total duration when a terminal state (`Finished`/`Cancelled`/`Failed`) is
+  reached.
+- [x]7.7 Tests for selection movement, the help overlay, elapsed timing,
+  `format_duration`, `window_start`, and `down_count`.
+- [x]7.8 Update `PLAN.md`.
+
+## Notes
+
+- **Only the keys that belong to this phase are wired up:** `Enter` (open the
+  selected host) is Phase 8, `/` (filter) is Phase 9, and `r` (rescan) is Phase 10.
+  The plan's keyboard section lists them, but their handlers are intentionally
+  not implemented yet and the `?` help overlay lists only the keys that work.
+- **`move_selection` anchors at the end you move towards:** with no current
+  selection, the first `↓` selects the first host and the first `↑` selects the
+  last. An existing selection steps by one, clamped at both ends; a stale
+  out-of-range index is first clamped into range.
+- **Elapsed time is testable:** `App::elapsed(now)` takes the reference instant as
+  a parameter. While a scan runs it is `now - started_at`; after a terminal state
+  the frozen total (`scan_duration`) is returned regardless of `now`, so a
+  finished scan keeps showing its real duration.
+- **Progress counts live only in the `Scanning` variant:** `completed`/`total` are
+  shown only while a scan is running; the `ScanState` shapes are unchanged from
+  Phase 6.
+- **Verified:** `cargo fmt --check` (clean), `cargo check` (no warnings),
+  `cargo test` (137 passed), `cargo clippy --all-targets` (no warnings),
+  `cargo build` (clean).
+
 ---
 
 # 14\. Phase 8 — Host Detail Screen

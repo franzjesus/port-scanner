@@ -8,7 +8,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{self, Event, KeyCode},
@@ -17,9 +17,10 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout},
-    style::{Modifier, Style},
-    widgets::{Cell, Paragraph, Row, Table},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Modifier, Style, Styled},
+    text::Line,
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
     Frame, Terminal,
 };
 
@@ -87,7 +88,6 @@ pub struct App {
     /// Written by keyboard navigation (Phase 7) and read by the host detail
     /// screen (Phase 8). An out-of-range index is treated as no selection by
     /// [`App::selected`].
-    #[allow(dead_code)] // consumed by Phase 7 (navigation) and Phase 8 (detail screen)
     pub selected_host: Option<usize>,
     /// Filter text for the host list, if any.
     ///
@@ -95,6 +95,13 @@ pub struct App {
     /// stored but not yet applied to the displayed host list.
     #[allow(dead_code)] // consumed by Phase 9 (filtering)
     pub filter: Option<String>,
+    /// When the current scan started, set on `ScanEvent::Started`.
+    started_at: Option<Instant>,
+    /// Total duration of the most recently ended scan (finished, cancelled,
+    /// or failed); captured when the scan ends and `started_at` is taken.
+    scan_duration: Option<Duration>,
+    /// Whether the help overlay is open.
+    show_help: bool,
 }
 
 impl App {
@@ -103,6 +110,14 @@ impl App {
         self.hosts
             .iter()
             .filter(|host| host.state == HostState::Up)
+            .count()
+    }
+
+    /// Number of discovered hosts currently in the down state.
+    pub fn down_count(&self) -> usize {
+        self.hosts
+            .iter()
+            .filter(|host| host.state == HostState::Down)
             .count()
     }
 
@@ -134,6 +149,18 @@ impl App {
         self.selected_host.and_then(|index| self.hosts.get(index))
     }
 
+    /// Elapsed time of the current or most recent scan.
+    ///
+    /// While a scan is running (from `ScanEvent::Started` until it ends), this
+    /// is the time since the scan started, measured at `now`. After the scan
+    /// ends, the frozen total duration is returned regardless of `now`.
+    /// `None` when no scan has ever started.
+    pub fn elapsed(&self, now: Instant) -> Option<Duration> {
+        self.started_at
+            .map(|start| now.duration_since(start))
+            .or(self.scan_duration)
+    }
+
     /// Apply one scanner event to the application state.
     pub fn apply_event(&mut self, event: ScanEvent) {
         match event {
@@ -142,6 +169,7 @@ impl App {
                     completed: 0,
                     total,
                 };
+                self.started_at = Some(Instant::now());
             }
             ScanEvent::HostDiscovered(host) => {
                 self.hosts.push(host);
@@ -151,8 +179,8 @@ impl App {
                     self.scan = ScanState::Scanning { completed, total };
                 }
             }
-            ScanEvent::Finished => self.scan = ScanState::Finished,
-            ScanEvent::Cancelled => self.scan = ScanState::Cancelled,
+            ScanEvent::Finished => self.end_scan(ScanState::Finished),
+            ScanEvent::Cancelled => self.end_scan(ScanState::Cancelled),
             ScanEvent::PortDiscovered { ip, port, state } => {
                 // The scanner emits this for every probed port (open or closed);
                 // count each one for live port progress, and record only open
@@ -166,7 +194,7 @@ impl App {
                     }
                 }
             }
-            ScanEvent::Error(err) => self.scan = ScanState::Failed(err.to_string()),
+            ScanEvent::Error(err) => self.end_scan(ScanState::Failed(err.to_string())),
         }
     }
 
@@ -174,18 +202,77 @@ impl App {
     ///
     /// `cancel` is the shared cancellation flag the scanner polls; pressing
     /// `c` or `q` sets it so in-flight probes stop.
+    ///
+    /// While the help overlay is open, only `?` and `Esc` dismiss it and `q`
+    /// still quits; every other key is ignored until it is closed.
     pub fn handle_key(&mut self, key: KeyCode, cancel: &AtomicBool) {
-        match key {
-            KeyCode::Char('q') => {
-                self.should_quit = true;
-                cancel.store(true, Ordering::SeqCst);
+        if self.show_help {
+            match key {
+                KeyCode::Char('?') | KeyCode::Esc => self.show_help = false,
+                KeyCode::Char('q') => self.quit(cancel),
+                _ => {}
             }
+            return;
+        }
+        match key {
+            KeyCode::Char('q') => self.quit(cancel),
             KeyCode::Char('c') if matches!(self.scan, ScanState::Scanning { .. }) => {
                 cancel.store(true, Ordering::SeqCst);
-                self.scan = ScanState::Cancelled;
+                self.end_scan(ScanState::Cancelled);
             }
+            KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             _ => {}
         }
+    }
+
+    /// Move the host selection by `direction` (-1 up, +1 down).
+    ///
+    /// A no-op with an empty host list. With no current selection, down
+    /// selects the first host and up selects the last. Otherwise the selection
+    /// steps by one, clamped at both ends; a stale out-of-range index is first
+    /// clamped into range.
+    fn move_selection(&mut self, direction: i8) {
+        let len = self.hosts.len();
+        if len == 0 || direction == 0 {
+            return;
+        }
+        let last = len - 1;
+        let next = match self.selected_host {
+            // No selection yet: anchor at the end we are moving towards, so
+            // the first down selects the first host and the first up selects
+            // the last.
+            None if direction > 0 => 0,
+            None => last,
+            Some(index) => {
+                // Clamp a stale out-of-range index into range before stepping.
+                let current = index.min(last);
+                if direction > 0 {
+                    (current + 1).min(last)
+                } else {
+                    current.saturating_sub(1)
+                }
+            }
+        };
+        self.selected_host = Some(next);
+    }
+
+    /// Transition to a terminal scan state, freezing the elapsed time.
+    ///
+    /// The start instant recorded on `ScanEvent::Started` is captured as the
+    /// total scan duration; a later terminal event does not change it.
+    fn end_scan(&mut self, state: ScanState) {
+        if let Some(start) = self.started_at.take() {
+            self.scan_duration = Some(start.elapsed());
+        }
+        self.scan = state;
+    }
+
+    /// Quit: mark the app for exit and stop any in-flight scan.
+    fn quit(&mut self, cancel: &AtomicBool) {
+        self.should_quit = true;
+        cancel.store(true, Ordering::SeqCst);
     }
 }
 
@@ -284,49 +371,146 @@ fn draw(frame: &mut Frame, app: &App) {
     let status = Paragraph::new(app.scan.label()).alignment(Alignment::Right);
     frame.render_widget(status, title_chunks[1]);
 
-    let mut status_text = format!("Hosts: {} up / {} scanned", app.up_count(), app.hosts.len());
+    // Summary line: host counts, live port progress, scan progress (only while
+    // scanning), and elapsed time (live while scanning, frozen afterwards).
+    let mut parts = vec![format!(
+        "Hosts: {} up / {} down",
+        app.up_count(),
+        app.down_count()
+    )];
     if let Some(progress) = app.port_progress() {
-        status_text.push_str(&format!("  {progress}"));
+        parts.push(progress);
     }
-    let status_line = Paragraph::new(status_text);
+    if let ScanState::Scanning { completed, total } = app.scan {
+        parts.push(format!("Progress: {completed}/{total}"));
+    }
+    if let Some(elapsed) = app.elapsed(Instant::now()) {
+        parts.push(format!("Elapsed: {}", format_duration(elapsed)));
+    }
+    let status_line = Paragraph::new(parts.join("  "));
     frame.render_widget(status_line, chunks[1]);
 
     if app.target.is_some() {
-        frame.render_widget(host_table(app), chunks[2]);
+        frame.render_widget(host_table(app, chunks[2]), chunks[2]);
     } else {
         let hint =
             Paragraph::new("No target. Run port-scanner with an IPv4 address or CIDR range.");
         frame.render_widget(hint, chunks[2]);
     }
 
-    let help = Paragraph::new("q Quit  c Cancel");
+    let help = Paragraph::new("↑/k Up  ↓/j Down  ? Help  c Cancel  q Quit");
     frame.render_widget(help, chunks[3]);
+
+    if app.show_help {
+        draw_help_overlay(frame);
+    }
 }
 
-fn host_table(app: &App) -> Table<'_> {
-    let header = Row::new(vec!["IP", "STATE", "LATENCY", "OPEN PORTS"])
+fn host_table(app: &App, area: Rect) -> Table<'_> {
+    let header = Row::new(vec!["", "IP", "STATE", "LATENCY", "OPEN PORTS"])
         .style(Style::default().add_modifier(Modifier::BOLD));
+
+    // Only render the rows that fit in the visible area, keeping the selected
+    // host in view. `area.height` includes the header row, so one row of data
+    // is visible per remaining line.
+    let visible = area.height.saturating_sub(1) as usize;
+    let start = window_start(app.hosts.len(), app.selected_host, visible);
     let rows: Vec<Row> = app
         .hosts
         .iter()
-        .map(|host| {
-            Row::new(vec![
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(index, host)| {
+            let selected = app.selected_host == Some(index);
+            let style = if selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            let cells: Vec<Cell<'_>> = vec![
+                Cell::from(if selected { "▸ " } else { "  " }),
                 Cell::from(host.ip.to_string()),
                 Cell::from(host.state.to_string()),
                 Cell::from(format_latency(host.latency)),
                 Cell::from(format_open_ports(&host.ports)),
-            ])
+            ]
+            .into_iter()
+            .map(|cell| cell.set_style(style))
+            .collect();
+            Row::new(cells)
         })
         .collect();
     Table::new(
         [header].into_iter().chain(rows),
         [
-            Constraint::Length(18),
+            Constraint::Length(2),
+            Constraint::Length(16),
             Constraint::Length(10),
             Constraint::Length(12),
             Constraint::Min(10),
         ],
     )
+}
+
+/// First visible row index for a scrollable host list.
+///
+/// Returns `0` when there is no selection, no room to show rows, or the
+/// selection is already within the top of the window; otherwise the window is
+/// shifted down so the selected row remains the last visible row.
+fn window_start(total: usize, selected: Option<usize>, visible: usize) -> usize {
+    let Some(selected) = selected else {
+        return 0;
+    };
+    if visible == 0 || selected >= total {
+        return 0;
+    }
+    if selected < visible {
+        0
+    } else {
+        selected - visible + 1
+    }
+}
+
+/// Render a duration as a human-readable elapsed time: `12.4s` under a minute
+/// and `1m 5.3s` at a minute or more.
+fn format_duration(duration: Duration) -> String {
+    let secs = duration.as_secs_f64();
+    if secs < 60.0 {
+        format!("{secs:.1}s")
+    } else {
+        let mins = (secs / 60.0) as u64;
+        let rest = secs - (mins as f64 * 60.0);
+        format!("{mins}m {rest:.1}s")
+    }
+}
+
+/// Draw the static key-binding help overlay, centered over the whole screen.
+fn draw_help_overlay(frame: &mut Frame) {
+    let area = frame.area();
+    let width = 26u16.min(area.width);
+    let height = 9u16.min(area.height);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let overlay_area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    let keys = [
+        "  ↑/k    Up",
+        "  ↓/j    Down",
+        "  ?      Help",
+        "  c      Cancel",
+        "  q      Quit",
+    ];
+    let block = Block::default().borders(Borders::ALL).title("Keys");
+    let content = Paragraph::new(keys.iter().map(|key| Line::from(*key)).collect::<Vec<_>>())
+        .alignment(Alignment::Center);
+    frame.render_widget(content, block.inner(overlay_area));
+    frame.render_widget(block, overlay_area);
 }
 
 fn format_latency(latency: Option<Duration>) -> String {
@@ -774,5 +958,256 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(app.up_count(), 2);
+    }
+
+    #[test]
+    fn down_count_counts_only_down_hosts() {
+        let app = App {
+            hosts: vec![
+                Host::up("10.0.0.1".parse().unwrap(), Duration::from_millis(1)),
+                Host::up("10.0.0.2".parse().unwrap(), Duration::from_millis(2)),
+                Host::down("10.0.0.3".parse().unwrap()),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(app.down_count(), 1);
+        assert_eq!(App::default().down_count(), 0);
+    }
+
+    fn app_with_hosts(count: usize) -> App {
+        let hosts = (0..count)
+            .map(|i| {
+                Host::up(
+                    Ipv4Addr::new(10, 0, 0, i as u8),
+                    Duration::from_millis(i as u64 + 1),
+                )
+            })
+            .collect();
+        App {
+            hosts,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn move_selection_noop_with_empty_host_list() {
+        let mut app = App::default();
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        app.handle_key(KeyCode::Char('k'), &cancel);
+        assert_eq!(app.selected_host, None);
+    }
+
+    #[test]
+    fn move_selection_down_selects_first_when_none_selected() {
+        let mut app = app_with_hosts(3);
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        assert_eq!(app.selected_host, Some(0));
+    }
+
+    #[test]
+    fn move_selection_up_selects_last_when_none_selected() {
+        let mut app = app_with_hosts(3);
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('k'), &cancel);
+        assert_eq!(app.selected_host, Some(2));
+    }
+
+    #[test]
+    fn move_selection_steps_down_and_clamps_at_end() {
+        let mut app = app_with_hosts(3);
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Down, &cancel);
+        assert_eq!(app.selected_host, Some(0));
+        app.handle_key(KeyCode::Down, &cancel);
+        assert_eq!(app.selected_host, Some(1));
+        app.handle_key(KeyCode::Down, &cancel);
+        assert_eq!(app.selected_host, Some(2));
+        // Clamped at the last host.
+        app.handle_key(KeyCode::Down, &cancel);
+        assert_eq!(app.selected_host, Some(2));
+    }
+
+    #[test]
+    fn move_selection_steps_up_and_clamps_at_start() {
+        let mut app = app_with_hosts(3);
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Up, &cancel);
+        assert_eq!(app.selected_host, Some(2));
+        app.handle_key(KeyCode::Up, &cancel);
+        assert_eq!(app.selected_host, Some(1));
+        app.handle_key(KeyCode::Up, &cancel);
+        assert_eq!(app.selected_host, Some(0));
+        // Clamped at the first host.
+        app.handle_key(KeyCode::Up, &cancel);
+        assert_eq!(app.selected_host, Some(0));
+    }
+
+    #[test]
+    fn move_selection_clamps_stale_index_into_range() {
+        let cancel = AtomicBool::new(false);
+        // Two hosts, but the selection points past the end.
+        let mut app = app_with_hosts(2);
+        app.selected_host = Some(9);
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        assert_eq!(app.selected_host, Some(1));
+
+        let mut app = app_with_hosts(2);
+        app.selected_host = Some(9);
+        app.handle_key(KeyCode::Char('k'), &cancel);
+        assert_eq!(app.selected_host, Some(0));
+    }
+
+    #[test]
+    fn help_key_opens_overlay() {
+        let mut app = App::default();
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('?'), &cancel);
+        assert!(app.show_help);
+    }
+
+    #[test]
+    fn help_key_and_esc_close_overlay() {
+        let cancel = AtomicBool::new(false);
+        let mut app = App {
+            show_help: true,
+            ..Default::default()
+        };
+        app.handle_key(KeyCode::Char('?'), &cancel);
+        assert!(!app.show_help);
+
+        let mut app = App {
+            show_help: true,
+            ..Default::default()
+        };
+        app.handle_key(KeyCode::Esc, &cancel);
+        assert!(!app.show_help);
+    }
+
+    #[test]
+    fn navigation_and_cancel_are_ignored_while_help_is_open() {
+        let mut app = App {
+            show_help: true,
+            scan: ScanState::Scanning {
+                completed: 1,
+                total: 4,
+            },
+            ..Default::default()
+        };
+        app.apply_event(ScanEvent::HostDiscovered(Host::up(
+            "10.0.0.1".parse().unwrap(),
+            Duration::from_millis(1),
+        )));
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        app.handle_key(KeyCode::Char('k'), &cancel);
+        app.handle_key(KeyCode::Char('c'), &cancel);
+        assert!(app.show_help);
+        assert_eq!(app.selected_host, None);
+        assert!(matches!(app.scan, ScanState::Scanning { .. }));
+        assert!(!cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn quit_works_while_help_is_open() {
+        let mut app = App {
+            show_help: true,
+            ..Default::default()
+        };
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('q'), &cancel);
+        assert!(app.should_quit);
+        assert!(cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn elapsed_is_none_before_any_scan() {
+        let app = App::default();
+        assert_eq!(app.elapsed(Instant::now()), None);
+    }
+
+    #[test]
+    fn elapsed_while_scanning_counts_from_start() {
+        let mut app = App::default();
+        app.apply_event(ScanEvent::Started { total: 1 });
+        app.started_at = Some(Instant::now() - Duration::from_secs(5));
+        let elapsed = app.elapsed(Instant::now()).expect("elapsed while scanning");
+        assert!(
+            elapsed >= Duration::from_secs(4) && elapsed <= Duration::from_secs(6),
+            "expected ~5s, got {elapsed:?}"
+        );
+    }
+
+    fn frozen_elapsed_after(event: ScanEvent) -> (App, Duration) {
+        let mut app = App::default();
+        app.apply_event(ScanEvent::Started { total: 1 });
+        app.started_at = Some(Instant::now() - Duration::from_secs(5));
+        app.apply_event(event);
+        assert!(app.started_at.is_none(), "started_at must be taken");
+        let frozen = app.elapsed(Instant::now()).expect("elapsed after scan");
+        assert!(
+            frozen >= Duration::from_secs(4) && frozen <= Duration::from_secs(6),
+            "expected ~5s, got {frozen:?}"
+        );
+        // The frozen value is independent of the `now` argument.
+        assert_eq!(
+            app.elapsed(Instant::now() + Duration::from_secs(100)),
+            Some(frozen)
+        );
+        (app, frozen)
+    }
+
+    #[test]
+    fn finished_event_freezes_elapsed() {
+        let (app, _) = frozen_elapsed_after(ScanEvent::Finished);
+        assert_eq!(app.scan, ScanState::Finished);
+    }
+
+    #[test]
+    fn cancelled_event_freezes_elapsed() {
+        let (app, _) = frozen_elapsed_after(ScanEvent::Cancelled);
+        assert_eq!(app.scan, ScanState::Cancelled);
+    }
+
+    #[test]
+    fn error_event_freezes_elapsed() {
+        let (app, _) = frozen_elapsed_after(ScanEvent::Error(ScanError::Socket("boom".to_owned())));
+        assert_eq!(app.scan, ScanState::Failed("socket error: boom".to_owned()));
+    }
+
+    #[test]
+    fn format_duration_under_a_minute() {
+        assert_eq!(format_duration(Duration::from_millis(400)), "0.4s");
+        assert_eq!(format_duration(Duration::from_millis(1000)), "1.0s");
+        assert_eq!(format_duration(Duration::from_millis(12400)), "12.4s");
+    }
+
+    #[test]
+    fn format_duration_one_minute_or_more() {
+        assert_eq!(format_duration(Duration::from_secs(60)), "1m 0.0s");
+        assert_eq!(format_duration(Duration::from_secs_f64(65.3)), "1m 5.3s");
+        assert_eq!(format_duration(Duration::from_secs(125)), "2m 5.0s");
+    }
+
+    #[test]
+    fn window_start_defaults_to_top() {
+        assert_eq!(window_start(0, None, 10), 0);
+        assert_eq!(window_start(10, None, 5), 0);
+        assert_eq!(window_start(10, Some(4), 0), 0); // no visible rows
+        assert_eq!(window_start(10, Some(15), 5), 0); // stale index
+    }
+
+    #[test]
+    fn window_start_returns_zero_when_selection_is_visible() {
+        assert_eq!(window_start(10, Some(0), 5), 0);
+        assert_eq!(window_start(10, Some(4), 5), 0);
+    }
+
+    #[test]
+    fn window_start_shifts_down_when_selection_is_off_screen() {
+        assert_eq!(window_start(10, Some(5), 5), 1);
+        assert_eq!(window_start(10, Some(6), 5), 2);
+        assert_eq!(window_start(10, Some(9), 5), 5);
     }
 }
