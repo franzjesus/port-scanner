@@ -119,10 +119,7 @@ mod tests {
     #[test]
     fn from_str_accepts_dash_form_and_is_case_insensitive() {
         let mac = "AA-BB-CC-DD-EE-FF".parse::<MacAddress>().unwrap();
-        assert_eq!(
-            mac,
-            MacAddress::new([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
-        );
+        assert_eq!(mac, MacAddress::new([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]));
     }
 
     #[test]
