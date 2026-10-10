@@ -33,7 +33,7 @@ impl MacAddress {
     }
 
     /// Whether every octet is zero, i.e. an unresolved ARP entry.
-    pub const fn is_zero(&self) -> bool {
+    pub fn is_zero(&self) -> bool {
         self.0 == [0; 6]
     }
 }
