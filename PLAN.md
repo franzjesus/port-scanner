@@ -605,6 +605,44 @@ Use sensible defaults.
 
 Avoid exposing every internal scanner option to users initially.
 
+## Tasks
+
+- [x]5.1 `ScanConfig` model bundling `target`, `discovery`, and `ports`.
+- [x]5.2 `ScanConfig::new` (sensible per-stage defaults); `run_scan` refactored to take `&ScanConfig`.
+- [x]5.3 Wire `main` to build a `ScanConfig` and pass `&config` to `run_scan`.
+- [x]5.4 Tests: `ScanConfig::new` defaults + `run_scan` framing via a `ScanConfig`.
+- [x]5.5 Update `PLAN.md`.
+
+## Notes
+
+- **No top-level `timeout`/`concurrency`:** the conceptual sketch above lists top-level
+  `timeout` and `concurrency`, but `DiscoveryConfig` and `PortConfig` each already own a
+  `timeout` + `concurrency`. Storing them again at the top level would duplicate state and
+  be ambiguous (which stage does a top-level value apply to?). `ScanConfig` therefore keeps
+  only `target` plus the two stage configs; each stage's timeout/concurrency is configured
+  on that stage (`DiscoveryConfig::timeout`/`concurrency` for discovery,
+  `PortConfig::timeout`/`concurrency` for ports). This is a deliberate deviation from the
+  conceptual sketch.
+- **Discovery method stays a generic param:** the discovery *method* (a
+  `D: HostDiscovery` strategy) is passed to `run_scan` as a generic parameter rather than
+  stored in `ScanConfig`. There is currently a single stateless method (`IcmpDiscovery`),
+  so storing an enum in the config would be premature. When a second method lands (e.g.
+  ARP), the choice can be promoted into `ScanConfig` then.
+- **No `Default` on `ScanConfig`:** `ScanTarget` has no `Default` (a target is always
+  required), so `ScanConfig` derives `Debug, Clone, PartialEq, Eq` and offers
+  `ScanConfig::new(target)` to fill in `DiscoveryConfig::default()` and
+  `PortConfig::default()`.
+- **`run_scan` signature:** now
+  `run_scan<D: HostDiscovery, P: PortScanner>(config: &ScanConfig, discovery, port_scanner, events, cancel)`;
+  it reads `config.target` for the `Started { total }` count, and `config.discovery` /
+  `config.ports` for the stage tunables. The single `Started`/`Finished` framing and the
+  early-return `Cancelled`/`Finished` path are preserved.
+- **TUI interface unchanged:** the TUI still takes `target` (for display) and
+  `ports_per_host` (for progress), not the whole `ScanConfig` — it does not need the stage
+  configs.
+- **Verified:** `cargo fmt --check` (clean), `cargo check` (no warnings), `cargo test`
+  (111 passed), `cargo clippy --all-targets` (no warnings), `cargo build` (clean).
+
 ---
 
 # 12\. Phase 6 — TUI Application State

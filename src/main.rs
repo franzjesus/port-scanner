@@ -14,7 +14,7 @@ use crate::ports::{
     PortConfig, PortProfile, PortProfileError, PortSpec, PortSpecError, DEFAULT_CONCURRENCY,
     DEFAULT_TIMEOUT,
 };
-use crate::scanner::{run_scan, DiscoveryConfig, IcmpDiscovery, ScanEvent, TcpPortScanner};
+use crate::scanner::{run_scan, IcmpDiscovery, ScanConfig, ScanEvent, TcpPortScanner};
 use crate::target::ScanTarget;
 
 /// PORT-SCANNER — interactive terminal network exploration.
@@ -110,20 +110,14 @@ async fn main() -> ExitCode {
     let cancel = Arc::new(AtomicBool::new(false));
 
     if let Some(target) = &target {
-        let target = target.clone();
-        let port_config = port_config.clone();
+        // The discovery stage keeps its defaults; only the port set (and its
+        // bounds) come from the CLI. The config is moved into the scanner
+        // thread below.
+        let mut config = ScanConfig::new(target.clone());
+        config.ports = port_config.clone();
         let cancel = cancel.clone();
         std::thread::spawn(move || {
-            let discovery_config = DiscoveryConfig::default();
-            let _ = run_scan(
-                &target,
-                &IcmpDiscovery,
-                &discovery_config,
-                &port_config,
-                &TcpPortScanner,
-                &sender,
-                &cancel,
-            );
+            let _ = run_scan(&config, &IcmpDiscovery, &TcpPortScanner, &sender, &cancel);
         });
     } else {
         drop(sender);

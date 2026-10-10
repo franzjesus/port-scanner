@@ -127,6 +127,43 @@ impl Default for DiscoveryConfig {
     }
 }
 
+/// The complete configuration for a full scan: what to scan and how each stage
+/// behaves.
+///
+/// A [`ScanConfig`] is the single object that describes a scan and is usable
+/// without the TUI (see Phase 5 in `PLAN.md`). It bundles the target with the
+/// per-stage tunables: [`DiscoveryConfig`] tunes the host-discovery stage and
+/// [`PortConfig`] tunes the TCP port stage.
+///
+/// Timeout and concurrency are owned per stage rather than held globally, so
+/// this struct deliberately has no top-level `timeout` or `concurrency`: the
+/// discovery stage reads [`DiscoveryConfig::timeout`] /
+/// [`DiscoveryConfig::concurrency`] and the port stage reads
+/// [`PortConfig::timeout`] / [`PortConfig::concurrency`]. A single global value
+/// would duplicate the per-stage state and be ambiguous (see the Phase 5 note
+/// in `PLAN.md`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanConfig {
+    /// What to scan: a single host or a subnet.
+    pub target: ScanTarget,
+    /// Tunables for the host-discovery stage.
+    pub discovery: DiscoveryConfig,
+    /// Tunables for the TCP port stage.
+    pub ports: PortConfig,
+}
+
+impl ScanConfig {
+    /// Create a configuration for `target` using the default discovery and
+    /// port settings.
+    pub fn new(target: ScanTarget) -> Self {
+        Self {
+            target,
+            discovery: DiscoveryConfig::default(),
+            ports: PortConfig::default(),
+        }
+    }
+}
+
 /// A mechanism for discovering which hosts in a target are up.
 ///
 /// Implementations probe the target's addresses concurrently and report
@@ -198,30 +235,27 @@ pub trait PortScanner {
 /// [`ScanEvent::Progress`], [`ScanEvent::PortDiscovered`]) inside that frame.
 ///
 /// The discovery and port-scanning mechanisms are supplied as traits so this
-/// orchestrator stays independent of any concrete implementation.
-/// `discovery_config` tunes the host-discovery stage and `port_config` tunes
-/// the TCP port stage.
+/// orchestrator stays independent of any concrete implementation. `config`
+/// carries the target and the per-stage tunables (see [`ScanConfig`]).
 ///
 /// Cancellation is cooperative: when `cancel` is set, discovery stops (and
 /// reports [`ScanEvent::Cancelled`]) and no further hosts are port-scanned;
 /// in-flight connections are allowed to finish. Both normal completion and
 /// cancellation return `Ok(())` — only a fatal error returns `Err`.
 pub fn run_scan<D: HostDiscovery, P: PortScanner>(
-    target: &ScanTarget,
+    config: &ScanConfig,
     discovery: &D,
-    discovery_config: &DiscoveryConfig,
-    port_config: &PortConfig,
     port_scanner: &P,
     events: &Sender<ScanEvent>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(), ScanError> {
     // Count the addresses (bounded by MAX_SUBNET_SIZE) so the progress display
     // has a stable total; the discovery stage enumerates them itself.
-    let total = target.iter().count() as u64;
+    let total = config.target.iter().count() as u64;
 
     let _ = events.send(ScanEvent::Started { total });
 
-    match discovery.discover(target, discovery_config, events, cancel)? {
+    match discovery.discover(&config.target, &config.discovery, events, cancel)? {
         DiscoveryOutcome::Completed(up_hosts) => {
             // Port-scan every host that came up. Cancellation is checked before
             // starting each host so a cancelled scan stops scheduling new work.
@@ -230,7 +264,7 @@ pub fn run_scan<D: HostDiscovery, P: PortScanner>(
                     let _ = events.send(ScanEvent::Cancelled);
                     return Ok(());
                 }
-                if let Err(err) = port_scanner.scan(host.ip, port_config, events, cancel) {
+                if let Err(err) = port_scanner.scan(host.ip, &config.ports, events, cancel) {
                     let _ = events.send(ScanEvent::Error(err.clone()));
                     return Err(err);
                 }
@@ -321,6 +355,15 @@ mod tests {
         assert_eq!(config.concurrency, 128);
     }
 
+    #[test]
+    fn scan_config_new_keeps_target_and_uses_default_stages() {
+        let target = ScanTarget::Host(Ipv4Addr::LOCALHOST);
+        let config = ScanConfig::new(target);
+        assert_eq!(config.target, ScanTarget::Host(Ipv4Addr::LOCALHOST));
+        assert_eq!(config.discovery, DiscoveryConfig::default());
+        assert_eq!(config.ports, PortConfig::default());
+    }
+
     /// Runs a full scan against loopback and checks that the whole run — host
     /// discovery plus port scanning — is framed by exactly one `Started` /
     /// `Finished` pair, with the host reported up and every probed port
@@ -345,25 +388,19 @@ mod tests {
         let closed_port = probe.local_addr().expect("probe address").port();
         drop(probe);
 
-        let target = ScanTarget::Host(Ipv4Addr::LOCALHOST);
-        let discovery = DiscoveryConfig::default();
-        let ports = PortConfig {
-            ports: PortSpec::from_port_numbers([open_port, closed_port]),
-            timeout: Duration::from_millis(500),
-            concurrency: 4,
+        let config = ScanConfig {
+            target: ScanTarget::Host(Ipv4Addr::LOCALHOST),
+            discovery: DiscoveryConfig::default(),
+            ports: PortConfig {
+                ports: PortSpec::from_port_numbers([open_port, closed_port]),
+                timeout: Duration::from_millis(500),
+                concurrency: 4,
+            },
         };
 
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        let result = run_scan(
-            &target,
-            &IcmpDiscovery,
-            &discovery,
-            &ports,
-            &TcpPortScanner,
-            &tx,
-            &cancel,
-        );
+        let result = run_scan(&config, &IcmpDiscovery, &TcpPortScanner, &tx, &cancel);
         drop(tx);
 
         // Skip in environments where ICMP is unavailable.
