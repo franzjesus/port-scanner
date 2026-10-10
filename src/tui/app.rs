@@ -24,7 +24,7 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use crate::network::{Host, HostState, Port, PortState};
+use crate::network::{Host, HostState, PortState, ProbedPort};
 use crate::scanner::ScanEvent;
 use crate::target::ScanTarget;
 
@@ -102,6 +102,11 @@ pub struct App {
     scan_duration: Option<Duration>,
     /// Whether the help overlay is open.
     show_help: bool,
+    /// Whether the host detail screen is open for the selected host.
+    ///
+    /// Set by `Enter` on the overview screen (only when a host is selected)
+    /// and cleared by `Esc`. While open, only `Esc` (back) and `q` (quit) act.
+    show_detail: bool,
 }
 
 impl App {
@@ -144,7 +149,6 @@ impl App {
     ///
     /// This is what the host detail screen (Phase 8) renders; `None` when no
     /// host is selected or the index is out of range.
-    #[allow(dead_code)] // consumed by the host detail screen (Phase 8)
     pub fn selected(&self) -> Option<&Host> {
         self.selected_host.and_then(|index| self.hosts.get(index))
     }
@@ -183,15 +187,13 @@ impl App {
             ScanEvent::Cancelled => self.end_scan(ScanState::Cancelled),
             ScanEvent::PortDiscovered { ip, port, state } => {
                 // The scanner emits this for every probed port (open or closed);
-                // count each one for live port progress, and record only open
-                // ports on the matching host. A host is always discovered before
-                // its ports are probed, so it is already present here; a miss is
-                // simply ignored.
+                // count each one for live port progress and record each probed
+                // port with its state on the matching host. A host is always
+                // discovered before its ports are probed, so it is already
+                // present here; a miss is simply ignored.
                 self.ports_probed += 1;
-                if state == PortState::Open {
-                    if let Some(host) = self.hosts.iter_mut().find(|h| h.ip == ip) {
-                        host.add_open_port(port);
-                    }
+                if let Some(host) = self.hosts.iter_mut().find(|h| h.ip == ip) {
+                    host.add_probed_port(port, state);
                 }
             }
             ScanEvent::Error(err) => self.end_scan(ScanState::Failed(err.to_string())),
@@ -205,10 +207,22 @@ impl App {
     ///
     /// While the help overlay is open, only `?` and `Esc` dismiss it and `q`
     /// still quits; every other key is ignored until it is closed.
+    ///
+    /// While the host detail screen is open, only `Esc` (back) and `q` (quit)
+    /// act; every other key is ignored until it is closed. On the overview
+    /// screen, `Enter` opens the detail screen for the selected host.
     pub fn handle_key(&mut self, key: KeyCode, cancel: &AtomicBool) {
         if self.show_help {
             match key {
                 KeyCode::Char('?') | KeyCode::Esc => self.show_help = false,
+                KeyCode::Char('q') => self.quit(cancel),
+                _ => {}
+            }
+            return;
+        }
+        if self.show_detail {
+            match key {
+                KeyCode::Esc => self.show_detail = false,
                 KeyCode::Char('q') => self.quit(cancel),
                 _ => {}
             }
@@ -223,6 +237,7 @@ impl App {
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
+            KeyCode::Enter if self.selected().is_some() => self.show_detail = true,
             _ => {}
         }
     }
@@ -391,15 +406,23 @@ fn draw(frame: &mut Frame, app: &App) {
     frame.render_widget(status_line, chunks[1]);
 
     if app.target.is_some() {
-        frame.render_widget(host_table(app, chunks[2]), chunks[2]);
+        if app.show_detail {
+            draw_host_detail(frame, app, chunks[2]);
+        } else {
+            frame.render_widget(host_table(app, chunks[2]), chunks[2]);
+        }
     } else {
         let hint =
             Paragraph::new("No target. Run port-scanner with an IPv4 address or CIDR range.");
         frame.render_widget(hint, chunks[2]);
     }
 
-    let help = Paragraph::new("↑/k Up  ↓/j Down  ? Help  c Cancel  q Quit");
-    frame.render_widget(help, chunks[3]);
+    let hint = if app.show_detail {
+        "Esc Back  q Quit"
+    } else {
+        "↑/k Up  ↓/j Down  Enter Detail  ? Help  c Cancel  q Quit"
+    };
+    frame.render_widget(Paragraph::new(hint), chunks[3]);
 
     if app.show_help {
         draw_help_overlay(frame);
@@ -513,6 +536,53 @@ fn draw_help_overlay(frame: &mut Frame) {
     frame.render_widget(block, overlay_area);
 }
 
+/// Draw the detail screen for the selected host.
+///
+/// A "Host" block shows the IP, state, and latency; a "Ports" block lists
+/// every probed port with the state its probe found. Only information that
+/// was actually discovered is shown (Phase 8).
+fn draw_host_detail(frame: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(5), Constraint::Min(1)])
+        .split(area);
+
+    let (host_lines, port_lines) = match app.selected() {
+        Some(host) => (
+            vec![
+                format!("{:<12}{}", "IP", host.ip),
+                format!("{:<12}{}", "State", host.state),
+                format!("{:<12}{}", "Latency", format_latency(host.latency)),
+            ],
+            if host.ports.is_empty() {
+                vec!["-".to_owned()]
+            } else {
+                host.ports
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "{:<12}{}",
+                            format!("{}/tcp", p.port),
+                            p.state.to_string().to_uppercase()
+                        )
+                    })
+                    .collect()
+            },
+        ),
+        None => (vec!["No host selected.".to_owned()], vec!["-".to_owned()]),
+    };
+
+    let host_block = Block::default().borders(Borders::ALL).title("Host");
+    let host_content = Paragraph::new(host_lines.into_iter().map(Line::from).collect::<Vec<_>>());
+    frame.render_widget(host_content, host_block.inner(chunks[0]));
+    frame.render_widget(host_block, chunks[0]);
+
+    let ports_block = Block::default().borders(Borders::ALL).title("Ports");
+    let ports_content = Paragraph::new(port_lines.into_iter().map(Line::from).collect::<Vec<_>>());
+    frame.render_widget(ports_content, ports_block.inner(chunks[1]));
+    frame.render_widget(ports_block, chunks[1]);
+}
+
 fn format_latency(latency: Option<Duration>) -> String {
     match latency {
         Some(latency) => format!("{:.1} ms", latency.as_secs_f64() * 1000.0),
@@ -521,22 +591,25 @@ fn format_latency(latency: Option<Duration>) -> String {
 }
 
 /// Render a host's open ports as a comma-separated list (`22,80,443`), or a
-/// dash when none have been found yet. Display-only; the structured data is
-/// the host's sorted `ports` list.
-fn format_open_ports(ports: &[Port]) -> String {
-    match ports.len() {
-        0 => "-".to_owned(),
-        _ => ports
-            .iter()
-            .map(Port::to_string)
-            .collect::<Vec<_>>()
-            .join(","),
+/// dash when none have been found open yet. Only ports whose probe found them
+/// open are shown; the structured data is the host's sorted probed-port list.
+fn format_open_ports(ports: &[ProbedPort]) -> String {
+    let open: Vec<String> = ports
+        .iter()
+        .filter(|p| p.state == PortState::Open)
+        .map(|p| p.port.to_string())
+        .collect();
+    if open.is_empty() {
+        "-".to_owned()
+    } else {
+        open.join(",")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::Port;
     use crate::scanner::ScanError;
     use std::net::Ipv4Addr;
 
@@ -735,13 +808,15 @@ mod tests {
         ] {
             app.apply_event(ScanEvent::PortDiscovered { ip, port, state });
         }
-        let ports: Vec<u16> = app.hosts[0].ports.iter().map(Port::as_u16).collect();
-        // Recorded in arrival order, kept sorted by `add_open_port`.
+        let ports: Vec<u16> = app.hosts[0].ports.iter().map(|p| p.port.as_u16()).collect();
+        // Recorded in arrival order, kept sorted by `add_probed_port`.
         assert_eq!(ports, vec![22, 80, 443]);
     }
 
     #[test]
-    fn port_discovered_closed_is_not_recorded() {
+    fn port_discovered_closed_is_recorded_with_state() {
+        // A closed result is a real discovery, so it is recorded alongside the
+        // open ones (Phase 8: the detail screen shows probed ports with state).
         let mut app = App::default();
         let ip = "10.0.0.1".parse::<Ipv4Addr>().unwrap();
         app.apply_event(ScanEvent::HostDiscovered(Host::up(
@@ -753,7 +828,10 @@ mod tests {
             port: Port::new(23).unwrap(),
             state: PortState::Closed,
         });
-        assert!(app.hosts[0].ports.is_empty());
+        assert_eq!(
+            app.hosts[0].ports,
+            vec![ProbedPort::new(Port::new(23).unwrap(), PortState::Closed)]
+        );
     }
 
     #[test]
@@ -848,11 +926,31 @@ mod tests {
     fn format_open_ports_joins_and_shows_dash_when_empty() {
         assert_eq!(format_open_ports(&[]), "-");
         let ports = vec![
-            Port::new(22).unwrap(),
-            Port::new(80).unwrap(),
-            Port::new(443).unwrap(),
+            ProbedPort::new(Port::new(22).unwrap(), PortState::Open),
+            ProbedPort::new(Port::new(80).unwrap(), PortState::Open),
+            ProbedPort::new(Port::new(443).unwrap(), PortState::Open),
         ];
         assert_eq!(format_open_ports(&ports), "22,80,443");
+    }
+
+    #[test]
+    fn format_open_ports_excludes_closed_ports() {
+        // Only ports probed open appear in the host-table column; closed
+        // results are still recorded on the host and shown on the detail
+        // screen instead.
+        let ports = vec![
+            ProbedPort::new(Port::new(22).unwrap(), PortState::Open),
+            ProbedPort::new(Port::new(23).unwrap(), PortState::Closed),
+            ProbedPort::new(Port::new(443).unwrap(), PortState::Open),
+        ];
+        assert_eq!(format_open_ports(&ports), "22,443");
+
+        // All closed means no open ports at all.
+        let closed_only = vec![
+            ProbedPort::new(Port::new(23).unwrap(), PortState::Closed),
+            ProbedPort::new(Port::new(80).unwrap(), PortState::Closed),
+        ];
+        assert_eq!(format_open_ports(&closed_only), "-");
     }
 
     #[test]
@@ -1113,6 +1211,80 @@ mod tests {
     fn quit_works_while_help_is_open() {
         let mut app = App {
             show_help: true,
+            ..Default::default()
+        };
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('q'), &cancel);
+        assert!(app.should_quit);
+        assert!(cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn enter_opens_detail_when_host_selected() {
+        let mut app = app_with_hosts(3);
+        app.selected_host = Some(1);
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Enter, &cancel);
+        assert!(app.show_detail);
+    }
+
+    #[test]
+    fn enter_does_not_open_detail_without_selection() {
+        let mut app = app_with_hosts(3);
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Enter, &cancel);
+        assert!(!app.show_detail);
+    }
+
+    #[test]
+    fn enter_does_not_open_detail_with_stale_selection() {
+        let mut app = app_with_hosts(2);
+        // Stale out-of-range index: no host is actually selected.
+        app.selected_host = Some(9);
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Enter, &cancel);
+        assert!(!app.show_detail);
+    }
+
+    #[test]
+    fn esc_closes_detail() {
+        let mut app = App {
+            show_detail: true,
+            ..Default::default()
+        };
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Esc, &cancel);
+        assert!(!app.show_detail);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn navigation_and_cancel_are_ignored_while_detail_is_open() {
+        let mut app = app_with_hosts(3);
+        app.show_detail = true;
+        app.selected_host = Some(1);
+        app.scan = ScanState::Scanning {
+            completed: 1,
+            total: 4,
+        };
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        app.handle_key(KeyCode::Char('k'), &cancel);
+        app.handle_key(KeyCode::Down, &cancel);
+        app.handle_key(KeyCode::Char('c'), &cancel);
+        app.handle_key(KeyCode::Char('?'), &cancel);
+        app.handle_key(KeyCode::Enter, &cancel);
+        assert!(app.show_detail);
+        assert_eq!(app.selected_host, Some(1));
+        assert!(matches!(app.scan, ScanState::Scanning { .. }));
+        assert!(!app.show_help);
+        assert!(!cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn quit_works_while_detail_is_open() {
+        let mut app = App {
+            show_detail: true,
             ..Default::default()
         };
         let cancel = AtomicBool::new(false);

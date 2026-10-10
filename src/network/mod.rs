@@ -8,4 +8,4 @@ pub mod host;
 pub mod port;
 
 pub use host::{Host, HostState};
-pub use port::{Port, PortState};
+pub use port::{Port, PortState, ProbedPort};

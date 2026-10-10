@@ -822,6 +822,49 @@ TLS information
 
 Do not display information that has not actually been discovered.
 
+## Tasks
+
+- [x]8.1 Store the state of every probed port on `Host`: new `ProbedPort { port,
+  state }` (kept sorted ascending by port, unique) with `Host::add_probed_port`,
+  recording both open and closed results.
+- [x]8.2 `Enter` opens the host detail screen when a host is selected (no-op for
+  a missing or stale selection): a `Host` block (IP, state, latency) and a
+  `Ports` block listing every probed port with the state its probe found, or `-`
+  when no ports were probed.
+- [x]8.3 Gate keys while the detail screen is open: only `Esc` (back) and `q`
+  (quit) act; navigation, cancel, help, and `Enter` are ignored.
+- [x]8.4 Context-sensitive bottom hint: the detail screen shows `Esc Back  q
+  Quit`; the overview key list gains `Enter Detail`.
+- [x]8.5 `format_open_ports` filters to ports probed open, so the overview's
+  OPEN PORTS column keeps showing only open ports (e.g. `22,80,443`).
+- [x]8.6 Tests: `Enter`/`Esc`/key gating (including a stale selection),
+  recording closed port results, and `format_open_ports` excluding closed ports.
+- [x]8.7 Update `PLAN.md`.
+
+## Notes
+
+- **Display scope:** `Host.ports` stores every probed port with its state, not
+  only open ones — a closed result is a legitimate discovery, and the detail
+  screen is where it is shown. The overview's OPEN PORTS column is unchanged in
+  appearance and still lists only ports probed open (the `format_open_ports`
+  filter).
+- **No auto-selection:** `apply_event` does not select a host on
+  `HostDiscovered`; the Phase 7 anchoring behavior (the first `↓` selects the
+  first host) is unchanged. The spec only requires the detail "when a host is
+  selected," and auto-selecting would change overview behavior beyond this
+  phase.
+- **Detail layout:** lines are padded with `{:<12}` to match the plan's mockup
+  (`IP          192.168.1.42`). Port states are uppercased only locally in the
+  detail screen (`OPEN`/`CLOSED`); `PortState::Display` stays lowercase.
+- **`ProbedPort` lives in `network/port.rs`** (re-exported from `network`),
+  keeping the model self-contained; no TUI types leak into network code.
+- **Verified:** `cargo fmt --check` (clean), `cargo check` (no warnings),
+  `cargo test` (145 passed), `cargo clippy --all-targets` (no warnings),
+  `cargo build` (clean); a PTY smoke test (pyte terminal emulation) confirmed
+  the rendered detail screen — Host and Ports blocks, context-sensitive hint,
+  `j`/`c` ignored while open, and `Esc` returning to the overview with the
+  selection preserved.
+
 ---
 
 # 15\. Phase 9 — Filtering
@@ -1283,7 +1326,7 @@ Implement in this order:
 - [x]TUI application state.
 - [x]Live scan progress.
 - [x]Host list.
-- [ ]Host detail view.
+- [x]Host detail view.
 - [x]TCP port scanning.
 - [x]Port profiles.
 - [ ]Filtering.

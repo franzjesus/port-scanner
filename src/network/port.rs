@@ -79,6 +79,26 @@ impl fmt::Display for PortState {
     }
 }
 
+/// A port that was probed, paired with the state the probe found.
+///
+/// The scanner reports a [`PortState`] for every probed port (both open and
+/// closed); this pairs the two so a host can record the full set of ports it
+/// actually probed, not just the ones found open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProbedPort {
+    /// The port that was probed.
+    pub port: Port,
+    /// The state the probe found.
+    pub state: PortState,
+}
+
+impl ProbedPort {
+    /// Pair a probed port with the state the probe found.
+    pub const fn new(port: Port, state: PortState) -> Self {
+        Self { port, state }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +153,12 @@ mod tests {
             err.to_string(),
             "invalid port 0: must be in the range 1–65535"
         );
+    }
+
+    #[test]
+    fn probed_port_pairs_port_and_state() {
+        let probed = ProbedPort::new(Port::new(443).unwrap(), PortState::Closed);
+        assert_eq!(probed.port, Port::new(443).unwrap());
+        assert_eq!(probed.state, PortState::Closed);
     }
 }

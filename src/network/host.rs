@@ -4,7 +4,7 @@ use std::fmt;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
-use super::port::Port;
+use super::port::{Port, PortState, ProbedPort};
 
 /// The liveness state of a host, as determined by the scanner.
 ///
@@ -42,8 +42,9 @@ pub struct Host {
     pub state: HostState,
     /// Round-trip time of the probe, present only when the host is [`Up`].
     pub latency: Option<Duration>,
-    /// TCP ports found open on this host, kept sorted ascending and unique.
-    pub ports: Vec<Port>,
+    /// TCP ports probed on this host and the state each probe found, kept
+    /// sorted ascending by port and unique.
+    pub ports: Vec<ProbedPort>,
 }
 
 impl Host {
@@ -68,14 +69,14 @@ impl Host {
         }
     }
 
-    /// Record a newly discovered open port, keeping the list sorted and
-    /// unique. Returns `true` if the port was added, `false` if it was
-    /// already present.
-    pub fn add_open_port(&mut self, port: Port) -> bool {
-        match self.ports.binary_search(&port) {
+    /// Record a probed port and the state the probe found, keeping the list
+    /// sorted ascending by port and unique. Returns `true` if the port was
+    /// added, `false` if it was already recorded (the first state is kept).
+    pub fn add_probed_port(&mut self, port: Port, state: PortState) -> bool {
+        match self.ports.binary_search_by(|p| p.port.cmp(&port)) {
             Ok(_) => false,
             Err(index) => {
-                self.ports.insert(index, port);
+                self.ports.insert(index, ProbedPort::new(port, state));
                 true
             }
         }
@@ -118,15 +119,26 @@ mod tests {
     }
 
     #[test]
-    fn add_open_port_keeps_sorted_and_unique() {
+    fn add_probed_port_keeps_sorted_and_unique() {
         let mut host = Host::up("10.0.0.1".parse().unwrap(), Duration::from_millis(5));
-        assert!(host.add_open_port(Port::new(443).unwrap()));
-        assert!(host.add_open_port(Port::new(22).unwrap()));
-        assert!(host.add_open_port(Port::new(80).unwrap()));
-        // A duplicate is not added and reports false.
-        assert!(!host.add_open_port(Port::new(80).unwrap()));
+        assert!(host.add_probed_port(Port::new(443).unwrap(), PortState::Open));
+        assert!(host.add_probed_port(Port::new(22).unwrap(), PortState::Open));
+        assert!(host.add_probed_port(Port::new(80).unwrap(), PortState::Closed));
+        // A duplicate is not added and reports false; the first state is kept.
+        assert!(!host.add_probed_port(Port::new(80).unwrap(), PortState::Open));
 
-        let ports: Vec<u16> = host.ports.iter().map(Port::as_u16).collect();
-        assert_eq!(ports, vec![22, 80, 443]);
+        let ports: Vec<(u16, PortState)> = host
+            .ports
+            .iter()
+            .map(|p| (p.port.as_u16(), p.state))
+            .collect();
+        assert_eq!(
+            ports,
+            vec![
+                (22, PortState::Open),
+                (80, PortState::Closed),
+                (443, PortState::Open),
+            ]
+        );
     }
 }
