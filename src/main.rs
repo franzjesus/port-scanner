@@ -16,7 +16,8 @@ use crate::ports::{
     DEFAULT_TIMEOUT,
 };
 use crate::scanner::{
-    default_detectors, run_scan, IcmpDiscovery, ScanConfig, ScanEvent, ScanSpawner, TcpPortScanner,
+    default_detectors, default_enrichers, run_scan, IcmpDiscovery, ScanConfig, ScanEvent,
+    ScanSpawner, TcpPortScanner,
 };
 use crate::target::ScanTarget;
 
@@ -46,6 +47,10 @@ struct Cli {
     /// Skip service detection on open ports.
     #[arg(long)]
     no_services: bool,
+
+    /// Skip host enrichment (reverse-DNS hostname, MAC address, vendor).
+    #[arg(long)]
+    no_enrichment: bool,
 }
 
 /// Parse the `--profile` argument into a [`PortProfile`].
@@ -87,22 +92,26 @@ fn resolve_port_config(
 /// alive for the lifetime of the TUI, so the event channel never disconnects
 /// mid-session.
 ///
-/// The spawner captures the default service detectors once and hands them to
-/// every scan; whether detection actually runs is decided per scan by
-/// [`ScanConfig::detect_services`] (set from the `--no-services` flag). The
-/// detector set lives behind an `Arc` because the spawner is an `Fn` closure
-/// invoked for every scan and the `ServiceDetector` trait objects themselves
-/// cannot be cloned.
+/// The spawner captures the default service detectors and host enrichers
+/// once and hands them to every scan; whether detection and enrichment
+/// actually run are decided per scan by [`ScanConfig::detect_services`] (set
+/// from the `--no-services` flag) and [`ScanConfig::enrich`] (set from the
+/// `--no-enrichment` flag). The detector and enricher sets live behind `Arc`s
+/// because the spawner is an `Fn` closure invoked for every scan and the
+/// trait objects themselves cannot be cloned.
 fn build_spawner() -> ScanSpawner {
     let detectors = Arc::new(default_detectors());
+    let enrichers = Arc::new(default_enrichers());
     Box::new(move |config, master_tx, cancel| {
         let detectors = Arc::clone(&detectors);
+        let enrichers = Arc::clone(&enrichers);
         std::thread::spawn(move || {
             let _ = run_scan(
                 &config,
                 &IcmpDiscovery,
                 &TcpPortScanner,
                 &detectors,
+                &enrichers,
                 &master_tx,
                 &cancel,
             );
@@ -146,6 +155,7 @@ async fn main() -> ExitCode {
         let mut config = ScanConfig::new(target.clone());
         config.ports = port_config.clone();
         config.detect_services = !cli.no_services;
+        config.enrich = !cli.no_enrichment;
         config
     });
 

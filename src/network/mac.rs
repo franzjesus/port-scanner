@@ -28,22 +28,29 @@ impl MacAddress {
     }
 
     /// The first three octets — the OUI (organizationally unique identifier).
+    ///
+    /// Exposed because the plan (PLAN.md Phase 13) requires the type to expose
+    /// OUI extraction. Vendor inference is OUI-derived, but the OUI-database
+    /// lookup takes the full address, so no production call site consumes this
+    /// yet; it is part of the data model's API surface.
+    #[allow(dead_code)]
     pub const fn oui(&self) -> [u8; 3] {
         [self.0[0], self.0[1], self.0[2]]
     }
 
     /// Whether every octet is zero, i.e. an unresolved ARP entry.
     pub fn is_zero(&self) -> bool {
-        self.0 == [0; 6]
+        self == &Self::ZERO
     }
 }
 
 impl fmt::Display for MacAddress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let octets = self.octets();
         write!(
             f,
             "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-            self.0[0], self.0[1], self.0[2], self.0[3], self.0[4], self.0[5]
+            octets[0], octets[1], octets[2], octets[3], octets[4], octets[5]
         )
     }
 }
@@ -84,7 +91,7 @@ impl FromStr for MacAddress {
             return Err(MacAddressError::Invalid(s.to_string()));
         }
         bytes.copy_from_slice(&octets);
-        Ok(Self(bytes))
+        Ok(Self::new(bytes))
     }
 }
 

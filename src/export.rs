@@ -48,6 +48,17 @@ pub struct ExportHost {
     /// down.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<f64>,
+    /// The host's reverse-DNS name; absent when no name was resolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    /// The host's MAC address, as `XX:XX:XX:XX:XX:XX`; absent when no MAC was
+    /// learned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
+    /// The vendor for the MAC's OUI; absent when no MAC was learned or its
+    /// OUI did not resolve to a vendor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<String>,
     /// The TCP ports probed on this host.
     pub ports: Vec<ExportPort>,
 }
@@ -83,6 +94,9 @@ impl ExportHost {
                 HostState::Down => "down",
             },
             latency_ms: host.latency.map(|latency| latency.as_secs_f64() * 1000.0),
+            hostname: host.hostname.clone(),
+            mac: host.mac.as_ref().map(|mac| mac.to_string()),
+            vendor: host.vendor.clone(),
             ports: host
                 .ports
                 .iter()
@@ -257,6 +271,43 @@ mod tests {
 
         let value = serde_json::to_value(&doc).expect("serialize");
         assert!(value["hosts"][0].get("latency_ms").is_none());
+    }
+
+    #[test]
+    fn json_includes_enrichment_fields_when_discovered() {
+        let target = ScanTarget::parse("192.168.1.10").expect("valid target");
+        let mut host = host_up(
+            "192.168.1.10",
+            Duration::from_millis(3),
+            &[(22, PortState::Open)],
+        );
+        host.hostname = Some("printer.local".to_owned());
+        host.mac = Some("3C:52:82:AA:BB:CC".parse().expect("valid mac"));
+        host.vendor = Some("Hewlett-Packard".to_owned());
+        let doc = ExportDocument::from_scan(&target, std::slice::from_ref(&host));
+
+        let value = serde_json::to_value(&doc).expect("serialize");
+        let exported = &value["hosts"][0];
+        assert_eq!(exported["hostname"], "printer.local");
+        assert_eq!(exported["mac"], "3C:52:82:AA:BB:CC");
+        assert_eq!(exported["vendor"], "Hewlett-Packard");
+    }
+
+    #[test]
+    fn json_omits_enrichment_fields_when_not_discovered() {
+        let target = ScanTarget::parse("192.168.1.10").expect("valid target");
+        let host = host_up(
+            "192.168.1.10",
+            Duration::from_millis(3),
+            &[(22, PortState::Open)],
+        );
+        let doc = ExportDocument::from_scan(&target, std::slice::from_ref(&host));
+
+        let value = serde_json::to_value(&doc).expect("serialize");
+        let exported = &value["hosts"][0];
+        assert!(exported.get("hostname").is_none());
+        assert!(exported.get("mac").is_none());
+        assert!(exported.get("vendor").is_none());
     }
 
     #[test]

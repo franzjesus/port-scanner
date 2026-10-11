@@ -296,6 +296,29 @@ impl App {
                     }
                 }
             }
+            ScanEvent::HostEnriched {
+                ip,
+                hostname,
+                mac,
+                vendor,
+            } => {
+                // Attach the enrichment to the host. The host was already
+                // discovered before its enrichment ran, so neither the scan
+                // state nor the progress counts change here; a missing host is
+                // simply ignored. Only fields the enrichers actually produced
+                // are `Some`, so `None` fields leave the host unchanged.
+                if let Some(host) = self.hosts.iter_mut().find(|h| h.ip == ip) {
+                    if let Some(hostname) = hostname {
+                        host.hostname = Some(hostname);
+                    }
+                    if let Some(mac) = mac {
+                        host.mac = Some(mac);
+                    }
+                    if let Some(vendor) = vendor {
+                        host.vendor = Some(vendor);
+                    }
+                }
+            }
             ScanEvent::Error(err) => {
                 // Keep the message for the status line; the state only records
                 // that an error occurred.
@@ -758,9 +781,9 @@ fn host_table<'a>(app: &'a App, visible: &'a [usize], area: Rect) -> Table<'a> {
 ///
 /// An empty needle matches every host. Otherwise the needle is matched as a
 /// substring against the IP address, the state name, each probed port number
-/// (Phase 9), and each detected service name (Phase 12). Matching is done on
-/// the display form of each field, so the needle never needs to know about
-/// the underlying types.
+/// (Phase 9), each detected service name (Phase 12), and the discovered
+/// hostname and vendor (Phase 13). Matching is done on the display form of
+/// each field, so the needle never needs to know about the underlying types.
 fn host_matches(host: &Host, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
@@ -782,6 +805,14 @@ fn host_matches(host: &Host, needle: &str) -> bool {
                 .as_ref()
                 .is_some_and(|service| service.name.to_ascii_lowercase().contains(&needle))
         })
+        || host
+            .hostname
+            .as_ref()
+            .is_some_and(|hostname| hostname.to_ascii_lowercase().contains(&needle))
+        || host
+            .vendor
+            .as_ref()
+            .is_some_and(|vendor| vendor.to_ascii_lowercase().contains(&needle))
 }
 
 /// First visible row index for a scrollable host list.
@@ -849,22 +880,15 @@ fn draw_help_overlay(frame: &mut Frame) {
 
 /// Draw the detail screen for the selected host.
 ///
-/// A "Host" block shows the IP, state, and latency; a "Ports" block lists
-/// every probed port with the state its probe found. Only information that
-/// was actually discovered is shown (Phase 8).
+/// A "Host" block shows the IP, state, and latency, plus one line for each
+/// enrichment field that was actually discovered for the host (hostname,
+/// MAC, vendor); a "Ports" block lists every probed port with the state its
+/// probe found. Only information that was actually discovered is shown
+/// (Phase 8); vendor is derived from the MAC's OUI and labelled as inferred.
 fn draw_host_detail(frame: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(5), Constraint::Min(1)])
-        .split(area);
-
     let (host_lines, port_lines) = match app.selected() {
         Some(host) => (
-            vec![
-                format!("{:<12}{}", "IP", host.ip),
-                format!("{:<12}{}", "State", host.state),
-                format!("{:<12}{}", "Latency", format_latency(host.latency)),
-            ],
+            host_detail_lines(host),
             if host.ports.is_empty() {
                 vec!["-".to_owned()]
             } else {
@@ -888,6 +912,14 @@ fn draw_host_detail(frame: &mut Frame, app: &App, area: Rect) {
         None => (vec!["No host selected.".to_owned()], vec!["-".to_owned()]),
     };
 
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(host_lines.len() as u16 + 2),
+            Constraint::Min(1),
+        ])
+        .split(area);
+
     let host_block = Block::default().borders(Borders::ALL).title("Host");
     let host_content = Paragraph::new(host_lines.into_iter().map(Line::from).collect::<Vec<_>>());
     frame.render_widget(host_content, host_block.inner(chunks[0]));
@@ -904,6 +936,28 @@ fn format_latency(latency: Option<Duration>) -> String {
         Some(latency) => format!("{:.1} ms", latency.as_secs_f64() * 1000.0),
         None => "-".to_owned(),
     }
+}
+
+/// The display lines for the "Host" block of the detail screen: the basic
+/// IP/state/latency lines, plus one line for each enrichment field that was
+/// actually discovered for the host (Phase 13). The vendor is derived from
+/// the MAC's OUI rather than observed, so it is labelled as inferred.
+fn host_detail_lines(host: &Host) -> Vec<String> {
+    let mut lines = vec![
+        format!("{:<12}{}", "IP", host.ip),
+        format!("{:<12}{}", "State", host.state),
+        format!("{:<12}{}", "Latency", format_latency(host.latency)),
+    ];
+    if let Some(hostname) = &host.hostname {
+        lines.push(format!("{:<12}{}", "Hostname", hostname));
+    }
+    if let Some(mac) = &host.mac {
+        lines.push(format!("{:<12}{}", "MAC", mac));
+    }
+    if let Some(vendor) = &host.vendor {
+        lines.push(format!("{:<12}{} (inferred)", "Vendor", vendor));
+    }
+    lines
 }
 
 /// The display label for a detected service: its name, with the version
@@ -935,7 +989,7 @@ fn format_open_ports(ports: &[ProbedPort]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network::Port;
+    use crate::network::{MacAddress, Port};
     use crate::scanner::ScanError;
     use std::net::Ipv4Addr;
 
@@ -1302,6 +1356,75 @@ mod tests {
         assert!(host_matches(&host, "sh"));
         assert!(!host_matches(&host, "http"));
         assert!(!host_matches(&host, "telnet"));
+    }
+
+    #[test]
+    fn host_matches_hostname_and_vendor_case_insensitively() {
+        let mut host = Host::up("10.0.0.1".parse().unwrap(), Duration::from_millis(1));
+        host.hostname = Some("Router".to_owned());
+        host.mac = Some(MacAddress::new([0x3C, 0x52, 0x82, 0x11, 0x22, 0x33]));
+        host.vendor = Some("Hewlett-Packard".to_owned());
+
+        // Hostname: case-insensitive substring match.
+        assert!(host_matches(&host, "router"));
+        assert!(host_matches(&host, "ROUTER"));
+        assert!(host_matches(&host, "rout"));
+        // Vendor: case-insensitive substring match.
+        assert!(host_matches(&host, "hewlett"));
+        assert!(host_matches(&host, "PACKARD"));
+        // Unrelated needles do not match any field.
+        assert!(!host_matches(&host, "server"));
+        assert!(!host_matches(&host, "cisco"));
+        // The MAC address is deliberately not a filter target.
+        assert!(!host_matches(&host, "3c:52:82"));
+    }
+
+    #[test]
+    fn host_detail_lines_shows_base_lines_only_without_enrichment() {
+        let host = Host::up("10.0.0.1".parse().unwrap(), Duration::from_millis(3));
+        let lines = host_detail_lines(&host);
+        // Exactly the three base lines; none of the enrichment labels appear.
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("IP"));
+        assert!(lines[1].starts_with("State"));
+        assert!(lines[2].starts_with("Latency"));
+        assert!(!lines.iter().any(|line| line.starts_with("Hostname")));
+        assert!(!lines.iter().any(|line| line.starts_with("MAC")));
+        assert!(!lines.iter().any(|line| line.starts_with("Vendor")));
+    }
+
+    #[test]
+    fn host_detail_lines_appends_each_discovered_enrichment_field() {
+        let mut host = Host::up("10.0.0.1".parse().unwrap(), Duration::from_millis(3));
+        host.hostname = Some("router".to_owned());
+        host.mac = Some(MacAddress::new([0x3C, 0x52, 0x82, 0x11, 0x22, 0x33]));
+        host.vendor = Some("Hewlett-Packard".to_owned());
+
+        let lines = host_detail_lines(&host);
+        // Three base lines plus one line per discovered field.
+        assert_eq!(lines.len(), 6);
+        assert!(lines.iter().any(|line| line.contains("router")));
+        assert!(lines.iter().any(|line| line.contains("3C:52:82:11:22:33")));
+        // The vendor is OUI-derived, so it is explicitly labelled as inferred.
+        let vendor_line = lines
+            .iter()
+            .find(|line| line.starts_with("Vendor"))
+            .expect("a vendor line is present");
+        assert!(vendor_line.contains("Hewlett-Packard"));
+        assert!(vendor_line.ends_with("(inferred)"));
+    }
+
+    #[test]
+    fn host_detail_lines_includes_only_present_enrichment_fields() {
+        let mut host = Host::up("10.0.0.1".parse().unwrap(), Duration::from_millis(3));
+        // Only a hostname was discovered; MAC and vendor stay absent.
+        host.hostname = Some("router".to_owned());
+
+        let lines = host_detail_lines(&host);
+        assert_eq!(lines.len(), 4);
+        assert!(lines.iter().any(|line| line.contains("router")));
+        assert!(!lines.iter().any(|line| line.starts_with("MAC")));
+        assert!(!lines.iter().any(|line| line.starts_with("Vendor")));
     }
 
     #[test]

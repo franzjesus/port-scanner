@@ -16,7 +16,7 @@ use std::sync::mpsc::{SendError, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::network::{Host, Port, PortState, ServiceInfo};
+use crate::network::{Host, MacAddress, Port, PortState, ServiceInfo};
 use crate::ports::PortConfig;
 use crate::target::ScanTarget;
 
@@ -48,6 +48,18 @@ mod services;
 use services::ServiceDetector;
 // Re-exported so `main.rs` can build the default detector set for a scan.
 pub use services::default_detectors;
+
+/// Host enrichment: hostname (reverse DNS), MAC (ARP table), vendor (OUI).
+mod enrichment;
+// Used by [`run_scan`] to accept the enricher set; the trait itself stays
+// reachable as `scanner::enrichment::HostEnricher`.
+use enrichment::HostEnricher;
+// Used by [`run_scan`] to merge per-host enricher contributions.
+use enrichment::HostEnrichment;
+// Used by [`run_scan`] to derive the vendor from a discovered MAC.
+use enrichment::vendor_for;
+// Re-exported so `main.rs` can build the default enricher set for a scan.
+pub use enrichment::default_enrichers;
 
 /// A structured message produced by the scanner as a scan progresses.
 ///
@@ -86,6 +98,21 @@ pub enum ScanEvent {
         port: Port,
         /// The identified service.
         service: ServiceInfo,
+    },
+    /// Host enrichment data was discovered for a host.
+    ///
+    /// Emitted after the host's port scan, once the enrichment stage has
+    /// contributed at least one field. Only the fields that were actually
+    /// discovered are set; the TUI attaches them to the host.
+    HostEnriched {
+        /// The host the enrichment was discovered for.
+        ip: Ipv4Addr,
+        /// Reverse-DNS hostname, if one resolved.
+        hostname: Option<String>,
+        /// MAC address read from the ARP table, if present.
+        mac: Option<MacAddress>,
+        /// Vendor inferred from the MAC's OUI, if known.
+        vendor: Option<String>,
     },
     /// Progress update: `completed` hosts resolved out of `total`.
     Progress { completed: u64, total: u64 },
@@ -175,6 +202,10 @@ pub struct ScanConfig {
     /// stage. Enabled by default; can be turned off with the
     /// `--no-services` CLI flag.
     pub detect_services: bool,
+    /// Whether to enrich up hosts with hostname, MAC, and vendor data after
+    /// their port scan. Enabled by default; can be turned off with the
+    /// `--no-enrichment` CLI flag.
+    pub enrich: bool,
 }
 
 /// Builds and runs one scan in a background thread.
@@ -194,13 +225,14 @@ pub type ScanSpawner = Box<
 
 impl ScanConfig {
     /// Create a configuration for `target` using the default discovery and
-    /// port settings, with service detection enabled.
+    /// port settings, with service detection and host enrichment enabled.
     pub fn new(target: ScanTarget) -> Self {
         Self {
             target,
             discovery: DiscoveryConfig::default(),
             ports: PortConfig::default(),
             detect_services: true,
+            enrich: true,
         }
     }
 }
@@ -274,36 +306,44 @@ pub trait PortScanner {
 }
 
 /// Run a full scan of `target`: discover which hosts are up, port-scan every
-/// host that comes up, and (when enabled) detect the service on each open port.
+/// host that comes up, and (when enabled) detect the service on each open port
+/// and enrich each host with hostname, MAC, and vendor data.
 ///
 /// This is the orchestrating entry point for a whole scan. A single run is
 /// framed by exactly one [`ScanEvent::Started`] / [`ScanEvent::Finished`] (or
-/// [`ScanEvent::Cancelled`]) pair; the discovery, port-scanning, and
-/// service-detection stages stream their intermediate events
+/// [`ScanEvent::Cancelled`]) pair; the discovery, port-scanning,
+/// service-detection, and enrichment stages stream their intermediate events
 /// ([`ScanEvent::HostDiscovered`], [`ScanEvent::Progress`],
-/// [`ScanEvent::PortDiscovered`], [`ScanEvent::ServiceDiscovered`]) inside
-/// that frame.
+/// [`ScanEvent::PortDiscovered`], [`ScanEvent::ServiceDiscovered`],
+/// [`ScanEvent::HostEnriched`]) inside that frame.
 ///
-/// The discovery, port-scanning, and service-detection mechanisms are supplied
-/// as traits so this orchestrator stays independent of any concrete
-/// implementation. `config` carries the target and the per-stage tunables
-/// (see [`ScanConfig`]).
+/// The discovery, port-scanning, service-detection, and enrichment mechanisms
+/// are supplied as traits so this orchestrator stays independent of any
+/// concrete implementation. `config` carries the target and the per-stage
+/// tunables (see [`ScanConfig`]).
 ///
 /// Service detection runs only when [`ScanConfig::detect_services`] is set and
 /// `detectors` is non-empty; it probes each open port in turn and stops at the
 /// first detector that recognizes the service. A detector failure never fails
 /// the scan: the failed detector is skipped and the next one is tried.
 ///
+/// Enrichment runs only when [`ScanConfig::enrich`] is set and `enrichers` is
+/// non-empty; each enricher is tried per host and its contributions (hostname,
+/// MAC) are merged, with the vendor derived from the discovered MAC. A host
+/// with no enrichment data produces no [`ScanEvent::HostEnriched`]. An
+/// enricher failure never fails the scan: the failed enricher is skipped.
+///
 /// Cancellation is cooperative: when `cancel` is set, discovery stops (and
-/// reports [`ScanEvent::Cancelled`]) and no further hosts are port-scanned or
-/// service-probed; in-flight connections are allowed to finish. Both normal
-/// completion and cancellation return `Ok(())` — only a fatal error returns
-/// `Err`.
+/// reports [`ScanEvent::Cancelled`]) and no further hosts are port-scanned,
+/// service-probed, or enriched; in-flight connections are allowed to finish.
+/// Both normal completion and cancellation return `Ok(())` — only a fatal
+/// error returns `Err`.
 pub fn run_scan<D: HostDiscovery, P: PortScanner>(
     config: &ScanConfig,
     discovery: &D,
     port_scanner: &P,
     detectors: &[Box<dyn ServiceDetector>],
+    enrichers: &[Box<dyn HostEnricher>],
     events: &Sender<ScanEvent>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(), ScanError> {
@@ -353,6 +393,36 @@ pub fn run_scan<D: HostDiscovery, P: PortScanner>(
                         }
                     }
                 }
+                // Enrichment for this host. Skipped entirely when disabled or
+                // when no enrichers are configured. Cancellation is checked
+                // before the stage so a cancelled scan stops scheduling further
+                // enrichment work.
+                if config.enrich && !enrichers.is_empty() {
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    // Merge the contributions of every enricher; a failed or
+                    // empty enricher simply adds nothing.
+                    let mut merged = HostEnrichment::default();
+                    for enricher in enrichers {
+                        if let Ok(Some(enrichment)) = enricher.enrich(host.ip) {
+                            // First contribution wins for a field.
+                            merged.hostname = merged.hostname.or(enrichment.hostname);
+                            merged.mac = merged.mac.or(enrichment.mac);
+                        }
+                    }
+                    // A host with no enrichment data produces no event at all.
+                    if !merged.is_empty() {
+                        // The vendor is inferred from the discovered MAC's OUI.
+                        let vendor = merged.mac.as_ref().and_then(vendor_for);
+                        let _ = events.send(ScanEvent::HostEnriched {
+                            ip: host.ip,
+                            hostname: merged.hostname,
+                            mac: merged.mac,
+                            vendor,
+                        });
+                    }
+                }
             }
             // The last host's scan may have started before cancellation was
             // requested; if so, report it rather than finishing normally.
@@ -370,6 +440,7 @@ pub fn run_scan<D: HostDiscovery, P: PortScanner>(
 
 #[cfg(test)]
 mod tests {
+    use super::enrichment::{EnrichmentError, HostEnrichment};
     use super::*;
     use std::net::Ipv4Addr;
     use std::time::Duration;
@@ -448,6 +519,7 @@ mod tests {
         assert_eq!(config.discovery, DiscoveryConfig::default());
         assert_eq!(config.ports, PortConfig::default());
         assert!(config.detect_services, "service detection is on by default");
+        assert!(config.enrich, "enrichment is on by default");
     }
 
     /// Runs a full scan against loopback and checks that the whole run — host
@@ -485,11 +557,22 @@ mod tests {
             // Service detection stays off: this test only checks the scan
             // framing, and empty detectors would make detection a no-op anyway.
             detect_services: false,
+            // Enrichment stays off: this test only checks the scan framing,
+            // and the default enrichers would perform real network lookups.
+            enrich: false,
         };
 
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        let result = run_scan(&config, &IcmpDiscovery, &TcpPortScanner, &[], &tx, &cancel);
+        let result = run_scan(
+            &config,
+            &IcmpDiscovery,
+            &TcpPortScanner,
+            &[],
+            &[],
+            &tx,
+            &cancel,
+        );
         drop(tx);
 
         // Skip in environments where ICMP is unavailable.
@@ -652,11 +735,38 @@ mod tests {
         }
     }
 
+    /// A [`HostEnricher`] that always returns a fixed enrichment.
+    struct FixedEnricher {
+        enrichment: HostEnrichment,
+    }
+
+    impl HostEnricher for FixedEnricher {
+        fn enrich(&self, _ip: Ipv4Addr) -> Result<Option<HostEnrichment>, EnrichmentError> {
+            if self.enrichment.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(self.enrichment.clone()))
+            }
+        }
+    }
+
+    /// A [`HostEnricher`] that always fails; the orchestrator must skip it
+    /// without failing the scan.
+    struct FailingEnricher;
+
+    impl HostEnricher for FailingEnricher {
+        fn enrich(&self, _ip: Ipv4Addr) -> Result<Option<HostEnrichment>, EnrichmentError> {
+            Err(EnrichmentError::Lookup("forced failure".to_string()))
+        }
+    }
+
     /// Runs the orchestrator against the hermetic fakes and returns the
     /// result plus every event that was produced.
     fn run_fake_scan(
         detect_services: bool,
         detectors: Vec<Box<dyn ServiceDetector>>,
+        enrich: bool,
+        enrichers: Vec<Box<dyn HostEnricher>>,
     ) -> (Result<(), ScanError>, Vec<ScanEvent>) {
         use std::sync::mpsc;
 
@@ -665,6 +775,7 @@ mod tests {
             discovery: DiscoveryConfig::default(),
             ports: PortConfig::default(),
             detect_services,
+            enrich,
         };
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -673,6 +784,7 @@ mod tests {
             &FakeDiscovery,
             &FakePortScanner,
             &detectors,
+            &enrichers,
             &tx,
             &cancel,
         );
@@ -693,13 +805,33 @@ mod tests {
             .collect()
     }
 
+    /// The `(ip, hostname, mac, vendor)` payload collected from
+    /// `HostEnriched` events in tests.
+    type EnrichedHost = (Ipv4Addr, Option<String>, Option<MacAddress>, Option<String>);
+
+    /// Collects the `EnrichedHost` tuples from `HostEnriched` events.
+    fn enrichment_events(events: &[ScanEvent]) -> Vec<EnrichedHost> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ScanEvent::HostEnriched {
+                    ip,
+                    hostname,
+                    mac,
+                    vendor,
+                } => Some((*ip, hostname.clone(), *mac, vendor.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn run_scan_detects_services_on_open_ports_when_enabled() {
         let detectors: Vec<Box<dyn ServiceDetector>> = vec![Box::new(RecognizingDetector {
             port: Port::new(80).unwrap(),
             name: "http",
         })];
-        let (result, events) = run_fake_scan(true, detectors);
+        let (result, events) = run_fake_scan(true, detectors, false, vec![]);
         assert!(result.is_ok(), "scan must succeed: {result:?}");
 
         // Only the open port the detector recognizes gets a service; the
@@ -721,7 +853,7 @@ mod tests {
             port: Port::new(80).unwrap(),
             name: "http",
         })];
-        let (result, events) = run_fake_scan(false, detectors);
+        let (result, events) = run_fake_scan(false, detectors, false, vec![]);
         assert!(result.is_ok(), "scan must succeed: {result:?}");
         assert!(
             service_events(&events).is_empty(),
@@ -731,7 +863,7 @@ mod tests {
 
     #[test]
     fn run_scan_skips_service_detection_without_detectors() {
-        let (result, events) = run_fake_scan(true, vec![]);
+        let (result, events) = run_fake_scan(true, vec![], false, vec![]);
         assert!(result.is_ok(), "scan must succeed: {result:?}");
         assert!(
             service_events(&events).is_empty(),
@@ -751,7 +883,7 @@ mod tests {
                 name: "beta",
             }),
         ];
-        let (result, events) = run_fake_scan(true, detectors);
+        let (result, events) = run_fake_scan(true, detectors, false, vec![]);
         assert!(result.is_ok(), "scan must succeed: {result:?}");
 
         let services = service_events(&events);
@@ -768,7 +900,7 @@ mod tests {
                 name: "http",
             }),
         ];
-        let (result, events) = run_fake_scan(true, detectors);
+        let (result, events) = run_fake_scan(true, detectors, false, vec![]);
         assert!(
             result.is_ok(),
             "a detector failure must not fail the scan: {result:?}"
@@ -790,11 +922,128 @@ mod tests {
     fn run_scan_no_service_when_no_detector_recognizes() {
         let detectors: Vec<Box<dyn ServiceDetector>> =
             vec![Box::new(NoMatchDetector), Box::new(FailingDetector)];
-        let (result, events) = run_fake_scan(true, detectors);
+        let (result, events) = run_fake_scan(true, detectors, false, vec![]);
         assert!(result.is_ok(), "scan must succeed: {result:?}");
         assert!(
             service_events(&events).is_empty(),
             "no recognition means no service: {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(ScanEvent::Finished)),
+            "scan still finishes: {events:?}"
+        );
+    }
+
+    #[test]
+    fn run_scan_enriches_hosts_when_enabled() {
+        let mac: MacAddress = "3c:52:82:aa:bb:cc".parse().unwrap();
+        let enrichers: Vec<Box<dyn HostEnricher>> = vec![
+            Box::new(FixedEnricher {
+                enrichment: HostEnrichment {
+                    hostname: Some("host.example".to_string()),
+                    mac: None,
+                },
+            }),
+            Box::new(FixedEnricher {
+                enrichment: HostEnrichment {
+                    hostname: None,
+                    mac: Some(mac),
+                },
+            }),
+        ];
+        let (result, events) = run_fake_scan(false, vec![], true, enrichers);
+        assert!(result.is_ok(), "scan must succeed: {result:?}");
+
+        // The contributions of every enricher are merged into one event, and
+        // the vendor is derived from the discovered MAC.
+        let enriched = enrichment_events(&events);
+        assert_eq!(enriched.len(), 1, "one event per host: {events:?}");
+        let (ip, hostname, mac_found, vendor) = &enriched[0];
+        assert_eq!(*ip, Ipv4Addr::LOCALHOST);
+        assert_eq!(hostname.as_deref(), Some("host.example"));
+        assert_eq!(mac_found.as_ref(), Some(&mac));
+        assert!(
+            vendor.is_some(),
+            "vendor should be derived from the discovered MAC: {events:?}"
+        );
+
+        assert!(
+            matches!(events.last(), Some(ScanEvent::Finished)),
+            "scan still finishes: {events:?}"
+        );
+    }
+
+    #[test]
+    fn run_scan_skips_enrichment_when_disabled() {
+        let enrichers: Vec<Box<dyn HostEnricher>> = vec![Box::new(FixedEnricher {
+            enrichment: HostEnrichment {
+                hostname: Some("host.example".to_string()),
+                mac: None,
+            },
+        })];
+        let (result, events) = run_fake_scan(false, vec![], false, enrichers);
+        assert!(result.is_ok(), "scan must succeed: {result:?}");
+        assert!(
+            enrichment_events(&events).is_empty(),
+            "enrichment must not run when disabled: {events:?}"
+        );
+    }
+
+    #[test]
+    fn run_scan_skips_enrichment_without_enrichers() {
+        let (result, events) = run_fake_scan(false, vec![], true, vec![]);
+        assert!(result.is_ok(), "scan must succeed: {result:?}");
+        assert!(
+            enrichment_events(&events).is_empty(),
+            "no enrichers means no enrichment: {events:?}"
+        );
+    }
+
+    #[test]
+    fn run_scan_enricher_failure_is_skipped_not_fatal() {
+        let enrichers: Vec<Box<dyn HostEnricher>> = vec![
+            Box::new(FailingEnricher),
+            Box::new(FixedEnricher {
+                enrichment: HostEnrichment {
+                    hostname: None,
+                    mac: Some("00:1b:63:dd:ee:ff".parse().unwrap()),
+                },
+            }),
+        ];
+        let (result, events) = run_fake_scan(false, vec![], true, enrichers);
+        assert!(
+            result.is_ok(),
+            "an enricher failure must not fail the scan: {result:?}"
+        );
+
+        // The failing enricher is skipped and the next one still reports.
+        let enriched = enrichment_events(&events);
+        assert_eq!(enriched.len(), 1, "events: {events:?}");
+        assert!(
+            enriched[0].2.is_some(),
+            "the surviving enricher still contributes: {events:?}"
+        );
+
+        // An enricher failure is not a scan error.
+        assert!(
+            !events.iter().any(|e| matches!(e, ScanEvent::Error(_))),
+            "no Error event expected: {events:?}"
+        );
+    }
+
+    #[test]
+    fn run_scan_no_enrichment_event_when_nothing_is_enriched() {
+        let enrichers: Vec<Box<dyn HostEnricher>> = vec![
+            Box::new(FailingEnricher),
+            Box::new(FixedEnricher {
+                enrichment: HostEnrichment::default(),
+            }),
+        ];
+        let (result, events) = run_fake_scan(false, vec![], true, enrichers);
+        assert!(result.is_ok(), "scan must succeed: {result:?}");
+        assert!(
+            enrichment_events(&events).is_empty(),
+            "no enrichment data means no event: {events:?}"
         );
         assert!(
             matches!(events.last(), Some(ScanEvent::Finished)),
