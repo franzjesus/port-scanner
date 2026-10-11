@@ -14,8 +14,7 @@ use std::sync::{mpsc, Arc};
 use crate::export::ExportDocument;
 use crate::network::host::Host;
 use crate::scanner::{
-    default_detectors, default_enrichers, run_scan, IcmpDiscovery, ScanConfig, ScanEvent,
-    TcpPortScanner,
+    default_detectors, default_enrichers, run_scan, ScanConfig, ScanEvent, TcpPortScanner,
 };
 
 /// Apply one scanner event to the collected host list, mirroring the TUI's
@@ -36,6 +35,12 @@ pub fn apply_event(hosts: &mut Vec<Host>, event: ScanEvent) -> bool {
         // progress and elapsed display; the export document carries none of
         // those, so there is nothing to do here.
         ScanEvent::Started { .. } | ScanEvent::Progress { .. } => false,
+        // A warning does not change the collected results; print it to
+        // stderr so it never pollutes the JSON document on stdout.
+        ScanEvent::Warning(message) => {
+            eprintln!("port-scanner: warning: {message}");
+            false
+        }
         ScanEvent::HostDiscovered(host) => {
             hosts.push(host);
             false
@@ -114,7 +119,7 @@ pub fn run(config: &ScanConfig, output: Option<&Path>) -> ExitCode {
 
     let result = run_scan(
         config,
-        &IcmpDiscovery,
+        &config.discovery_strategy,
         &TcpPortScanner,
         &default_detectors(),
         &default_enrichers(),
@@ -214,6 +219,17 @@ mod tests {
                 total: 256
             }
         ));
+        assert_eq!(hosts.len(), 1);
+    }
+
+    #[test]
+    fn warning_does_not_change_the_hosts_and_is_not_terminal() {
+        let mut hosts = vec![up_host("192.168.1.10")];
+        let finished = apply_event(
+            &mut hosts,
+            ScanEvent::Warning("falling back to TCP discovery".to_string()),
+        );
+        assert!(!finished);
         assert_eq!(hosts.len(), 1);
     }
 
@@ -338,5 +354,38 @@ mod tests {
             ScanEvent::Error(ScanError::Socket("boom".to_string()))
         ));
         assert_eq!(hosts.len(), 1);
+    }
+
+    #[test]
+    fn run_respects_the_configured_discovery_strategy() {
+        use crate::scanner::Discovery;
+        use crate::target::ScanTarget;
+
+        // A single-host target keeps the scan small. The TCP strategy probes
+        // 127.0.0.1's common ports; loopback answers even closed ports with
+        // RST, so the host must come back up.
+        let mut config = ScanConfig::new(ScanTarget::Host("127.0.0.1".parse().unwrap()));
+        config.discovery_strategy = Discovery::Tcp;
+        config.detect_services = false;
+        config.enrich = false;
+
+        let dir = std::env::temp_dir().join(format!(
+            "port-scanner-headless-{}-{}",
+            "tcp-strategy",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("export.json");
+
+        let code = run(&config, Some(&path));
+        assert_eq!(code, std::process::ExitCode::SUCCESS);
+
+        let json = std::fs::read_to_string(&path).unwrap();
+        assert!(json.contains("127.0.0.1"), "document: {json}");
+        assert!(
+            json.contains("\"state\": \"up\""),
+            "expected 127.0.0.1 to be up: {json}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

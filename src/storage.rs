@@ -413,7 +413,7 @@ mod tests {
     use super::*;
     use crate::network::{Host, MacAddress, Port, PortState, ProbedPort, ServiceInfo};
     use crate::ports::{PortConfig, PortSpec};
-    use crate::scanner::{DiscoveryConfig, ScanConfig};
+    use crate::scanner::{Discovery, DiscoveryConfig, ScanConfig};
     use std::time::Duration;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -429,6 +429,7 @@ mod tests {
     fn test_config() -> ScanConfig {
         ScanConfig {
             target: ScanTarget::parse("192.168.1.0/24").expect("valid subnet"),
+            discovery_strategy: Discovery::default(),
             discovery: DiscoveryConfig {
                 timeout: Duration::from_millis(350),
                 concurrency: 64,

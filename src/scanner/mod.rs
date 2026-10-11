@@ -11,6 +11,7 @@
 
 use std::fmt;
 use std::net::Ipv4Addr;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SendError, Sender};
 use std::sync::Arc;
@@ -34,6 +35,9 @@ pub use discovery::IcmpDiscovery;
 // Re-exported so the discovery outcome is reachable as
 // `scanner::DiscoveryOutcome`.
 pub use discovery::DiscoveryOutcome;
+
+/// TCP-based host discovery, used when an ICMP socket cannot be opened.
+mod tcp_discovery;
 
 /// TCP port scanning for hosts found by discovery.
 mod ports;
@@ -116,6 +120,14 @@ pub enum ScanEvent {
     },
     /// Progress update: `completed` hosts resolved out of `total`.
     Progress { completed: u64, total: u64 },
+    /// A non-fatal warning about the scan in progress.
+    ///
+    /// Emitted when the scanner recovers from a degraded condition, for
+    /// example falling back from ICMP to TCP discovery because the ICMP socket
+    /// could not be opened. Unlike [`ScanEvent::Error`], a warning does not
+    /// stop the scan; the TUI displays it and clears it when the next scan
+    /// starts.
+    Warning(String),
     /// The scan completed normally.
     Finished,
     /// The scan was cancelled by the user.
@@ -194,6 +206,9 @@ impl Default for DiscoveryConfig {
 pub struct ScanConfig {
     /// What to scan: a single host or a subnet.
     pub target: ScanTarget,
+    /// The strategy used to resolve which hosts are up. Defaults to
+    /// [`Discovery::Auto`]; selectable with the `--discovery` CLI flag.
+    pub discovery_strategy: Discovery,
     /// Tunables for the host-discovery stage.
     pub discovery: DiscoveryConfig,
     /// Tunables for the TCP port stage.
@@ -229,10 +244,102 @@ impl ScanConfig {
     pub fn new(target: ScanTarget) -> Self {
         Self {
             target,
+            discovery_strategy: Discovery::default(),
             discovery: DiscoveryConfig::default(),
             ports: PortConfig::default(),
             detect_services: true,
             enrich: true,
+        }
+    }
+}
+
+/// The host-discovery strategy used for a scan.
+///
+/// This is the single selection point for how a scan resolves which of the
+/// target's hosts are up. [`Discovery::Auto`] is the default: it tries ICMP
+/// echo first and, when the ICMP socket cannot be opened (for example when
+/// the kernel denies an unprivileged ICMP datagram socket with `EPERM`),
+/// emits a [`ScanEvent::Warning`] and falls back to TCP port probing so the
+/// scan remains usable instead of failing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Discovery {
+    /// Try ICMP echo first; fall back to TCP port probing (with a
+    /// [`ScanEvent::Warning`]) if the ICMP socket cannot be opened.
+    #[default]
+    Auto,
+    /// Resolve hosts with ICMP echo. A socket failure is a scan error.
+    Icmp,
+    /// Resolve hosts by probing a small fixed set of TCP ports.
+    Tcp,
+}
+
+/// Error produced when a `--discovery` value cannot be parsed into a
+/// [`Discovery`] strategy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscoveryError {
+    /// The given string is not one of `auto`, `icmp`, or `tcp`.
+    UnknownStrategy {
+        /// The offending input, for the error message.
+        input: String,
+    },
+}
+
+impl fmt::Display for DiscoveryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DiscoveryError::UnknownStrategy { input } => write!(
+                f,
+                "unknown discovery strategy {input:?}; expected one of: auto, icmp, tcp"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DiscoveryError {}
+
+impl FromStr for Discovery {
+    type Err = DiscoveryError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "auto" => Ok(Discovery::Auto),
+            "icmp" => Ok(Discovery::Icmp),
+            "tcp" => Ok(Discovery::Tcp),
+            other => Err(DiscoveryError::UnknownStrategy {
+                input: other.to_string(),
+            }),
+        }
+    }
+}
+
+impl HostDiscovery for Discovery {
+    fn discover(
+        &self,
+        target: &ScanTarget,
+        config: &DiscoveryConfig,
+        events: &Sender<ScanEvent>,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<DiscoveryOutcome, ScanError> {
+        match self {
+            Discovery::Icmp => IcmpDiscovery.discover(target, config, events, cancel),
+            Discovery::Tcp => tcp_discovery::TcpDiscovery.discover(target, config, events, cancel),
+            Discovery::Auto => match IcmpDiscovery::open() {
+                // ICMP is available: run the sweep directly on the socket we
+                // just opened.
+                Ok(socket) => {
+                    let addresses: Vec<Ipv4Addr> = target.iter().collect();
+                    discovery::sweep(&socket, &addresses, config, events, cancel)
+                }
+                // ICMP is unavailable (for example EPERM on an unprivileged
+                // ICMP datagram socket): warn and fall back to TCP port
+                // probing so the scan stays usable.
+                Err(err) => {
+                    let _ = events.send(ScanEvent::Warning(format!(
+                        "ICMP echo unavailable ({err}); falling back to TCP port probing"
+                    )));
+                    tcp_discovery::TcpDiscovery.discover(target, config, events, cancel)
+                }
+            },
         }
     }
 }
@@ -483,6 +590,68 @@ mod tests {
             other => panic!("expected Error, got {other:?}"),
         };
         assert_eq!(cause, ScanError::Socket("boom".to_string()));
+
+        let warning = ScanEvent::Warning("falling back to TCP discovery".to_string());
+        let message = match warning {
+            ScanEvent::Warning(message) => message,
+            other => panic!("expected Warning, got {other:?}"),
+        };
+        assert_eq!(message, "falling back to TCP discovery");
+    }
+
+    /// When the ICMP socket can be opened, `Auto` behaves exactly like
+    /// `Icmp` and emits no warning.
+    ///
+    /// This test requires ICMP echo to work in the test environment (as
+    /// `discovers_localhost` in `discovery.rs` does); when it is unavailable,
+    /// the fallback path under test here does not run.
+    #[test]
+    fn auto_uses_icmp_when_the_socket_opens() {
+        let target = ScanTarget::Host(Ipv4Addr::LOCALHOST);
+        let config = DiscoveryConfig::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let outcome = match Discovery::Auto.discover(&target, &config, &tx, &cancel) {
+            Ok(outcome) => outcome,
+            Err(err) => panic!("ICMP echo unavailable in this environment: {err:?}"),
+        };
+        drop(tx);
+        let events: Vec<ScanEvent> = rx.try_iter().collect();
+
+        // No warning: ICMP worked, so the fallback never engaged.
+        assert!(
+            !events.iter().any(|e| matches!(e, ScanEvent::Warning(_))),
+            "Auto must not warn when ICMP is available: {events:?}"
+        );
+
+        match &outcome {
+            DiscoveryOutcome::Completed(hosts) => {
+                assert_eq!(hosts.len(), 1, "expected localhost to be up: {hosts:?}");
+                assert_eq!(hosts[0].ip, Ipv4Addr::LOCALHOST);
+                assert!(matches!(hosts[0].state, crate::network::HostState::Up));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discovery_parses_from_its_cli_names() {
+        assert_eq!("auto".parse::<Discovery>().unwrap(), Discovery::Auto);
+        assert_eq!("icmp".parse::<Discovery>().unwrap(), Discovery::Icmp);
+        assert_eq!("tcp".parse::<Discovery>().unwrap(), Discovery::Tcp);
+    }
+
+    #[test]
+    fn discovery_rejects_unknown_strategies() {
+        let err = "udp".parse::<Discovery>().unwrap_err();
+        assert_eq!(
+            err,
+            DiscoveryError::UnknownStrategy {
+                input: "udp".to_string()
+            }
+        );
+        assert!(err.to_string().contains("udp"), "message: {err}");
     }
 
     #[test]
@@ -548,6 +717,7 @@ mod tests {
 
         let config = ScanConfig {
             target: ScanTarget::Host(Ipv4Addr::LOCALHOST),
+            discovery_strategy: Discovery::default(),
             discovery: DiscoveryConfig::default(),
             ports: PortConfig {
                 ports: PortSpec::from_port_numbers([open_port, closed_port]),
@@ -772,6 +942,7 @@ mod tests {
 
         let config = ScanConfig {
             target: ScanTarget::Host(Ipv4Addr::LOCALHOST),
+            discovery_strategy: Discovery::default(),
             discovery: DiscoveryConfig::default(),
             ports: PortConfig::default(),
             detect_services,

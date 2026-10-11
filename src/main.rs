@@ -23,8 +23,8 @@ use crate::ports::{
     DEFAULT_TIMEOUT,
 };
 use crate::scanner::{
-    default_detectors, default_enrichers, run_scan, IcmpDiscovery, ScanConfig, ScanEvent,
-    ScanSpawner, TcpPortScanner,
+    default_detectors, default_enrichers, run_scan, Discovery, DiscoveryError, ScanConfig,
+    ScanEvent, ScanSpawner, TcpPortScanner,
 };
 use crate::target::ScanTarget;
 
@@ -50,6 +50,12 @@ struct Cli {
     /// Ignored when `--ports` is given.
     #[arg(long, value_parser = parse_profile)]
     profile: Option<PortProfile>,
+
+    /// Host-discovery strategy: auto, icmp, or tcp. `auto` (the default)
+    /// tries ICMP echo first and falls back to TCP port probing, with a
+    /// visible warning, when the ICMP socket cannot be opened.
+    #[arg(long, value_parser = parse_discovery, default_value = "auto")]
+    discovery: Discovery,
 
     /// Skip service detection on open ports.
     #[arg(long)]
@@ -82,6 +88,14 @@ struct Cli {
 /// logic (and its tests) live in a single place.
 fn parse_profile(raw: &str) -> Result<PortProfile, PortProfileError> {
     raw.parse::<PortProfile>()
+}
+
+/// Parse the `--discovery` argument into a [`Discovery`] strategy.
+///
+/// Delegates to [`Discovery`]'s `FromStr` implementation so the parsing
+/// logic (and its tests) live in a single place.
+fn parse_discovery(raw: &str) -> Result<Discovery, DiscoveryError> {
+    raw.parse::<Discovery>()
 }
 
 /// Error produced when the `--timeout` argument cannot be parsed.
@@ -205,7 +219,7 @@ fn build_spawner() -> ScanSpawner {
         std::thread::spawn(move || {
             let _ = run_scan(
                 &config,
-                &IcmpDiscovery,
+                &config.discovery_strategy,
                 &TcpPortScanner,
                 &detectors,
                 &enrichers,
@@ -250,6 +264,7 @@ async fn main() -> ExitCode {
     // the scan itself through the spawner (Phase 10).
     let config = target.as_ref().map(|target| {
         let mut config = ScanConfig::new(target.clone());
+        config.discovery_strategy = cli.discovery;
         config.ports = port_config.clone();
         // `--timeout` applies to both stages, so mirror it into the discovery
         // stage when the user set it.

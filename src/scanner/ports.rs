@@ -43,15 +43,15 @@ use crate::scanner::{PortScanner, ScanError, ScanEvent};
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TcpPortScanner;
 
-/// The number of worker threads to run for a port count and concurrency bound:
+/// The number of worker threads to run for a work count and concurrency bound:
 /// zero when there is no work, otherwise the concurrency clamped to the range
-/// `[1, ports]`. Capping at the port count keeps a small selection from
-/// over-spawning; the floor of one guards against a zero concurrency setting.
-fn worker_count(concurrency: usize, ports: usize) -> usize {
-    if ports == 0 {
+/// `[1, work]`. Capping at the work count keeps a small job from over-spawning;
+/// the floor of one guards against a zero concurrency setting.
+pub(crate) fn worker_count(concurrency: usize, work: usize) -> usize {
+    if work == 0 {
         0
     } else {
-        concurrency.max(1).min(ports)
+        concurrency.max(1).min(work)
     }
 }
 

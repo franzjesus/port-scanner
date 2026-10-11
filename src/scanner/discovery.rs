@@ -170,6 +170,18 @@ pub(crate) fn sweep(
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IcmpDiscovery;
 
+impl IcmpDiscovery {
+    /// Opens the unprivileged ICMP echo socket.
+    ///
+    /// Split out from [`IcmpDiscovery::discover`] so a caller that wants to
+    /// *probe* whether ICMP is available (for example, a discovery-strategy
+    /// selector that falls back to TCP port probing) can open the socket
+    /// itself and react to the failure without running a sweep.
+    pub(crate) fn open() -> Result<PingSocket, ScanError> {
+        PingSocket::new().map_err(|e| ScanError::Socket(e.to_string()))
+    }
+}
+
 impl HostDiscovery for IcmpDiscovery {
     fn discover(
         &self,
@@ -184,10 +196,9 @@ impl HostDiscovery for IcmpDiscovery {
 
         // Open the socket before any probe so a socket failure is reported as
         // an error event instead of a half-started scan.
-        let socket = match PingSocket::new() {
+        let socket = match IcmpDiscovery::open() {
             Ok(socket) => socket,
-            Err(e) => {
-                let err = ScanError::Socket(e.to_string());
+            Err(err) => {
                 let _ = events.send(ScanEvent::Error(err.clone()));
                 return Err(err);
             }
@@ -265,6 +276,18 @@ mod tests {
                 assert!(hosts[0].latency.is_some());
             }
             other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// Whether the environment allows an unprivileged ICMP socket or not, an
+    /// open failure must surface as [`ScanError::Socket`] so callers can treat
+    /// it uniformly (and fall back to another discovery mechanism).
+    #[test]
+    fn open_maps_socket_failure_to_a_socket_error() {
+        match IcmpDiscovery::open() {
+            Ok(_) => {}
+            Err(ScanError::Socket(message)) => assert!(!message.is_empty()),
+            Err(other) => panic!("expected ScanError::Socket, got {other:?}"),
         }
     }
 }

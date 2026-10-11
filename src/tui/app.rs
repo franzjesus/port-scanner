@@ -137,6 +137,12 @@ pub struct App {
     /// Set when a `ScanEvent::Error` arrives (Phase 10) and cleared whenever a
     /// new scan is started.
     pub scan_error: Option<String>,
+    /// Warning message from the most recent scan, if any.
+    ///
+    /// Set when a `ScanEvent::Warning` arrives (for example, the scanner fell
+    /// back to TCP discovery because the ICMP socket could not be opened) and
+    /// cleared whenever a new scan is started.
+    pub warning: Option<String>,
     /// Number of TCP ports to probe on each up host, from the resolved port
     /// configuration. Drives the live port-progress display.
     pub ports_per_host: usize,
@@ -317,7 +323,9 @@ impl App {
         match event {
             ScanEvent::Started { total } => {
                 // Discovery begins: record the total host count and the start
-                // instant for elapsed/duration tracking.
+                // instant for elapsed/duration tracking, and drop any stale
+                // warning from a previous scan.
+                self.warning = None;
                 self.scan = ScanState::Discovering {
                     completed: 0,
                     total,
@@ -386,6 +394,11 @@ impl App {
                         host.vendor = Some(vendor);
                     }
                 }
+            }
+            // Non-fatal: show the message on the status line but do not
+            // change the scan state or progress.
+            ScanEvent::Warning(message) => {
+                self.warning = Some(message);
             }
             ScanEvent::Error(err) => {
                 // Keep the message for the status line; the state only records
@@ -1092,6 +1105,9 @@ fn draw_overview(frame: &mut Frame, app: &App) {
     if let Some(err) = &app.scan_error {
         parts.push(format!("Error: {err}"));
     }
+    if let Some(warning) = &app.warning {
+        parts.push(format!("Warning: {warning}"));
+    }
     if let Some(status) = &app.export_status {
         parts.push(status.clone());
     }
@@ -1737,6 +1753,29 @@ mod tests {
                 total: 4
             }
         );
+    }
+
+    #[test]
+    fn warning_event_stores_the_message() {
+        let mut app = App::default();
+        app.apply_event(ScanEvent::Warning(
+            "ICMP unavailable; falling back to TCP discovery".to_owned(),
+        ));
+        assert_eq!(
+            app.warning.as_deref(),
+            Some("ICMP unavailable; falling back to TCP discovery")
+        );
+        // A warning does not change the scan state or progress.
+        assert_eq!(app.scan, ScanState::Idle);
+    }
+
+    #[test]
+    fn started_event_clears_a_previous_warning() {
+        let mut app = App::default();
+        app.apply_event(ScanEvent::Warning("stale warning".to_owned()));
+        assert!(app.warning.is_some());
+        app.apply_event(ScanEvent::Started { total: 4 });
+        assert!(app.warning.is_none());
     }
 
     #[test]

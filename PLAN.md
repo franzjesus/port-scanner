@@ -230,6 +230,7 @@ enum ScanEvent {
         completed: usize,
         total: usize,
     },
+    Warning(String),
     Finished,
     Cancelled,
     Error(ScanError),
@@ -343,7 +344,7 @@ Invalid targets produce clear errors without panicking.
 - CIDR handling uses `ipnet 2` (`Ipv4Net`): the standard library provides `Ipv4Addr` but no CIDR type, and `ipnet` is small and dependency-free.
 - `ScanTarget` is an enum: `Host(Ipv4Addr)` / `Subnet(Ipv4Net)`. Subnets are normalized via `trunc()`, so `192.168.1.1/24` is stored as `192.168.1.0/24`. `len()` returns the address count as `u64` (a `/0` is 2^32).
 - `MAX_SUBNET_SIZE = 65_536` (i.e. minimum prefix `/16`) rejects larger targets with a `TooManyHosts` error. It is a constant for now and can become configurable once scan configuration exists (Phase 5).
-- IPv6 input is explicitly rejected with `Ipv6NotSupported` until IPv6 support lands (Phase 23).
+- IPv6 input is explicitly rejected with `Ipv6NotSupported` until IPv6 support lands (Phase 24).
 - The TUI displays the target in the title (per the UI mockup) and in the body (`Target: ... (N hosts). Press q to quit.`); the body remains a placeholder until the host list exists in a later phase.
 - Verified: `cargo fmt --check`, `cargo check`, `cargo test` (16 unit tests), `cargo clippy --all-targets` (clean), plus manual CLI checks of every error path (invalid address, invalid prefix, oversized subnet, IPv6 → exit 1) and a PTY smoke test (renders the target title/body, clean exit on `q`).
 
@@ -1642,7 +1643,88 @@ A subnet view can be useful even without claiming topology.
 
 ---
 
-# 23\. Future IPv6 Support
+# 23\. Phase 17 — TCP Discovery Fallback
+
+Follow-up work after Phase 16. On some hosts an unprivileged ICMPv4 datagram
+socket fails with EPERM (`socket error: Permission denied (os error 13)`),
+which made host discovery unusable: the scan died with a single `Error` event
+and no hosts. This phase keeps the scanner usable by falling back to TCP port
+probing, with a visible warning, and adds an explicit strategy selector to
+the CLI.
+
+## Design decisions
+
+- **Strategy type:** a `Discovery` enum in `src/scanner/mod.rs`
+  (`Auto` | `Icmp` | `Tcp`, `#[default] Auto`). `ScanConfig` gains a
+  `discovery_strategy: Discovery` field.
+- **`impl HostDiscovery for Discovery`:** `Auto` opens the ICMP socket via the
+  new `IcmpDiscovery::open()`; on success it runs the existing ICMP sweep, on
+  failure it emits `ScanEvent::Warning(...)` and falls back to TCP probing.
+  `Icmp` and `Tcp` delegate directly to the respective strategy with no
+  fallback. `run_scan` is generic over `HostDiscovery`, so the TUI and
+  headless paths both pass `&config.discovery_strategy`.
+- **TCP probing:** a new module `src/scanner/tcp_discovery.rs`. `TcpDiscovery`
+  probes `PROBE_PORTS = [22, 80, 443, 3389]` per candidate address with a
+  bounded worker pool (same concurrency as the ICMP sweep) and
+  `TcpStream::connect_timeout` using `DiscoveryConfig.timeout`. The pure
+  `classify_connect` maps `Ok` → `Up`, `ConnectionRefused` → `Up` (a live host
+  answered the SYN with RST), and every other timeout/unreachable error to
+  `Down`. Host latency is the minimum over the responding probes. It emits
+  `HostDiscovered` and `Progress` per host in sorted IP order and never emits
+  `Started`/`Finished` (owned by `run_scan`).
+- **Warning event:** a new non-fatal `ScanEvent::Warning(String)` variant. The
+  TUI stores the message in `App.warning`, shows it on the status line
+  (`Warning: ...`), and clears it on the next `Started`. Headless prints it to
+  stderr (`port-scanner: warning: ...`) so stdout stays JSON-only.
+- **CLI:** `--discovery auto|icmp|tcp` (default `auto`), parsed through
+  `impl FromStr for Discovery`. Unknown values produce the standard clap
+  value error `unknown discovery strategy '...'; expected one of: auto,
+  icmp, tcp`.
+- **No new dependencies.**
+
+## Tasks
+
+- [x]17.1 `ScanEvent::Warning(String)` variant with compile-keeping arms in
+  the TUI and headless event loops.
+- [x]17.2 TUI: `App.warning: Option<String>`, set on `Warning`, cleared on
+  `Started`, rendered on the status line; unit tests.
+- [x]17.3 Headless: `Warning` handled separately from `Started`/`Progress`,
+  printed to stderr, non-terminal; test.
+- [x]17.4 `src/scanner/tcp_discovery.rs`: pure `classify_connect` plus unit
+  tests (accepted/refused → Up against a real local listener; timeout and
+  unreachable errors → Down).
+- [x]17.5 `TcpDiscovery` with `PROBE_PORTS`, a bounded worker pool, `BTreeMap`
+  aggregation, and per-host `HostDiscovered`/`Progress`; integration tests
+  via `discover_single`.
+- [x]17.6 `IcmpDiscovery::open() -> Result<PingSocket, ScanError>` extracted
+  from `discover`; `open_maps_socket_failure_to_a_socket_error` test.
+- [x]17.7 `Discovery` enum plus `impl HostDiscovery for Discovery` (auto
+  fallback with `Warning`); `auto_uses_icmp_when_the_socket_opens` test.
+- [x]17.8 `DiscoveryError` plus `impl FromStr for Discovery`;
+  `ScanConfig.discovery_strategy` (default `Auto`) with all struct-literal
+  sites updated; `--discovery` CLI flag in `main.rs`; parse tests.
+- [x]17.9 Headless `run` passes `&config.discovery_strategy`; wiring test
+  (`run_respects_the_configured_discovery_strategy` against 127.0.0.1 with
+  `Discovery::Tcp`).
+- [x]17.10 PTY smoke test: `--discovery tcp` and `--discovery auto` both
+  report 127.0.0.1 UP with port 631 and no warning; `--discovery bogus` exits
+  non-zero with the descriptive error.
+- [x]17.11 Update `PLAN.md`.
+
+## Verification
+
+- Full gate: `cargo fmt --check`, `cargo check`, `cargo test` (320 passing),
+  `cargo clippy --all-targets` clean.
+- PTY smoke test (127.0.0.1, `--ports 631`): the `tcp` and `auto` runs show
+  the host UP with port 631 and no warning line; `bogus` is a clean clap
+  error.
+- The EPERM fallback branch (ICMP unavailable → `Warning` → TCP) cannot be
+  reproduced in the development environment because ICMP works there; it is
+  covered by review and must be verified manually where EPERM occurs.
+
+---
+
+# 24\. Future IPv6 Support
 
 IPv6 should be considered in the architecture from the beginning, but does not need to be implemented in the MVP.
 
@@ -1658,7 +1740,7 @@ Initial implementation may explicitly reject IPv6 with a clear message.
 
 ---
 
-# 24\. Error Handling
+# 25\. Error Handling
 
 Errors should be structured and user-friendly.
 
@@ -1686,7 +1768,7 @@ Unexpected programmer errors may still panic during development, but user/networ
 
 ---
 
-# 25\. Performance Requirements
+# 26\. Performance Requirements
 
 The application should remain responsive during large scans.
 
@@ -1703,7 +1785,7 @@ Large subnet scans should provide continuous progress feedback.
 
 ---
 
-# 26\. Security and Safety
+# 27\. Security and Safety
 
 This is a network scanner and must behave predictably.
 
@@ -1722,7 +1804,7 @@ The tool should be designed primarily for networks the user is authorized to tes
 
 ---
 
-# 27\. Testing Strategy
+# 28\. Testing Strategy
 
 ## Unit tests
 
@@ -1761,7 +1843,7 @@ Avoid making tests dependent on a real external network.
 
 ---
 
-# 28\. Logging and Diagnostics
+# 29\. Logging and Diagnostics
 
 The application should support optional debug logging.
 
@@ -1779,7 +1861,7 @@ Consider logging to a file or only enabling detailed logs when explicitly reques
 
 ---
 
-# 29\. CLI Design
+# 30\. CLI Design
 
 Initial command structure:
 
@@ -1802,9 +1884,15 @@ Do not over-design the CLI before the core scanner works.
 
 The default command can eventually launch the interactive TUI.
 
+Implemented flag worth noting:
+
+- `--discovery auto|icmp|tcp` (default `auto`): selects the host-discovery
+  strategy. `auto` uses ICMP echo and falls back to TCP port probing with a
+  visible warning when the ICMP socket cannot be opened (see Phase 17).
+
 ---
 
-# 30\. Suggested MVP User Experience
+# 31\. Suggested MVP User Experience
 
 A user should be able to run:
 
@@ -1850,7 +1938,7 @@ Selecting a host:
 
 ---
 
-# 31\. Development Order
+# 32\. Development Order
 
 Implement in this order:
 
@@ -1883,7 +1971,7 @@ Do not jump ahead to persistence, visualization, or service detection until the 
 
 ---
 
-# 32\. Definition of Done for MVP
+# 33\. Definition of Done for MVP
 
 The MVP is complete when all of the following are true:
 
@@ -1912,7 +2000,7 @@ The MVP is complete when all of the following are true:
 
 ---
 
-# 33\. Implementation Principles for OpenCode
+# 34\. Implementation Principles for OpenCode
 
 When implementing this plan:
 
@@ -1978,7 +2066,7 @@ Network capabilities such as ICMP and ARP can differ across Linux environments. 
 
 ---
 
-# 34\. First Task for OpenCode
+# 35\. First Task for OpenCode
 
 Start with **Phase 1 only**.
 
