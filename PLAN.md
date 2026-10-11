@@ -1123,17 +1123,21 @@ The exact schema should be treated as a versioned public format once released.
   hosts, the filename suffix increments on collision, `export_to` writes
   valid JSON without overwriting an existing file, and the TUI treats `e` as
   a no-op without a target and as filter input while filtering.
-- [ ]11.9 Headless CLI `--json` mode: run a scan from the command line and
+- [x]11.9 Headless CLI `--json` mode: run a scan from the command line and
   write the same JSON document to a file or stdout without launching the
-  TUI. Deferred — the TUI route (`e`) is sufficient for the MVP.
+  TUI. `--json` prints to stdout; `--json-file <PATH>` writes to a file
+  (overwriting it). Both conflict with each other and require a target.
+  A dedicated `src/headless.rs` collector mirrors the TUI's event handling so
+  the output is byte-identical to a TUI export.
 - [x]11.10 Update `PLAN.md`.
 
 ## Notes
 
 - **Scope decision:** the plan's example shows a headless CLI invocation
-  (`port-scanner scan … --json`); only the TUI route was implemented. The
-  headless CLI mode is recorded as task 11.9 and is not required for the MVP
-  ("Results can be exported as JSON" is satisfied by the TUI export).
+  (`port-scanner scan … --json`). The TUI route (`e`) was implemented first
+  and satisfied the MVP; the headless CLI mode (task 11.9) was added later.
+  Both routes share the same `ExportDocument`/`from_scan` render, so their
+  output is byte-identical.
 - The network model deliberately has no serde derives: the export types are
   a separate public contract, so changing internal field types or names does
   not silently change the exported format.
@@ -1151,7 +1155,11 @@ The exact schema should be treated as a versioned public format once released.
   matches the plan's shape (`target`, one `up` host with `latency_ms`, both
   requested ports with `protocol: "tcp"`), a second `e` creating
   `port-scanner-export-2.json` without overwriting the first, and a clean `q`
-  exit (status 0).
+  exit (status 0). A headless run (`--json` and `--json-file`) against
+  `127.0.0.1` produced the same document on stdout / in the file (file has no
+  trailing newline, matching the TUI export), a headless run without a target
+  fails with a clear message and non-zero exit, and `--json` / `--json-file`
+  are rejected together by clap.
 
 ---
 

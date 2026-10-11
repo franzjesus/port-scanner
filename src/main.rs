@@ -1,4 +1,5 @@
 mod export;
+mod headless;
 mod network;
 mod ports;
 mod scanner;
@@ -6,6 +7,7 @@ mod target;
 mod tui;
 
 use std::fmt;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
@@ -59,6 +61,16 @@ struct Cli {
     /// are also accepted (e.g. 300, 500ms, 1s, 2m).
     #[arg(long, value_parser = parse_timeout)]
     timeout: Option<Duration>,
+
+    /// Run headlessly: perform the scan without the TUI and print the JSON
+    /// export document to stdout.
+    #[arg(long, conflicts_with = "json_file")]
+    json: bool,
+
+    /// Run headlessly and write the JSON export document to the given file,
+    /// overwriting it if it exists.
+    #[arg(long, value_name = "PATH", conflicts_with = "json")]
+    json_file: Option<PathBuf>,
 }
 
 /// Parse the `--profile` argument into a [`PortProfile`].
@@ -245,6 +257,18 @@ async fn main() -> ExitCode {
         config.enrich = !cli.no_enrichment;
         config
     });
+
+    // Headless mode (Phase 11): run the scan without the TUI and emit the same
+    // JSON export document to stdout or a file. A target is required.
+    if cli.json || cli.json_file.is_some() {
+        return match &config {
+            Some(config) => headless::run(config, cli.json_file.as_deref()),
+            None => {
+                eprintln!("port-scanner: headless mode requires a target");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     // The scanner reports structured events through this channel; the TUI
     // keeps the master sender alive for its whole lifetime so rescans can
