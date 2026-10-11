@@ -1404,6 +1404,79 @@ Scan
 
 The storage layer must remain independent from the TUI.
 
+## Design decisions
+
+- **Storage format:** one JSON file per completed scan, written into the XDG
+  data directory. The network model carries no `serde` derives (as with the
+  export document in Phase 11); persistence uses dedicated `Serialize`/
+  `Deserialize` record types in `src/storage.rs`.
+- **Record is a superset of the export document:** it adds `version`
+  (`CURRENT_VERSION = 1`), `timestamp` (Unix seconds — dependency-free and
+  sortable for the Phase 15 history), `target`, and the scan `config`, and its
+  host/port entries include **service info** (which `ExportPort` omits).
+- **`config.target` is canonical** for the record's `target` field; the app's
+  separately held target is not consulted.
+- **Config is flattened** into a `RecordConfig` (the original `ScanConfig` /
+  `PortConfig` / `PortSpec` carry no serde): discovery/port timeout in
+  milliseconds, discovery/port concurrency, ports as a lossless ascending
+  `Vec<u16>` (a `PortSpec` wraps a sorted `BTreeSet`, so iteration order is
+  deterministic), `detect_services`, and `enrich`.
+- **Data directory** is resolved with std (no new `dirs` dependency):
+  `$XDG_DATA_HOME/port-scanner` only when set **and** absolute, otherwise
+  `~/.local/share/port-scanner`; created on demand. Resolution is split into a
+  pure `resolve_data_dir(xdg, home)` helper so it is testable without mutating
+  process environment.
+- **File name:** `{timestamp}_{target-slug}.json`. The target slug lowercases
+  the normalized target and replaces any character outside `[a-z0-9._-]` with
+  `_`, so `192.168.1.0/24` → `192.168.1.0_24`. A numeric suffix is appended
+  (`…-2.json`, `…-3.json`, …) on collision, mirroring the export convention.
+- **Save happens exactly once, on `Completed`**, not inside `apply_event`
+  (which stays a pure, tested state transition). `run_loop` keeps a local
+  `persisted` flag: when the app is in `Completed` and the scan has not yet
+  been persisted, it performs the disk write once and sets the flag; the flag
+  resets in `start_scan` so a rescan saves again. Only `Completed` saves —
+  not `Cancelled` or `Error`.
+- **TUI surface:** `App` gains `save_status: Option<String>` (distinct from
+  `export_status`), cleared in `start_scan` and drawn on the status line. The
+  loop calls `crate::storage::save_scan` directly and stores the outcome in
+  `save_status` — the same precedent as `App::export_results` calling
+  `crate::export::export` from the TUI layer.
+
+## Tasks
+
+- [x]14.1 Add `src/storage.rs` with the record types: `ScanRecord`
+  (`version`, `timestamp`, `target`, `config: RecordConfig`,
+  `hosts: Vec<RecordHost>`) plus `RecordConfig`, `RecordHost`, `RecordPort`,
+  and `RecordService` (all `Serialize` + `Deserialize`), with the current
+  schema constant `CURRENT_VERSION = 1`. Register the module in `main.rs`.
+- [x]14.2 `ScanRecord::from_scan(&ScanTarget, &[Host], &ScanConfig,
+  timestamp: u64)` builds a record, mapping host state to lowercase, latency
+  to milliseconds, MAC to its colon form, and each probed port (including
+  `service`) to its record form. `target` is passed explicitly (the caller
+  passes `config.target`, the canonical source); the config is flattened as
+  decided above.
+- [x]14.3 `resolve_data_dir(xdg, home) -> io::Result<PathBuf>` (pure, testable)
+  and `data_dir() -> io::Result<PathBuf>` that reads the real environment and
+  creates the directory on demand.
+- [x]14.4 `record_path(dir, &record) -> PathBuf` (base name from timestamp and
+  target slug), `next_record_path(dir, &record) -> io::Result<PathBuf>`
+  (collision suffix), `save(dir, &record) -> io::Result<PathBuf>` (pretty
+  JSON), and `load(path) -> io::Result<ScanRecord>`.
+- [x]14.5 TUI: add `save_status: Option<String>` to `App` (cleared in
+  `start_scan`); in `run_loop`, track a `persisted` flag and call
+  `crate::storage::save_scan` once when the scan is `Completed`, storing the
+  outcome in `save_status` (`Saved {path}` / `Save failed: {err}`); reset the
+  flag when a rescan starts.
+- [x]14.6 TUI: draw `save_status` on the status line alongside `export_status`.
+- [x]14.7 Tests (no network, temp dirs): record round-trip
+  (serialize → deserialize → equality), `from_scan` field mapping including
+  service info and config flattening, `record_path`/`next_record_path`
+  collision suffix, `save`/`load` round-trip to a temp dir, `load` error on a
+  missing/invalid file, and `resolve_data_dir` precedence.
+- [x]14.8 Verify `cargo fmt --check`, `cargo check`, `cargo test`, and
+  `cargo clippy --all-targets`; confirm a completed scan writes a record to the
+  data dir and the status line shows the path. Update `PLAN.md`.
+
 ---
 
 # 21\. Phase 15 — Scan History and Diff
@@ -1686,7 +1759,7 @@ Implement in this order:
 - [ ]Add tests and integration tests.
 - [x]Service detection.
 - [x]Hostname/MAC/vendor enrichment.
-- [ ]Persistence.
+- [x]Persistence.
 - [ ]Scan history.
 - [ ]Scan diff.
 - [ ]Network visualization.

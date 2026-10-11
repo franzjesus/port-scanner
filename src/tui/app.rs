@@ -148,6 +148,10 @@ pub struct App {
     /// A short message about the most recent export attempt (Phase 11), shown
     /// on the status line until a new scan is started.
     export_status: Option<String>,
+    /// A short message about the most recent persistence attempt (Phase 14),
+    /// shown on the status line until a new scan is started. Set when a scan
+    /// completes and its record is saved (or when saving fails).
+    save_status: Option<String>,
 }
 
 impl App {
@@ -531,6 +535,7 @@ impl App {
         self.selected_host = None;
         self.scan_error = None;
         self.export_status = None;
+        self.save_status = None;
         self.ports_probed = 0;
         self.started_at = None;
         self.scan_duration = None;
@@ -600,6 +605,9 @@ fn run_loop(
     if let Some(config) = config {
         app.start_scan(config, spawner, master_tx, cancel);
     }
+    // Whether the current scan has already been persisted (Phase 14). Reset
+    // whenever a new scan starts so each completed scan is saved exactly once.
+    let mut persisted = false;
 
     loop {
         // Drain scanner events first so new results appear on the next frame.
@@ -607,6 +615,20 @@ fn run_loop(
         // started); there is nothing more to apply.
         while let Ok(event) = events.try_recv() {
             app.apply_event(event);
+        }
+
+        // Persist the scan exactly once, the moment it transitions to
+        // `Completed` (not on cancel or error). Saving is a file-I/O concern
+        // of the event loop, kept out of the pure state transition in
+        // [`App::apply_event`].
+        if !persisted && matches!(app.scan, ScanState::Completed) {
+            persisted = true;
+            if let Some(config) = config {
+                match crate::storage::save_scan(&config.target, &app.hosts, config) {
+                    Ok(path) => app.save_status = Some(format!("Saved {}", path.display())),
+                    Err(err) => app.save_status = Some(format!("Save failed: {err}")),
+                }
+            }
         }
 
         terminal.draw(|f| draw(f, app))?;
@@ -630,6 +652,7 @@ fn run_loop(
             app.rescan_requested = false;
             if let Some(config) = config {
                 app.start_scan(config, spawner, master_tx, cancel);
+                persisted = false;
             }
         }
     }
@@ -687,6 +710,9 @@ fn draw(frame: &mut Frame, app: &App) {
         parts.push(format!("Error: {err}"));
     }
     if let Some(status) = &app.export_status {
+        parts.push(status.clone());
+    }
+    if let Some(status) = &app.save_status {
         parts.push(status.clone());
     }
     let status_line = Paragraph::new(parts.join("  "));

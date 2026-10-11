@@ -3,6 +3,7 @@ mod headless;
 mod network;
 mod ports;
 mod scanner;
+mod storage;
 mod target;
 mod tui;
 
