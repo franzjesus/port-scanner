@@ -13,7 +13,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::{
     event::{self, Event, KeyCode},
@@ -23,14 +23,16 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style, Styled},
+    style::{Color, Modifier, Style, Styled},
     text::Line,
     widgets::{Block, Borders, Cell, Paragraph, Row, Table},
     Frame, Terminal,
 };
 
+use crate::diff::ScanDiff;
 use crate::network::{Host, HostState, PortState, ProbedPort, ServiceInfo};
 use crate::scanner::{ScanConfig, ScanEvent, ScanSpawner};
+use crate::storage::RecordSummary;
 use crate::target::ScanTarget;
 
 /// The phase of the scan, as tracked by the TUI.
@@ -80,6 +82,38 @@ impl ScanState {
             ScanState::Starting | ScanState::Discovering { .. } | ScanState::ScanningPorts
         )
     }
+}
+
+/// The top-level view the TUI is showing (Phase 15).
+///
+/// `Overview` is the main scan screen; `History` lists the saved scan records
+/// and `Diff` shows the comparison of two of them.
+///
+/// The derived `Default` is `Overview`, the first variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum View {
+    /// The main scan screen (progress, hosts, details).
+    #[default]
+    Overview,
+    /// The saved-scan browser.
+    History,
+    /// The comparison of two saved scans.
+    Diff,
+}
+
+/// Two saved records chosen for comparison, together with their computed diff
+/// (Phase 15).
+///
+/// Created when the user marks a second record with `d` on the history screen
+/// and displayed while [`View::Diff`] is active.
+#[derive(Debug)]
+pub struct DiffSelection {
+    /// The earlier record (ordered by timestamp at selection time).
+    pub before: RecordSummary,
+    /// The later record.
+    pub after: RecordSummary,
+    /// The differences between the two records.
+    pub result: ScanDiff,
 }
 
 /// Central application state.
@@ -152,6 +186,30 @@ pub struct App {
     /// shown on the status line until a new scan is started. Set when a scan
     /// completes and its record is saved (or when saving fails).
     save_status: Option<String>,
+    /// The top-level view: overview, saved-scan history, or diff (Phase 15).
+    view: View,
+    /// Summaries of the saved scan records in the data directory (Phase 15),
+    /// newest first.
+    ///
+    /// Loaded when the history view is opened with `h`.
+    history_summaries: Vec<RecordSummary>,
+    /// Index into [`App::history_summaries`] of the highlighted record.
+    history_selected: usize,
+    /// Index into [`App::history_summaries`] of the record marked as a diff
+    /// candidate, if any.
+    ///
+    /// Set by `d` on the history screen: the first press marks the selected
+    /// record, a second press on another record opens the diff and clears the
+    /// mark, and a press on the already-marked record deselects it.
+    history_marked: Option<usize>,
+    /// A message about a failed history/diff attempt (Phase 15), shown on the
+    /// history screen.
+    history_error: Option<String>,
+    /// The two saved records being compared and their diff (Phase 15).
+    ///
+    /// Set when `d` picks a second record on the history screen; cleared by
+    /// `Esc` on the diff screen.
+    diff_selection: Option<DiffSelection>,
 }
 
 impl App {
@@ -349,6 +407,12 @@ impl App {
     /// overview handlers (Phase 9): characters and backspace edit the filter,
     /// `Enter` commits it, and `Esc` discards the buffer and leaves input
     /// mode.
+    ///
+    /// On the history screen (Phase 15), `Up`/`k` and `Down`/`j` move through
+    /// the saved records, `d` marks the selected record for comparison (a
+    /// second mark on another record opens the diff), and `Esc` returns to the
+    /// overview. On the diff screen, only `Esc` (back to history) and `q`
+    /// (quit) act.
     pub fn handle_key(&mut self, key: KeyCode, cancel: &AtomicBool) {
         if self.show_help {
             match key {
@@ -370,6 +434,14 @@ impl App {
             self.handle_filter_input(key);
             return;
         }
+        if self.view == View::History {
+            self.handle_history_key(key, cancel);
+            return;
+        }
+        if self.view == View::Diff {
+            self.handle_diff_key(key, cancel);
+            return;
+        }
         match key {
             KeyCode::Char('q') => self.quit(cancel),
             KeyCode::Char('c') if self.scan.is_active() => {
@@ -381,6 +453,7 @@ impl App {
                 self.rescan_requested = true;
             }
             KeyCode::Char('e') => self.export_results(),
+            KeyCode::Char('h') => self.open_history(),
             KeyCode::Char('/') => {
                 self.filter_input.clear();
                 self.filter_mode = true;
@@ -476,6 +549,139 @@ impl App {
             KeyCode::Esc => {
                 self.filter_input.clear();
                 self.filter_mode = false;
+            }
+            _ => {}
+        }
+    }
+
+    /// Open the saved-scan history (Phase 15).
+    ///
+    /// Loads the record summaries from the data directory and switches to
+    /// [`View::History`]. A data-directory resolution failure is reported on
+    /// the history screen via [`App::history_error`] instead of blocking the
+    /// view.
+    pub fn open_history(&mut self) {
+        self.view = View::History;
+        self.history_error = None;
+        self.history_marked = None;
+        self.history_selected = 0;
+        match crate::storage::data_dir() {
+            Ok(dir) => self.load_history(&dir),
+            Err(err) => {
+                self.history_summaries.clear();
+                self.history_error = Some(format!("Could not determine the data directory: {err}"));
+            }
+        }
+    }
+
+    /// Load saved scan records from `dir` into [`App::history_summaries`]
+    /// (Phase 15).
+    ///
+    /// Used by [`App::open_history`] and by the tests, which pass a temporary
+    /// directory instead of the real data directory.
+    fn load_history(&mut self, dir: &std::path::Path) {
+        match crate::storage::list_records(dir) {
+            Ok(summaries) => {
+                self.history_summaries = summaries;
+                self.history_error = None;
+            }
+            Err(err) => {
+                self.history_summaries.clear();
+                self.history_error = Some(format!("Could not read saved scans: {err}"));
+            }
+        }
+        // Keep the highlight within range once the list is known.
+        if self.history_summaries.is_empty() {
+            self.history_selected = 0;
+        } else if self.history_selected >= self.history_summaries.len() {
+            self.history_selected = self.history_summaries.len() - 1;
+        }
+    }
+
+    /// Handle a keypress on the history screen (Phase 15).
+    fn handle_history_key(&mut self, key: KeyCode, cancel: &AtomicBool) {
+        match key {
+            KeyCode::Char('q') => self.quit(cancel),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.history_selected = self.history_selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.history_selected < self.history_summaries.len().saturating_sub(1) {
+                    self.history_selected += 1;
+                }
+            }
+            KeyCode::Char('d') => self.toggle_diff_mark(),
+            KeyCode::Esc => {
+                self.history_marked = None;
+                self.view = View::Overview;
+            }
+            _ => {}
+        }
+    }
+
+    /// Mark or unmark the selected record as a diff candidate (Phase 15).
+    ///
+    /// The first press marks the highlighted record; a second press on a
+    /// different record compares the two and switches to [`View::Diff`]; a
+    /// press on the already-marked record clears the mark.
+    fn toggle_diff_mark(&mut self) {
+        // Clone the summaries so they do not borrow the list while
+        // `open_diff` mutates the app state.
+        let Some(selected) = self.history_summaries.get(self.history_selected).cloned() else {
+            return;
+        };
+        match self.history_marked {
+            None => self.history_marked = Some(self.history_selected),
+            Some(index) if index == self.history_selected => {
+                self.history_marked = None;
+            }
+            Some(index) => {
+                let Some(other) = self.history_summaries.get(index).cloned() else {
+                    self.history_marked = None;
+                    return;
+                };
+                self.open_diff(&other, &selected);
+            }
+        }
+    }
+
+    /// Compare two saved records and switch to [`View::Diff`] (Phase 15).
+    ///
+    /// The records are ordered by timestamp so the earlier scan is always the
+    /// "before" side; records with equal timestamps keep the order in which
+    /// they were selected (the first-marked record is "before"). A record that
+    /// fails to load is reported via [`App::history_error`] and the view stays
+    /// on the history screen.
+    pub fn open_diff(&mut self, first: &RecordSummary, second: &RecordSummary) {
+        let (before, after) = if first.timestamp <= second.timestamp {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let (Ok(before_record), Ok(after_record)) = (
+            crate::storage::load(&before.path),
+            crate::storage::load(&after.path),
+        ) else {
+            self.history_error = Some("A selected record could not be loaded.".to_owned());
+            self.history_marked = None;
+            return;
+        };
+        self.history_marked = None;
+        self.diff_selection = Some(DiffSelection {
+            before: before.clone(),
+            after: after.clone(),
+            result: crate::diff::diff_records(&before_record, &after_record),
+        });
+        self.view = View::Diff;
+    }
+
+    /// Handle a keypress on the diff screen (Phase 15).
+    fn handle_diff_key(&mut self, key: KeyCode, cancel: &AtomicBool) {
+        match key {
+            KeyCode::Char('q') => self.quit(cancel),
+            KeyCode::Esc => {
+                self.diff_selection = None;
+                self.view = View::History;
             }
             _ => {}
         }
@@ -664,7 +870,23 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io
     terminal.show_cursor()
 }
 
+/// Draw the top-level view: the overview, the saved-scan history, or the
+/// scan diff (Phase 15).
 fn draw(frame: &mut Frame, app: &App) {
+    match app.view {
+        View::Overview => draw_overview(frame, app),
+        View::History => draw_history(frame, app),
+        View::Diff => draw_diff(frame, app),
+    }
+
+    if app.show_help {
+        draw_help_overlay(frame);
+    }
+}
+
+/// Draw the main scan screen: title row, status line, host list (or detail
+/// screen), and the hint line.
+fn draw_overview(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -742,12 +964,259 @@ fn draw(frame: &mut Frame, app: &App) {
     } else if let Some(filter) = app.filter.as_deref() {
         format!("Filter: {filter}  / Edit  Esc Clear  ? Help  q Quit")
     } else {
-        "↑/k Up  ↓/j Down  Enter Detail  / Filter  e Export  ? Help  c Cancel  q Quit".to_string()
+        "↑/k Up  ↓/j Down  Enter Detail  / Filter  e Export  h History  ? Help  c Cancel  q Quit"
+            .to_string()
     };
     frame.render_widget(Paragraph::new(hint), chunks[3]);
+}
 
-    if app.show_help {
-        draw_help_overlay(frame);
+/// Draw the saved-scan history view (Phase 15): a table of the records in
+/// the data directory, newest first, with the selected row highlighted and
+/// the diff-marked row starred.
+fn draw_history(frame: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+
+    let title = Paragraph::new("PORT-SCANNER  Saved Scans")
+        .style(Style::default().add_modifier(Modifier::BOLD));
+    frame.render_widget(title, chunks[0]);
+
+    if let Some(err) = &app.history_error {
+        frame.render_widget(Paragraph::new(err.as_str()), chunks[1]);
+    } else if app.history_summaries.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No saved scans yet. Complete a scan to save one."),
+            chunks[1],
+        );
+    } else {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let header = Row::new(vec!["", "AGE", "TARGET", "HOSTS", "OPEN PORTS"])
+            .style(Style::default().add_modifier(Modifier::BOLD));
+        let row_space = chunks[1].height as usize;
+        let start = window_start(
+            app.history_summaries.len(),
+            Some(app.history_selected),
+            row_space,
+        );
+        let rows: Vec<Row> = app
+            .history_summaries
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(row_space)
+            .map(|(index, record)| {
+                let selected = app.history_selected == index;
+                let marked = app.history_marked == Some(index);
+                let style = if selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                let cells: Vec<Cell<'_>> = vec![
+                    Cell::from(if marked { "* " } else { "  " }),
+                    Cell::from(format_age(record.timestamp, now)),
+                    Cell::from(record.target.clone()),
+                    Cell::from(record.host_count.to_string()),
+                    Cell::from(record.open_port_count.to_string()),
+                ]
+                .into_iter()
+                .map(|cell| cell.set_style(style))
+                .collect();
+                Row::new(cells)
+            })
+            .collect();
+        frame.render_widget(
+            Table::new(
+                [header].into_iter().chain(rows),
+                [
+                    Constraint::Length(2),
+                    Constraint::Length(10),
+                    Constraint::Min(10),
+                    Constraint::Length(8),
+                    Constraint::Length(12),
+                ],
+            ),
+            chunks[1],
+        );
+    }
+
+    let hint = "↑/k Up  ↓/j Down  d Mark/Compare  Esc Back  q Quit";
+    frame.render_widget(Paragraph::new(hint), chunks[2]);
+}
+
+/// Draw the scan-diff view (Phase 15): the two selected records and the
+/// differences between them, with added items in green, removed items in red,
+/// and changed items in yellow.
+fn draw_diff(frame: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+
+    let title = Paragraph::new("PORT-SCANNER  Scan Diff")
+        .style(Style::default().add_modifier(Modifier::BOLD));
+    frame.render_widget(title, chunks[0]);
+
+    let Some(selection) = &app.diff_selection else {
+        frame.render_widget(Paragraph::new("No diff selected."), chunks[1]);
+        frame.render_widget(Paragraph::new("Esc Back to history  q Quit"), chunks[2]);
+        return;
+    };
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut lines = vec![
+        Line::from(format!(
+            "Before: {}  {}  ({} hosts, {} open ports)",
+            format_age(selection.before.timestamp, now),
+            selection.before.target,
+            selection.before.host_count,
+            selection.before.open_port_count
+        )),
+        Line::from(format!(
+            "After:  {}  {}  ({} hosts, {} open ports)",
+            format_age(selection.after.timestamp, now),
+            selection.after.target,
+            selection.after.host_count,
+            selection.after.open_port_count
+        )),
+        Line::from(""),
+    ];
+
+    let diff = &selection.result;
+    if diff.is_empty() {
+        lines.push(Line::from("No changes between the two scans."));
+    } else {
+        for host in &diff.hosts_added {
+            lines.push(diff_line(
+                format!(
+                    "+ host {}  open: {}",
+                    host.ip,
+                    open_port_list(&host.open_ports)
+                ),
+                Color::Green,
+            ));
+        }
+        for host in &diff.hosts_removed {
+            lines.push(diff_line(
+                format!(
+                    "- host {}  open: {}",
+                    host.ip,
+                    open_port_list(&host.open_ports)
+                ),
+                Color::Red,
+            ));
+        }
+        for port in &diff.ports_opened {
+            lines.push(diff_line(
+                format!(
+                    "+ port {}:{}  {}",
+                    port.ip,
+                    port.port,
+                    present_or_none(port.service.as_deref())
+                ),
+                Color::Green,
+            ));
+        }
+        for port in &diff.ports_closed {
+            lines.push(diff_line(
+                format!(
+                    "- port {}:{}  {}",
+                    port.ip,
+                    port.port,
+                    present_or_none(port.service.as_deref())
+                ),
+                Color::Red,
+            ));
+        }
+        for host in &diff.hosts_changed {
+            lines.push(diff_line(
+                format!("~ host {}  information changed", host.ip),
+                Color::Yellow,
+            ));
+            for change in &host.changes {
+                lines.push(Line::from(format!(
+                    "    {}: {} -> {}",
+                    change.field.name(),
+                    present_or_none(change.before.as_deref()),
+                    present_or_none(change.after.as_deref())
+                )));
+            }
+        }
+        for service in &diff.services_changed {
+            lines.push(diff_line(
+                format!(
+                    "~ service {}:{}  {} -> {}",
+                    service.ip,
+                    service.port,
+                    present_or_none(service.before.as_deref()),
+                    present_or_none(service.after.as_deref())
+                ),
+                Color::Yellow,
+            ));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines), chunks[1]);
+
+    let hint = "Esc Back to history  q Quit";
+    frame.render_widget(Paragraph::new(hint), chunks[2]);
+}
+
+/// A diff line with the given color.
+fn diff_line(text: String, color: Color) -> Line<'static> {
+    Line::from(text).style(Style::default().fg(color))
+}
+
+/// Render a list of open port numbers for diff lines: `22, 443`, or `none`
+/// when the host had no open ports.
+fn open_port_list(ports: &[u16]) -> String {
+    if ports.is_empty() {
+        "none".to_owned()
+    } else {
+        ports
+            .iter()
+            .map(|port| port.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// Render an optional value for diff lines, showing `none` when absent.
+fn present_or_none(value: Option<&str>) -> String {
+    match value {
+        Some(value) => value.to_owned(),
+        None => "none".to_owned(),
+    }
+}
+
+/// Render a Unix timestamp as a short relative age: `42s ago`, `5m ago`,
+/// `3h ago`, or `2d ago`. Future timestamps saturate to `0s ago`.
+fn format_age(timestamp: u64, now: u64) -> String {
+    let age = now.saturating_sub(timestamp);
+    if age < 60 {
+        format!("{age}s ago")
+    } else if age < 3600 {
+        format!("{}m ago", age / 60)
+    } else if age < 86_400 {
+        format!("{}h ago", age / 3600)
+    } else {
+        format!("{}d ago", age / 86_400)
     }
 }
 
@@ -877,7 +1346,7 @@ fn format_duration(duration: Duration) -> String {
 fn draw_help_overlay(frame: &mut Frame) {
     let area = frame.area();
     let width = 26u16.min(area.width);
-    let height = 10u16.min(area.height);
+    let height = 11u16.min(area.height);
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let overlay_area = Rect {
@@ -892,6 +1361,7 @@ fn draw_help_overlay(frame: &mut Frame) {
         "  ↓/j    Down",
         "  /      Filter",
         "  e      Export",
+        "  h      History",
         "  ?      Help",
         "  r      Rescan",
         "  c      Cancel",
@@ -2322,5 +2792,283 @@ mod tests {
         assert_eq!(window_start(10, Some(5), 5), 1);
         assert_eq!(window_start(10, Some(6), 5), 2);
         assert_eq!(window_start(10, Some(9), 5), 5);
+    }
+
+    // --- Phase 15: history and diff state transitions -------------------
+
+    /// A unique temporary directory holding saved scan records, mirroring the
+    /// storage tests' helper.
+    fn temp_record_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "port-scanner-app-test-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// Write a minimal record (no hosts) with the given completion timestamp.
+    fn save_test_record(dir: &std::path::Path, timestamp: u64, target: &str) {
+        let record = crate::storage::ScanRecord {
+            version: crate::storage::CURRENT_VERSION,
+            timestamp,
+            target: target.to_owned(),
+            config: crate::storage::RecordConfig {
+                discovery_timeout_ms: 300,
+                discovery_concurrency: 16,
+                ports: vec![22],
+                port_timeout_ms: 300,
+                port_concurrency: 8,
+                detect_services: false,
+                enrich: false,
+            },
+            hosts: vec![],
+        };
+        crate::storage::save(dir, &record).expect("save record");
+    }
+
+    /// An app in the history view with two saved records: timestamp 100 (the
+    /// older one) and timestamp 200 (the newer one, listed first).
+    fn app_with_history(name: &str) -> (App, std::path::PathBuf) {
+        let dir = temp_record_dir(name);
+        save_test_record(&dir, 100, "10.0.0.0/24");
+        save_test_record(&dir, 200, "10.0.0.0/24");
+        let mut app = App {
+            view: View::History,
+            ..Default::default()
+        };
+        app.load_history(&dir);
+        (app, dir)
+    }
+
+    #[test]
+    fn h_key_on_overview_switches_to_history_view() {
+        let mut app = app_with_target();
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('h'), &cancel);
+        assert_eq!(app.view, View::History);
+    }
+
+    #[test]
+    fn load_history_lists_records_newest_first() {
+        let (app, dir) = app_with_history("list-order");
+        assert_eq!(app.history_summaries.len(), 2);
+        assert_eq!(app.history_summaries[0].timestamp, 200);
+        assert_eq!(app.history_summaries[1].timestamp, 100);
+        assert!(app.history_error.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_history_missing_dir_yields_empty_list() {
+        let dir = temp_record_dir("missing-dir");
+        let gone = dir.join("does-not-exist");
+        let mut app = App::default();
+        app.load_history(&gone);
+        assert!(app.history_summaries.is_empty());
+        assert!(app.history_error.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_history_unreadable_dir_sets_error() {
+        let dir = temp_record_dir("unreadable-dir");
+        // A regular file is not a directory, so `read_dir` fails.
+        let file = dir.join("not-a-dir");
+        std::fs::write(&file, b"nope").expect("write file");
+        let mut app = App::default();
+        app.load_history(&file);
+        assert!(app.history_summaries.is_empty());
+        assert!(app.history_error.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_navigation_clamps_at_bounds() {
+        let (mut app, dir) = app_with_history("nav-clamp");
+        let cancel = AtomicBool::new(false);
+        // Two records: down, down (clamped), up, up (clamped).
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        assert_eq!(app.history_selected, 1);
+        app.handle_key(KeyCode::Char('k'), &cancel);
+        app.handle_key(KeyCode::Char('k'), &cancel);
+        app.handle_key(KeyCode::Char('k'), &cancel);
+        assert_eq!(app.history_selected, 0);
+        // Arrow keys behave the same.
+        app.handle_key(KeyCode::Down, &cancel);
+        assert_eq!(app.history_selected, 1);
+        app.handle_key(KeyCode::Up, &cancel);
+        assert_eq!(app.history_selected, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_d_marks_and_unmarks_the_selected_record() {
+        let (mut app, dir) = app_with_history("mark-unmark");
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('d'), &cancel);
+        assert_eq!(app.history_marked, Some(0));
+        assert_eq!(app.view, View::History);
+        // Pressing `d` on the marked record again clears the mark.
+        app.handle_key(KeyCode::Char('d'), &cancel);
+        assert_eq!(app.history_marked, None);
+        assert_eq!(app.view, View::History);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_d_on_second_record_opens_diff_with_older_scan_first() {
+        let (mut app, dir) = app_with_history("open-diff-order");
+        let cancel = AtomicBool::new(false);
+        // Mark the newer record (index 0), move to the older one (index 1),
+        // then mark it: the diff must open with the older scan as "before".
+        app.handle_key(KeyCode::Char('d'), &cancel);
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        app.handle_key(KeyCode::Char('d'), &cancel);
+        assert_eq!(app.view, View::Diff);
+        let selection = app.diff_selection.as_ref().expect("diff is open");
+        assert_eq!(selection.before.timestamp, 100);
+        assert_eq!(selection.after.timestamp, 200);
+        assert_eq!(app.history_marked, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_d_orders_by_timestamp_regardless_of_mark_order() {
+        let (mut app, dir) = app_with_history("open-diff-reverse");
+        let cancel = AtomicBool::new(false);
+        // Mark the older record first, then the newer one.
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        app.handle_key(KeyCode::Char('d'), &cancel);
+        app.handle_key(KeyCode::Char('k'), &cancel);
+        app.handle_key(KeyCode::Char('d'), &cancel);
+        assert_eq!(app.view, View::Diff);
+        let selection = app.diff_selection.as_ref().expect("diff is open");
+        assert_eq!(selection.before.timestamp, 100);
+        assert_eq!(selection.after.timestamp, 200);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_esc_returns_to_overview_and_clears_mark() {
+        let (mut app, dir) = app_with_history("esc-to-overview");
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('d'), &cancel);
+        assert_eq!(app.history_marked, Some(0));
+        app.handle_key(KeyCode::Esc, &cancel);
+        assert_eq!(app.view, View::Overview);
+        assert_eq!(app.history_marked, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diff_esc_returns_to_history_and_clears_selection() {
+        let (mut app, dir) = app_with_history("diff-esc");
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('d'), &cancel);
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        app.handle_key(KeyCode::Char('d'), &cancel);
+        assert_eq!(app.view, View::Diff);
+        app.handle_key(KeyCode::Esc, &cancel);
+        assert_eq!(app.view, View::History);
+        assert!(app.diff_selection.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn q_quits_from_history_and_diff_views() {
+        let (mut app, dir) = app_with_history("quit-from-history");
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('q'), &cancel);
+        assert!(app.should_quit);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (mut app, dir) = app_with_history("quit-from-diff");
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('d'), &cancel);
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        app.handle_key(KeyCode::Char('d'), &cancel);
+        app.handle_key(KeyCode::Char('q'), &cancel);
+        assert!(app.should_quit);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overview_navigation_keys_are_routed_to_history_view() {
+        // With the history view active, `j` moves the record highlight, not
+        // the host selection.
+        let (mut app, dir) = app_with_history("view-routing");
+        app.hosts = (0..3)
+            .map(|i| Host::up(Ipv4Addr::new(10, 0, 0, i as u8), Duration::from_millis(1)))
+            .collect();
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        assert_eq!(app.history_selected, 1);
+        assert_eq!(app.selected_host, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_diff_reports_load_failure_and_stays_in_history() {
+        let (mut app, dir) = app_with_history("diff-load-failure");
+        // Replace the summaries with ones pointing at nonexistent files.
+        app.history_summaries = vec![
+            RecordSummary {
+                path: dir.join("missing-a.json"),
+                timestamp: 100,
+                target: "10.0.0.0/24".to_owned(),
+                host_count: 0,
+                open_port_count: 0,
+            },
+            RecordSummary {
+                path: dir.join("missing-b.json"),
+                timestamp: 200,
+                target: "10.0.0.0/24".to_owned(),
+                host_count: 0,
+                open_port_count: 0,
+            },
+        ];
+        let first = app.history_summaries[0].clone();
+        let second = app.history_summaries[1].clone();
+        app.open_diff(&first, &second);
+        assert_eq!(app.view, View::History);
+        assert!(app.diff_selection.is_none());
+        assert!(app.history_error.is_some());
+        assert_eq!(app.history_marked, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn format_age_renders_seconds() {
+        assert_eq!(format_age(100, 142), "42s ago");
+        assert_eq!(format_age(100, 100), "0s ago");
+    }
+
+    #[test]
+    fn format_age_renders_minutes() {
+        assert_eq!(format_age(100, 100 + 60), "1m ago");
+        assert_eq!(format_age(100, 100 + 300), "5m ago");
+        assert_eq!(format_age(100, 100 + 3599), "59m ago");
+    }
+
+    #[test]
+    fn format_age_renders_hours() {
+        assert_eq!(format_age(100, 100 + 3600), "1h ago");
+        assert_eq!(format_age(100, 100 + 7200), "2h ago");
+        assert_eq!(format_age(100, 100 + 86_399), "23h ago");
+    }
+
+    #[test]
+    fn format_age_renders_days() {
+        assert_eq!(format_age(100, 100 + 86_400), "1d ago");
+        assert_eq!(format_age(100, 100 + 172_800), "2d ago");
+    }
+
+    #[test]
+    fn format_age_saturates_for_future_timestamps() {
+        assert_eq!(format_age(1000, 100), "0s ago");
     }
 }

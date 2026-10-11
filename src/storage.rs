@@ -1,4 +1,5 @@
-//! File-based persistence of completed scans (Phase 14).
+//! File-based persistence of completed scans (Phase 14) and listing of saved
+//! scans for the history view (Phase 15).
 //!
 //! One completed scan is stored as a single JSON file in the XDG data
 //! directory. The network model carries no `serde` derives (as with the export
@@ -318,13 +319,77 @@ pub fn save(dir: &Path, record: &ScanRecord) -> io::Result<PathBuf> {
 }
 
 /// Read a record from disk, validating it as JSON.
-///
-/// Used by the tests and by scan history (Phase 15); no non-test caller
-/// exists yet.
-#[allow(dead_code)]
 pub fn load(path: &Path) -> io::Result<ScanRecord> {
     let bytes = fs::read(path)?;
     serde_json::from_slice(&bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+/// A saved scan's summary, enough for the history view to display it without
+/// loading the full record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordSummary {
+    /// Path of the record file.
+    pub path: PathBuf,
+    /// Completion instant as Unix seconds.
+    pub timestamp: u64,
+    /// The target that was scanned, in normalized form.
+    pub target: String,
+    /// Number of hosts in the record.
+    pub host_count: usize,
+    /// Number of open ports across all hosts.
+    pub open_port_count: usize,
+}
+
+/// List the saved scans in `dir`, newest first.
+///
+/// A missing directory is not an error and yields an empty list. Files that
+/// are not `.json` or that fail to load are skipped rather than surfaced as
+/// errors, so one corrupt record never hides the rest of the history.
+pub fn list_records(dir: &Path) -> io::Result<Vec<RecordSummary>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+
+    let mut summaries = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let record = match load(&path) {
+            Ok(record) => record,
+            Err(_) => continue,
+        };
+        summaries.push(RecordSummary {
+            path,
+            timestamp: record.timestamp,
+            target: record.target,
+            host_count: record.hosts.len(),
+            open_port_count: record
+                .hosts
+                .iter()
+                .map(|host| {
+                    host.ports
+                        .iter()
+                        .filter(|port| port.state == "open")
+                        .count()
+                })
+                .sum(),
+        });
+    }
+    // Newest first; break timestamp ties by path so the order is stable.
+    summaries.sort_by(|a, b| {
+        b.timestamp
+            .cmp(&a.timestamp)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    Ok(summaries)
 }
 
 /// The current instant as Unix seconds.
@@ -523,6 +588,81 @@ mod tests {
         let err = load(&path).expect_err("invalid json");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_records_orders_newest_first() {
+        let dir = temp_dir("list_order");
+        let config = test_config();
+        let hosts = vec![host_with_ports()];
+        let older = ScanRecord::from_scan(&config.target, &hosts, &config, 1_700_000_000);
+        let newer = ScanRecord::from_scan(&config.target, &hosts, &config, 1_700_000_900);
+        save(&dir, &older).expect("save older");
+        save(&dir, &newer).expect("save newer");
+
+        let summaries = list_records(&dir).expect("list");
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].timestamp, 1_700_000_900);
+        assert_eq!(summaries[1].timestamp, 1_700_000_000);
+        for summary in &summaries {
+            assert_eq!(summary.target, "192.168.1.0/24");
+            assert_eq!(summary.host_count, 1);
+            assert_eq!(summary.open_port_count, 2);
+            assert!(summary.path.exists());
+        }
+        // The summaries point at the two distinct written files.
+        assert_ne!(summaries[0].path, summaries[1].path);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_records_counts_open_ports() {
+        let dir = temp_dir("list_counts");
+        let config = test_config();
+        let mut host = Host::up("192.168.1.10".parse().unwrap(), Duration::from_millis(3));
+        host.ports = vec![
+            ProbedPort {
+                port: Port::new(80).unwrap(),
+                state: PortState::Open,
+                service: None,
+            },
+            ProbedPort {
+                port: Port::new(22).unwrap(),
+                state: PortState::Closed,
+                service: None,
+            },
+        ];
+        let record = ScanRecord::from_scan(&config.target, &[host], &config, 1_700_000_000);
+        save(&dir, &record).expect("save");
+
+        let summaries = list_records(&dir).expect("list");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].host_count, 1);
+        assert_eq!(summaries[0].open_port_count, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_records_skips_non_json_and_invalid_records() {
+        let dir = temp_dir("list_skip");
+        let config = test_config();
+        let record =
+            ScanRecord::from_scan(&config.target, &[host_with_ports()], &config, 1_700_000_000);
+        save(&dir, &record).expect("save");
+        fs::write(dir.join("notes.txt"), "not a record").expect("write");
+        fs::write(dir.join("1699999999_bad.json"), "not json").expect("write");
+
+        let summaries = list_records(&dir).expect("list");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].timestamp, 1_700_000_000);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_records_missing_dir_yields_empty() {
+        let dir = temp_dir("list_missing").join("does-not-exist");
+        let summaries = list_records(&dir).expect("list");
+        assert!(summaries.is_empty());
     }
 
     #[test]

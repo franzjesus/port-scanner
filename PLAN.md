@@ -1496,6 +1496,68 @@ NETWORK CHANGES
 
 This should compare structured data rather than textual output.
 
+## Design decisions
+
+- **Diff module:** a new pure `src/diff.rs` module. It operates on the
+  `ScanRecord` types from `storage.rs`, contains no I/O and no TUI types, and
+  returns a structured `ScanDiff`. The storage layer stays independent from the
+  TUI, and the diff logic is unit-testable without touching the disk.
+- **Diff categories** (for a pair of records `before` → `after`):
+  - `hosts_added` / `hosts_removed` — hosts present in one record but not the
+    other (hosts matched by their IP string).
+  - `ports_opened` / `ports_closed` — for hosts present in both records, ports
+    are matched by number. A port that is open in `after` and closed **or
+    absent** in `before` counts as opened (absence is treated as closed); a
+    port that is open in `before` and closed or absent in `after` counts as
+    closed.
+  - `hosts_changed` — hosts present in both records whose `state`, `hostname`,
+    `mac`, or `vendor` differs. `latency_ms` is deliberately excluded: it is
+    inherently variable and comparing it would produce noise.
+  - `services_changed` — ports open in both records whose service information
+    (name, version, extra) differs, including a service that appears or
+    disappears.
+- **Diff direction:** the TUI orders the two selected records by timestamp
+  (earlier = `before`) regardless of selection order, so the diff always reads
+  "what changed since the earlier scan". Both records are labelled in the diff
+  view so the direction is visible.
+- **History list:** `storage::list_records(dir)` returns lightweight
+  `RecordSummary { path, timestamp, target, host_count, open_port_count }`
+  entries sorted newest first. Files that cannot be read or parsed are skipped
+  rather than failing the whole listing (one corrupt record must not break the
+  history view).
+- **Timestamps in the TUI:** no `chrono`/`time` dependency is added. History
+  entries display a dependency-free relative age ("3m ago", "2h ago", "5d ago")
+  computed at render time from the record timestamp and the current clock.
+- **MVP scope:** saved-record vs saved-record comparison only. Comparing a saved
+  record against the current in-memory scan (via `storage::from_scan`) and a
+  headless diff mode are possible extensions, explicitly deferred.
+
+## Tasks
+
+- [x]15.1 `storage.rs`: add `RecordSummary` and `list_records(dir)` (newest
+  first, skips unreadable or invalid files); drop the `#[allow(dead_code)]`
+  from `load` now that it has a non-test caller.
+- [x]15.2 `diff.rs`: new module with the structured `ScanDiff` model
+  (`hosts_added`, `hosts_removed`, `ports_opened`, `ports_closed`,
+  `hosts_changed`, `services_changed`, `is_empty()`) and the pure function
+  `diff_records(before, after)` implementing the categories above. Register the
+  module in `main.rs`.
+- [x]15.3 TUI: `h` opens a history view listing saved scans (relative age,
+  target, host and open-port counts) with `j`/`k`/`Up`/`Down` navigation;
+  pressing `d` on two records computes and opens the diff; `Esc` returns to the
+  list, then to the overview; `q` still quits. Update the help overlay.
+- [x]15.4 TUI: render the diff in the plan's format — `+` lines for new hosts
+  and ports, `-` lines for removed hosts and closed ports, `~` lines for host
+  information changes (with indented per-field `before -> after` detail) and
+  service changes; show a "No changes" message when the diff is empty.
+- [x]15.5 Tests (no network, temp dirs): `diff_records` covering each category,
+  absent-vs-closed port handling, and latency noise exclusion; `list_records`
+  ordering and invalid-file skipping; history-view key handling in the TUI;
+  relative-age formatting.
+- [x]15.6 Verify `cargo fmt --check`, `cargo check`, `cargo test`, and
+  `cargo clippy --all-targets`; smoke-test the history and diff flow against
+  two saved records. Update `PLAN.md`.
+
 ---
 
 # 22\. Phase 16 — Network Visualization
@@ -1760,8 +1822,8 @@ Implement in this order:
 - [x]Service detection.
 - [x]Hostname/MAC/vendor enrichment.
 - [x]Persistence.
-- [ ]Scan history.
-- [ ]Scan diff.
+- [x]Scan history.
+- [x]Scan diff.
 - [ ]Network visualization.
 - [ ]IPv6.
 
