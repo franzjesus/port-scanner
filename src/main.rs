@@ -5,9 +5,11 @@ mod scanner;
 mod target;
 mod tui;
 
+use std::fmt;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
+use std::time::Duration;
 
 use clap::Parser;
 
@@ -51,6 +53,12 @@ struct Cli {
     /// Skip host enrichment (reverse-DNS hostname, MAC address, vendor).
     #[arg(long)]
     no_enrichment: bool,
+
+    /// Per-stage scan timeout, applied to both host discovery and port
+    /// scanning. A bare number is milliseconds; `ms`, `s`, and `m` suffixes
+    /// are also accepted (e.g. 300, 500ms, 1s, 2m).
+    #[arg(long, value_parser = parse_timeout)]
+    timeout: Option<Duration>,
 }
 
 /// Parse the `--profile` argument into a [`PortProfile`].
@@ -61,15 +69,89 @@ fn parse_profile(raw: &str) -> Result<PortProfile, PortProfileError> {
     raw.parse::<PortProfile>()
 }
 
-/// Resolve the port configuration from the CLI's `--ports` and `--profile`
-/// flags.
+/// Error produced when the `--timeout` argument cannot be parsed.
+#[derive(Debug)]
+enum TimeoutError {
+    Parse { input: String, reason: String },
+}
+
+impl fmt::Display for TimeoutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TimeoutError::Parse { input, reason } => {
+                write!(f, "invalid timeout {input:?}: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TimeoutError {}
+
+/// Parse the `--timeout` argument into a [`Duration`].
+///
+/// A bare non-negative integer is milliseconds, matching the default. The
+/// `ms`, `s`, and `m` suffixes are accepted (case-sensitive), with or without
+/// a space before the unit (e.g. `300`, `500ms`, `1s`, `2m`). Fractions are
+/// not supported.
+fn parse_timeout(raw: &str) -> Result<Duration, TimeoutError> {
+    let err = |reason: &str| TimeoutError::Parse {
+        input: raw.to_string(),
+        reason: reason.to_string(),
+    };
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(err("empty value"));
+    }
+
+    // Split off an optional unit suffix. A space before the unit is allowed.
+    let (value, unit) = if let Some(pos) = trimmed.rfind(' ') {
+        let unit = trimmed[pos..].trim_start();
+        if unit == "ms" || unit == "s" || unit == "m" {
+            (trimmed[..pos].trim_end(), Some(unit))
+        } else {
+            (trimmed, None)
+        }
+    } else if let Some(stripped) = trimmed.strip_suffix("ms") {
+        (stripped, Some("ms"))
+    } else if let Some(stripped) = trimmed.strip_suffix('s') {
+        (stripped, Some("s"))
+    } else if let Some(stripped) = trimmed.strip_suffix('m') {
+        (stripped, Some("m"))
+    } else {
+        (trimmed, None)
+    };
+
+    let number: u64 = value
+        .parse()
+        .map_err(|_| err("not a non-negative integer"))?;
+
+    let millis = match unit {
+        None => number, // bare value = milliseconds
+        Some("ms") => number,
+        Some("s") => number
+            .checked_mul(1_000)
+            .ok_or_else(|| err("value out of range"))?,
+        Some("m") => number
+            .checked_mul(60_000)
+            .ok_or_else(|| err("value out of range"))?,
+        _ => unreachable!("only known units are matched above"),
+    };
+
+    Ok(Duration::from_millis(millis))
+}
+
+/// Resolve the port configuration from the CLI's `--ports`, `--profile`, and
+/// `--timeout` flags.
 ///
 /// Precedence: an explicit `--ports` spec wins over `--profile`; when neither
-/// is given, the default Quick profile is used. The timeout and concurrency
-/// bounds are always the defaults — only the port set varies.
+/// is given, the default Quick profile is used. The timeout comes from
+/// `--timeout` when present and falls back to the default otherwise; the
+/// concurrency bound is always the default.
 fn resolve_port_config(
     ports: Option<String>,
     profile: Option<PortProfile>,
+    timeout: Option<Duration>,
 ) -> Result<PortConfig, PortSpecError> {
     let port_spec = match (ports, profile) {
         (Some(spec), _) => PortSpec::parse(&spec)?,
@@ -79,7 +161,7 @@ fn resolve_port_config(
 
     Ok(PortConfig {
         ports: port_spec,
-        timeout: DEFAULT_TIMEOUT,
+        timeout: timeout.unwrap_or(DEFAULT_TIMEOUT),
         concurrency: DEFAULT_CONCURRENCY,
     })
 }
@@ -140,7 +222,7 @@ async fn main() -> ExitCode {
     // produces a clear error and a non-zero exit code, mirroring how the
     // target is validated above. `--ports` wins over `--profile`; with neither
     // flag the Quick profile is the default.
-    let port_config = match resolve_port_config(cli.ports, cli.profile) {
+    let port_config = match resolve_port_config(cli.ports, cli.profile, cli.timeout) {
         Ok(config) => config,
         Err(err) => {
             eprintln!("port-scanner: {err}");
@@ -148,12 +230,17 @@ async fn main() -> ExitCode {
         }
     };
 
-    // Build the scan configuration up front when a target was given; the
-    // discovery stage keeps its defaults and only the port set comes from the
-    // CLI. The TUI launches the scan itself through the spawner (Phase 10).
+    // Build the scan configuration up front when a target was given; the port
+    // set, timeout, and feature toggles come from the CLI. The TUI launches
+    // the scan itself through the spawner (Phase 10).
     let config = target.as_ref().map(|target| {
         let mut config = ScanConfig::new(target.clone());
         config.ports = port_config.clone();
+        // `--timeout` applies to both stages, so mirror it into the discovery
+        // stage when the user set it.
+        if let Some(timeout) = cli.timeout {
+            config.discovery.timeout = timeout;
+        }
         config.detect_services = !cli.no_services;
         config.enrich = !cli.no_enrichment;
         config
@@ -191,13 +278,13 @@ mod tests {
 
     #[test]
     fn defaults_to_quick_when_nothing_is_given() {
-        let config = resolve_port_config(None, None).unwrap();
+        let config = resolve_port_config(None, None, None).unwrap();
         assert_eq!(config, PortConfig::default());
     }
 
     #[test]
     fn selects_the_named_profile() {
-        let config = resolve_port_config(None, Some(PortProfile::Common)).unwrap();
+        let config = resolve_port_config(None, Some(PortProfile::Common), None).unwrap();
         assert_eq!(config.ports, PortProfile::Common.ports());
         assert_eq!(config.timeout, DEFAULT_TIMEOUT);
         assert_eq!(config.concurrency, DEFAULT_CONCURRENCY);
@@ -205,20 +292,66 @@ mod tests {
 
     #[test]
     fn explicit_ports_take_precedence_over_profile() {
-        let config = resolve_port_config(Some("80,443".into()), Some(PortProfile::Full)).unwrap();
+        let config =
+            resolve_port_config(Some("80,443".into()), Some(PortProfile::Full), None).unwrap();
         assert_eq!(config.ports, PortSpec::parse("80,443").unwrap());
     }
 
     #[test]
     fn explicit_ports_with_ranges_parse() {
         // 22 is one port; 8000..=8100 is 101 ports (inclusive), so 102 total.
-        let config = resolve_port_config(Some("22,8000-8100".into()), None).unwrap();
+        let config = resolve_port_config(Some("22,8000-8100".into()), None, None).unwrap();
         assert_eq!(config.ports.len(), 102);
     }
 
     #[test]
     fn invalid_ports_are_rejected_with_a_clear_error() {
-        let err = resolve_port_config(Some("99999".into()), None).unwrap_err();
+        let err = resolve_port_config(Some("99999".into()), None, None).unwrap_err();
         assert!(matches!(err, PortSpecError::Parse { .. }));
+    }
+
+    #[test]
+    fn explicit_timeout_overrides_the_default() {
+        let timeout = Duration::from_millis(750);
+        let config = resolve_port_config(None, None, Some(timeout)).unwrap();
+        assert_eq!(config.timeout, timeout);
+    }
+
+    #[test]
+    fn bare_number_is_milliseconds() {
+        assert_eq!(parse_timeout("300").unwrap(), Duration::from_millis(300));
+        assert_eq!(parse_timeout("0").unwrap(), Duration::ZERO);
+    }
+
+    #[test]
+    fn unit_suffixes_are_supported() {
+        assert_eq!(parse_timeout("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_timeout("1s").unwrap(), Duration::from_secs(1));
+        assert_eq!(parse_timeout("2m").unwrap(), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn space_before_unit_is_allowed() {
+        assert_eq!(parse_timeout("500 ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_timeout("1 s").unwrap(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn invalid_timeout_values_are_rejected() {
+        for input in ["", "  ", "abc", "1.5s", "-1", "1x"] {
+            let err = parse_timeout(input).unwrap_err();
+            assert!(
+                matches!(err, TimeoutError::Parse { .. }),
+                "expected parse error for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn overflowing_timeout_is_rejected() {
+        // 18446744073709551615 ms overflows a u64 when converted to seconds,
+        // and u64::MAX seconds overflows the millisecond conversion.
+        let err = parse_timeout("18446744073709551615s").unwrap_err();
+        assert!(matches!(err, TimeoutError::Parse { .. }));
     }
 }
