@@ -9,7 +9,9 @@
 //! results or triggering new scans (see AGENTS.md: "filtering operates on the
 //! UI model").
 
+use std::collections::HashMap;
 use std::io;
+use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
@@ -33,6 +35,7 @@ use crate::diff::ScanDiff;
 use crate::network::{Host, HostState, PortState, ProbedPort, ServiceInfo};
 use crate::scanner::{ScanConfig, ScanEvent, ScanSpawner};
 use crate::storage::RecordSummary;
+use crate::subnet::group_by_subnet;
 use crate::target::ScanTarget;
 
 /// The phase of the scan, as tracked by the TUI.
@@ -84,10 +87,11 @@ impl ScanState {
     }
 }
 
-/// The top-level view the TUI is showing (Phase 15).
+/// The top-level view the TUI is showing.
 ///
-/// `Overview` is the main scan screen; `History` lists the saved scan records
-/// and `Diff` shows the comparison of two of them.
+/// `Overview` is the main scan screen; `History` lists the saved scan records,
+/// `Diff` shows the comparison of two of them, and `Network` groups the
+/// discovered hosts by /24 subnet (organization only, no topology claim).
 ///
 /// The derived `Default` is `Overview`, the first variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -99,6 +103,8 @@ pub enum View {
     History,
     /// The comparison of two saved scans.
     Diff,
+    /// Discovered hosts grouped by /24 subnet.
+    Network,
 }
 
 /// Two saved records chosen for comparison, together with their computed diff
@@ -442,6 +448,10 @@ impl App {
             self.handle_diff_key(key, cancel);
             return;
         }
+        if self.view == View::Network {
+            self.handle_network_key(key, cancel);
+            return;
+        }
         match key {
             KeyCode::Char('q') => self.quit(cancel),
             KeyCode::Char('c') if self.scan.is_active() => {
@@ -454,6 +464,7 @@ impl App {
             }
             KeyCode::Char('e') => self.export_results(),
             KeyCode::Char('h') => self.open_history(),
+            KeyCode::Char('n') => self.view = View::Network,
             KeyCode::Char('/') => {
                 self.filter_input.clear();
                 self.filter_mode = true;
@@ -476,38 +487,71 @@ impl App {
     /// the visible ends; a stale (out-of-range) or hidden index is treated as
     /// no selection.
     fn move_selection(&mut self, direction: i8) {
+        self.move_within(&self.visible_indices(), direction)
+    }
+
+    /// Move the selection by `direction` (-1 up, +1 down) within an explicit
+    /// display order.
+    ///
+    /// `order` is a list of `hosts` indices in display order (for example
+    /// the overview's filtered list or the network view's grouped order).
+    /// With an empty order the selection is cleared. With no selection in the
+    /// order, down anchors on the first entry and up on the last. Otherwise
+    /// the selection steps to the adjacent entry, clamped at the ends; a
+    /// stale (out-of-range) or out-of-order index is treated as no selection.
+    fn move_within(&mut self, order: &[usize], direction: i8) {
         if direction == 0 {
             return;
         }
-        let visible = self.visible_indices();
-        if visible.is_empty() {
-            // Nothing matches the filter: there is no host to select.
+        if order.is_empty() {
+            // Nothing to select.
             self.selected_host = None;
             return;
         }
-        let first = visible[0];
-        let last = *visible.last().expect("visible checked non-empty");
+        let first = order[0];
+        let last = *order.last().expect("order checked non-empty");
         let next = match self.selected_host {
-            // A selection that is still visible steps to the adjacent visible
-            // host, skipping hidden ones, clamped at the visible ends.
-            Some(index) if visible.contains(&index) => {
-                let position = visible
+            // A selection that is in the order steps to the adjacent entry,
+            // clamped at the order's ends.
+            Some(index) if order.contains(&index) => {
+                let position = order
                     .iter()
-                    .position(|&visible_index| visible_index == index)
-                    .expect("selection is a visible index");
+                    .position(|&order_index| order_index == index)
+                    .expect("selection is an order index");
                 if direction > 0 {
-                    *visible.get(position + 1).unwrap_or(&last)
+                    *order.get(position + 1).unwrap_or(&last)
                 } else {
-                    *visible.get(position.saturating_sub(1)).unwrap_or(&first)
+                    *order.get(position.saturating_sub(1)).unwrap_or(&first)
                 }
             }
-            // No selection, or a stale/hidden index: anchor at the end we are
-            // moving towards, so the first down selects the first visible
-            // host and the first up selects the last.
+            // No selection, or a stale/out-of-order index: anchor at the end
+            // we are moving towards, so the first down selects the first
+            // entry and the first up selects the last.
             _ if direction > 0 => first,
             _ => last,
         };
         self.selected_host = Some(next);
+    }
+
+    /// The display order of host indices in the network view (Phase 16):
+    /// hosts grouped by /24 subnet, groups sorted by network address, hosts
+    /// sorted by IP within each group.
+    ///
+    /// Duplicate IPs (the TUI does not dedupe hosts) map to their last index.
+    fn network_order(&self) -> Vec<usize> {
+        let mut index_of: HashMap<Ipv4Addr, usize> = HashMap::new();
+        for (index, host) in self.hosts.iter().enumerate() {
+            index_of.insert(host.ip, index);
+        }
+        let mut order = Vec::new();
+        for group in group_by_subnet(&self.hosts) {
+            for host in group.hosts {
+                if let Some(&index) = index_of.get(&host.ip) {
+                    order.push(index);
+                }
+            }
+        }
+        order
     }
 
     /// Drop the current selection if its host is hidden by the effective
@@ -683,6 +727,24 @@ impl App {
                 self.diff_selection = None;
                 self.view = View::History;
             }
+            _ => {}
+        }
+    }
+
+    /// Handle a key pressed in the network view (Phase 16).
+    ///
+    /// `Esc` returns to the overview, `j`/`k`/`Up`/`Down` move the selection
+    /// through the grouped display order, and `Enter` opens the host detail.
+    /// The detail screen itself is handled by the top-level `show_detail`
+    /// branch in [`App::handle_key`].
+    fn handle_network_key(&mut self, key: KeyCode, cancel: &AtomicBool) {
+        match key {
+            KeyCode::Char('q') => self.quit(cancel),
+            KeyCode::Esc => self.view = View::Overview,
+            KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Up | KeyCode::Char('k') => self.move_within(&self.network_order(), -1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_within(&self.network_order(), 1),
+            KeyCode::Enter if self.selected().is_some() => self.show_detail = true,
             _ => {}
         }
     }
@@ -870,18 +932,117 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io
     terminal.show_cursor()
 }
 
-/// Draw the top-level view: the overview, the saved-scan history, or the
-/// scan diff (Phase 15).
+/// Draw the top-level view: the overview, the saved-scan history, the scan
+/// diff (Phase 15), or the network view (Phase 16).
 fn draw(frame: &mut Frame, app: &App) {
     match app.view {
         View::Overview => draw_overview(frame, app),
         View::History => draw_history(frame, app),
         View::Diff => draw_diff(frame, app),
+        View::Network => draw_network(frame, app),
     }
 
     if app.show_help {
         draw_help_overlay(frame);
     }
+}
+
+/// Draw the network view (Phase 16): discovered hosts grouped by /24 subnet,
+/// clearly labeled as organization only — no topology is claimed.
+///
+/// Every discovered host is listed, grouped into /24 subnets (see
+/// [`crate::subnet::group_by_subnet`]). Groups are ordered by network address
+/// and the hosts within each group are ordered by IP. The grouping is purely
+/// organizational: it makes a long list easier to read and asserts no routing
+/// or topology relationship between the hosts. Pressing `Enter` on a selected
+/// host opens the shared host detail screen (Phase 8); `Esc` returns here.
+fn draw_network(frame: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+
+    let title = Paragraph::new("Network").style(Style::default().add_modifier(Modifier::BOLD));
+    frame.render_widget(title, chunks[0]);
+
+    let subtitle =
+        Paragraph::new("Grouped by /24 subnet — organization only; no topology is claimed.");
+    frame.render_widget(subtitle, chunks[1]);
+
+    if app.show_detail {
+        draw_host_detail(frame, app, chunks[2]);
+    } else {
+        draw_network_list(frame, app, chunks[2]);
+    }
+
+    let hint = if app.show_detail {
+        "Esc Back  q Quit".to_string()
+    } else {
+        "↑/k Up  ↓/j Down  Enter Detail  Esc Back  ? Help  q Quit".to_string()
+    };
+    frame.render_widget(Paragraph::new(hint), chunks[3]);
+}
+
+/// Build and render the grouped host list for the network view.
+///
+/// Each /24 group is introduced by a bold header line followed by one line per
+/// host in IP order. The currently selected host is drawn reversed, and the
+/// list is scrolled so the selection stays visible (see [`window_start`]).
+fn draw_network_list(frame: &mut Frame, app: &App, area: Rect) {
+    if app.hosts.is_empty() {
+        frame.render_widget(Paragraph::new("No hosts discovered."), area);
+        return;
+    }
+
+    let groups = group_by_subnet(&app.hosts);
+    let selected_ip = app.selected().map(|host| host.ip);
+
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    let mut selected_position: Option<usize> = None;
+    for group in &groups {
+        let host_count = group.hosts.len();
+        lines.push(
+            Line::from(format!(
+                "{}/24  ({} host{})",
+                group.network,
+                host_count,
+                if host_count == 1 { "" } else { "s" }
+            ))
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+        );
+        for host in &group.hosts {
+            let selected = selected_ip.is_some_and(|ip| host.ip == ip);
+            if selected {
+                selected_position = Some(lines.len());
+            }
+            let style = if selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            let text = format!(
+                "  {}  {:<4}  {}",
+                host.ip,
+                host.state,
+                format_open_ports(&host.ports)
+            );
+            lines.push(Line::from(text).style(style));
+        }
+    }
+
+    let start = window_start(lines.len(), selected_position, area.height as usize);
+    let visible: Vec<Line<'_>> = lines
+        .iter()
+        .skip(start)
+        .take(area.height as usize)
+        .cloned()
+        .collect();
+    frame.render_widget(Paragraph::new(visible), area);
 }
 
 /// Draw the main scan screen: title row, status line, host list (or detail
@@ -964,7 +1125,7 @@ fn draw_overview(frame: &mut Frame, app: &App) {
     } else if let Some(filter) = app.filter.as_deref() {
         format!("Filter: {filter}  / Edit  Esc Clear  ? Help  q Quit")
     } else {
-        "↑/k Up  ↓/j Down  Enter Detail  / Filter  e Export  h History  ? Help  c Cancel  q Quit"
+        "↑/k Up  ↓/j Down  Enter Detail  / Filter  e Export  h History  n Network  ? Help  c Cancel  q Quit"
             .to_string()
     };
     frame.render_widget(Paragraph::new(hint), chunks[3]);
@@ -1346,7 +1507,7 @@ fn format_duration(duration: Duration) -> String {
 fn draw_help_overlay(frame: &mut Frame) {
     let area = frame.area();
     let width = 26u16.min(area.width);
-    let height = 11u16.min(area.height);
+    let height = 12u16.min(area.height);
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let overlay_area = Rect {
@@ -1362,6 +1523,7 @@ fn draw_help_overlay(frame: &mut Frame) {
         "  /      Filter",
         "  e      Export",
         "  h      History",
+        "  n      Network",
         "  ?      Help",
         "  r      Rescan",
         "  c      Cancel",
@@ -2565,6 +2727,78 @@ mod tests {
         app.selected_host = Some(9);
         app.handle_key(KeyCode::Char('k'), &cancel);
         assert_eq!(app.selected_host, Some(1));
+    }
+
+    /// Hosts spanning two /24 subnets, deliberately not in IP order.
+    fn app_with_multi_subnet_hosts() -> App {
+        App {
+            hosts: vec![
+                Host::up("192.168.2.5".parse().unwrap(), Duration::from_millis(1)),
+                Host::up("10.0.0.9".parse().unwrap(), Duration::from_millis(2)),
+                Host::up("192.168.2.3".parse().unwrap(), Duration::from_millis(3)),
+                Host::up("10.0.0.2".parse().unwrap(), Duration::from_millis(4)),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn network_order_sorts_groups_by_network_and_hosts_by_ip() {
+        let app = app_with_multi_subnet_hosts();
+        // Groups sorted by network address (10.0.0.0 before 192.168.2.0);
+        // hosts sorted by IP within each group.
+        assert_eq!(app.network_order(), vec![3, 1, 2, 0]);
+    }
+
+    #[test]
+    fn network_order_empty_without_hosts() {
+        assert!(App::default().network_order().is_empty());
+    }
+
+    #[test]
+    fn n_key_opens_network_view_from_overview() {
+        let mut app = app_with_multi_subnet_hosts();
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('n'), &cancel);
+        assert_eq!(app.view, View::Network);
+    }
+
+    #[test]
+    fn network_view_navigation_steps_through_grouped_order() {
+        let mut app = app_with_multi_subnet_hosts();
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('n'), &cancel);
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        assert_eq!(app.selected_host, Some(3)); // 10.0.0.2
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        assert_eq!(app.selected_host, Some(1)); // 10.0.0.9
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        assert_eq!(app.selected_host, Some(2)); // 192.168.2.3 (next group)
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        assert_eq!(app.selected_host, Some(0)); // 192.168.2.5
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        // Clamped at the end of the grouped order.
+        assert_eq!(app.selected_host, Some(0));
+        app.handle_key(KeyCode::Char('k'), &cancel);
+        assert_eq!(app.selected_host, Some(2));
+    }
+
+    #[test]
+    fn network_view_enter_opens_detail_and_esc_returns_to_overview() {
+        let mut app = app_with_multi_subnet_hosts();
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('n'), &cancel);
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        assert_eq!(app.selected_host, Some(3));
+        app.handle_key(KeyCode::Enter, &cancel);
+        assert!(app.show_detail);
+        // Esc closes the detail and stays in the network view...
+        app.handle_key(KeyCode::Esc, &cancel);
+        assert!(!app.show_detail);
+        assert_eq!(app.view, View::Network);
+        // ...and the next Esc returns to the overview.
+        app.handle_key(KeyCode::Esc, &cancel);
+        assert_eq!(app.view, View::Overview);
     }
 
     #[test]

@@ -1588,6 +1588,58 @@ The visualization should distinguish between:
 
 A subnet view can be useful even without claiming topology.
 
+## Design decisions
+
+- **Subnet grouping only:** the network view groups discovered hosts by /24
+  subnet (first three IP octets) and lists them per group. It is explicitly
+  labelled "Grouped by /24 subnet — organization only; no topology is claimed."
+  The tree example above is deliberately **not** implemented in this phase: the
+  scanner has no data supporting topology relationships, and the plan states
+  that "a subnet view can be useful even without claiming topology."
+- **Grouping key:** /24, regardless of the scan target's prefix. Grouping is a
+  presentation-level organization of already-discovered hosts; it never
+  expands or changes the scan scope.
+- **Grouping module:** a new pure crate-root module `src/subnet.rs`
+  (precedent: `src/diff.rs`): `network_of(ip) -> Ipv4Addr` (last octet zeroed),
+  `SubnetGroup { network, hosts }`, and pure
+  `group_by_subnet(hosts) -> Vec<SubnetGroup>` built on a `BTreeMap` so groups
+  are sorted by network address and hosts by ascending IP within a group. No
+  new dependencies.
+- **Access and navigation:** `n` opens the view from the overview. `j`/`k`/`Up`/`Down`
+  move the selection through the grouped display order (across groups); `Enter`
+  opens the host detail (reusing the global detail overlay); `Esc` returns to
+  the overview; `?` shows the help overlay; `q` quits.
+- **Selection sharing:** the network view reuses `selected_host` (a host index
+  into `app.hosts`). Because the network view shows all hosts, the overview's
+  existing selection is always valid when the view is entered.
+- **Movement generalization:** selection movement is generalized into
+  `move_within(order, direction)`, which takes an explicit display order;
+  `move_selection` delegates to it with the visible (filtered) list, and the
+  network view delegates with the grouped order. No behavior change for the
+  overview.
+
+## Tasks
+
+- [x]16.1 `subnet.rs`: new pure module with `network_of`, `SubnetGroup`, and
+  `group_by_subnet`; unit tests for empty input, a single group, multiple
+  groups from unsorted input, and IP ordering within a group. Register the
+  module in `src/main.rs`.
+- [x]16.2 TUI: refactor `move_selection` into `move_within(order, direction)`
+  in `src/tui/app.rs`; `move_selection` delegates with `visible_indices()`. No
+  behavior change; existing tests must still pass.
+- [x]16.3 TUI: add `View::Network`, the `n` keybinding in the overview,
+  `handle_network_key`, `network_order()`, and a minimal `draw_network`
+  registered in the draw router; unit tests for `network_order` and
+  network-view navigation.
+- [x]16.4 TUI: implement the full `draw_network`: per-group headers
+  (`{network}/24  (N hosts)`), host rows with state and open ports, selection
+  highlighting, scrolling, and host-detail integration (`show_detail`).
+- [x]16.5 TUI: add `n Network` to the overview hint line and to the help
+  overlay.
+- [x]16.6 Verify `cargo fmt --check`, `cargo check`, `cargo test`, and
+  `cargo clippy --all-targets`; PTY smoke-test the network flow (open the
+  view, navigate, open detail, return). Update `PLAN.md`.
+
 ---
 
 # 23\. Future IPv6 Support
@@ -1824,7 +1876,7 @@ Implement in this order:
 - [x]Persistence.
 - [x]Scan history.
 - [x]Scan diff.
-- [ ]Network visualization.
+- [x]Network visualization.
 - [ ]IPv6.
 
 Do not jump ahead to persistence, visualization, or service detection until the basic scanner and TUI are stable.

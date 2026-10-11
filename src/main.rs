@@ -5,6 +5,7 @@ mod network;
 mod ports;
 mod scanner;
 mod storage;
+mod subnet;
 mod target;
 mod tui;
 
