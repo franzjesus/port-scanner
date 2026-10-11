@@ -612,10 +612,11 @@ Avoid exposing every internal scanner option to users initially.
 - [x]5.3 Wire `main` to build a `ScanConfig` and pass `&config` to `run_scan`.
 - [x]5.4 Tests: `ScanConfig::new` defaults + `run_scan` framing via a `ScanConfig`.
 - [x]5.5 Update `PLAN.md`.
-- [ ]5.6 Make the scan timeout user-configurable from the CLI (e.g. a
-  `--timeout` flag); `src/main.rs` currently pins both stages to
-  `DEFAULT_TIMEOUT`/`DEFAULT_CONCURRENCY`, so the MVP DoD item "Scan timeout is
-  configurable" is not met.
+- [x]5.6 Make the scan timeout user-configurable from the CLI. A `--timeout`
+  flag was added; a bare number is milliseconds and `ms`/`s`/`m` suffixes are
+  accepted. It is applied to both the discovery and port stages (mirrored into
+  `DiscoveryConfig::timeout` and `PortConfig::timeout`); concurrency remains
+  fixed at `DEFAULT_CONCURRENCY`.
 
 ## Notes
 
@@ -1697,9 +1698,9 @@ The MVP is complete when all of the following are true:
 - [x]Live hosts are discovered.
 - [x]TCP ports can be scanned.
 - [x]Scan concurrency is bounded.
-- [ ]Scan timeout is configurable.
-  - Per-stage timeouts exist in the config model (`DiscoveryConfig::timeout`,
-    `PortConfig::timeout`) but the CLI pins them to `DEFAULT_TIMEOUT`; see
+- [x]Scan timeout is configurable.
+  - The CLI `--timeout` flag sets both the discovery and port stage timeouts
+    (mirrored into `DiscoveryConfig::timeout` and `PortConfig::timeout`); see
     task 5.6.
 - [x]Progress is displayed in real time.
 - [x]The UI remains responsive during scans.
