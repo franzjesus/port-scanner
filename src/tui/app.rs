@@ -1007,8 +1007,10 @@ fn draw_network(frame: &mut Frame, app: &App) {
 /// host in IP order. The currently selected host is drawn reversed, and the
 /// list is scrolled so the selection stays visible (see [`window_start`]).
 fn draw_network_list(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title("Hosts by /24");
+    let inner = block.inner(area);
     if app.hosts.is_empty() {
-        frame.render_widget(Paragraph::new("No hosts discovered."), area);
+        frame.render_widget(Paragraph::new("No hosts discovered.").block(block), area);
         return;
     }
 
@@ -1048,14 +1050,14 @@ fn draw_network_list(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    let start = window_start(lines.len(), selected_position, area.height as usize);
+    let start = window_start(lines.len(), selected_position, inner.height as usize);
     let visible: Vec<Line<'_>> = lines
         .iter()
         .skip(start)
-        .take(area.height as usize)
+        .take(inner.height as usize)
         .cloned()
         .collect();
-    frame.render_widget(Paragraph::new(visible), area);
+    frame.render_widget(Paragraph::new(visible).block(block), area);
 }
 
 /// Draw the main scan screen: title row, status line, host list (or detail
@@ -1122,10 +1124,20 @@ fn draw_overview(frame: &mut Frame, app: &App) {
             draw_host_detail(frame, app, chunks[2]);
         } else {
             let visible = app.visible_indices();
+            let title = hosts_frame_title(
+                app.effective_filter().map(|_| visible.len()),
+                app.hosts.len(),
+            );
             if app.effective_filter().is_some() && visible.is_empty() {
-                frame.render_widget(Paragraph::new("No hosts match the filter."), chunks[2]);
+                let block = Block::default().borders(Borders::ALL).title(title);
+                frame.render_widget(
+                    Paragraph::new("No hosts match the filter.").block(block),
+                    chunks[2],
+                );
             } else {
-                frame.render_widget(host_table(app, &visible, chunks[2]), chunks[2]);
+                let block = Block::default().borders(Borders::ALL).title(title);
+                let table = host_table(app, &visible, block.inner(chunks[2]));
+                frame.render_widget(table.block(block), chunks[2]);
             }
         }
     } else {
@@ -1164,11 +1176,14 @@ fn draw_history(frame: &mut Frame, app: &App) {
         .style(Style::default().add_modifier(Modifier::BOLD));
     frame.render_widget(title, chunks[0]);
 
+    let block = Block::default().borders(Borders::ALL).title("Saved Scans");
+    let inner = block.inner(chunks[1]);
+
     if let Some(err) = &app.history_error {
-        frame.render_widget(Paragraph::new(err.as_str()), chunks[1]);
+        frame.render_widget(Paragraph::new(err.as_str()).block(block.clone()), chunks[1]);
     } else if app.history_summaries.is_empty() {
         frame.render_widget(
-            Paragraph::new("No saved scans yet. Complete a scan to save one."),
+            Paragraph::new("No saved scans yet. Complete a scan to save one.").block(block.clone()),
             chunks[1],
         );
     } else {
@@ -1178,7 +1193,7 @@ fn draw_history(frame: &mut Frame, app: &App) {
             .unwrap_or(0);
         let header = Row::new(vec!["", "AGE", "TARGET", "HOSTS", "OPEN PORTS"])
             .style(Style::default().add_modifier(Modifier::BOLD));
-        let row_space = chunks[1].height as usize;
+        let row_space = inner.height as usize;
         let start = window_start(
             app.history_summaries.len(),
             Some(app.history_selected),
@@ -1221,7 +1236,8 @@ fn draw_history(frame: &mut Frame, app: &App) {
                     Constraint::Length(8),
                     Constraint::Length(12),
                 ],
-            ),
+            )
+            .block(block),
             chunks[1],
         );
     }
@@ -1247,8 +1263,13 @@ fn draw_diff(frame: &mut Frame, app: &App) {
         .style(Style::default().add_modifier(Modifier::BOLD));
     frame.render_widget(title, chunks[0]);
 
+    let block = Block::default().borders(Borders::ALL).title("Diff");
+
     let Some(selection) = &app.diff_selection else {
-        frame.render_widget(Paragraph::new("No diff selected."), chunks[1]);
+        frame.render_widget(
+            Paragraph::new("No diff selected.").block(block.clone()),
+            chunks[1],
+        );
         frame.render_widget(Paragraph::new("Esc Back to history  q Quit"), chunks[2]);
         return;
     };
@@ -1349,7 +1370,7 @@ fn draw_diff(frame: &mut Frame, app: &App) {
         }
     }
 
-    frame.render_widget(Paragraph::new(lines), chunks[1]);
+    frame.render_widget(Paragraph::new(lines).block(block), chunks[1]);
 
     let hint = "Esc Back to history  q Quit";
     frame.render_widget(Paragraph::new(hint), chunks[2]);
@@ -1516,6 +1537,17 @@ fn format_duration(duration: Duration) -> String {
         let mins = (secs / 60.0) as u64;
         let rest = secs - (mins as f64 * 60.0);
         format!("{mins}m {rest:.1}s")
+    }
+}
+
+/// Frame title for the host list.
+///
+/// Plain "Hosts" when no filter is active; otherwise the match count and the
+/// total number of discovered hosts, so filtering shows how much it matched.
+fn hosts_frame_title(shown: Option<usize>, total: usize) -> String {
+    match shown {
+        Some(shown) => format!("Hosts  {shown} of {total}"),
+        None => "Hosts".to_string(),
     }
 }
 
@@ -3343,5 +3375,15 @@ mod tests {
     #[test]
     fn format_age_saturates_for_future_timestamps() {
         assert_eq!(format_age(1000, 100), "0s ago");
+    }
+
+    #[test]
+    fn hosts_frame_title_is_plain_without_a_filter() {
+        assert_eq!(hosts_frame_title(None, 42), "Hosts");
+    }
+
+    #[test]
+    fn hosts_frame_title_shows_match_count_with_a_filter() {
+        assert_eq!(hosts_frame_title(Some(3), 42), "Hosts  3 of 42");
     }
 }

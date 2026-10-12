@@ -1724,7 +1724,66 @@ the CLI.
 
 ---
 
-# 24\. Future IPv6 Support
+# 24\. Phase 18 — TUI Visual Polish
+
+Follow-up work after Phase 17. The main content area rendered unstructured
+text blocks, scan progress was a single line of numbers, and host states were
+monochrome. This phase adds bordered panels around the four main views, a
+live progress gauge, and host-state colors so the screen reads at a glance.
+
+## Design decisions
+
+- **Panels:** each main view renders its content inside a `Block` with
+  `Borders::ALL` and a title — overview host list (`Hosts`), network list
+  (`Hosts by /24`), history (`Saved Scans`), and diff (`Diff`). Row windowing
+  uses `block.inner(area)` so one data row fits per line under the header.
+  Empty states ("No hosts match the filter.", "No hosts discovered.", "No
+  saved scans yet...", "No diff selected.") render inside the frame. The
+  host-detail screen and the "No target" hint stay unframed.
+- **Filter match count:** the host-list frame title doubles as filter
+  feedback — `hosts_frame_title(shown, total)` renders `Hosts` with no filter
+  and `Hosts  {shown} of {total}` when one is active.
+- **Gauge:** while a scan is active, the overview summary line renders a
+  one-line `Gauge`. `App::scan_progress() -> Option<(f64, String)>` maps the
+  scan-state enum to a ratio and label: `Starting…` (no ratio),
+  `Discovering {completed}/{total} · {up} up`, and
+  `Probing ports {probed}/{total} · {up} up`; ` · {elapsed}` is appended only
+  when a start time is known. Idle and terminal states keep the existing
+  summary text.
+- **State colors:** `UP` is green and `DOWN` is dark gray in the host table
+  (state cell styled via `style.patch(fg)` so selection REVERSED is not
+  clobbered) and in the network list (per-host lines built from styled
+  `Span`s; the selected line stays REVERSED). The host-detail screen keeps
+  plain strings.
+- **No new dependencies.**
+
+## Tasks
+
+- [x]18.1 Frame the overview host list in a bordered panel; "No hosts match
+  the filter." renders inside the frame; the table receives
+  `block.inner(chunks[2])`.
+- [x]18.2 Frame the network list (`Hosts by /24`) including its empty state;
+  line windowing switches to the inner rect.
+- [x]18.3 Frame the history table (`Saved Scans`) in all three branches
+  (error, empty, populated); `row_space` uses the inner height.
+- [x]18.4 Frame the diff view (`Diff`) in both branches (empty and content).
+- [x]18.5 `hosts_frame_title` filter-count title helper with unit tests.
+- [ ]18.6 One-line `Gauge` in the overview summary line while a scan is
+  active, driven by `App::scan_progress()`; unit tests.
+- [ ]18.7 Color host states (`UP` green, `DOWN` dark gray) in the host table
+  and the network list.
+
+## Verification
+
+- Full gate: `cargo fmt --check`, `cargo check`, `cargo test`,
+  `cargo clippy` clean.
+- PTY smoke test: overview, network, history, and diff views render bordered
+  panels; the gauge fills during a live scan; the filter title shows the
+  match count; host states are colored.
+
+---
+
+# 25\. Future IPv6 Support
 
 IPv6 should be considered in the architecture from the beginning, but does not need to be implemented in the MVP.
 
@@ -1740,7 +1799,7 @@ Initial implementation may explicitly reject IPv6 with a clear message.
 
 ---
 
-# 25\. Error Handling
+# 26\. Error Handling
 
 Errors should be structured and user-friendly.
 
@@ -1768,7 +1827,7 @@ Unexpected programmer errors may still panic during development, but user/networ
 
 ---
 
-# 26\. Performance Requirements
+# 27\. Performance Requirements
 
 The application should remain responsive during large scans.
 
@@ -1785,7 +1844,7 @@ Large subnet scans should provide continuous progress feedback.
 
 ---
 
-# 27\. Security and Safety
+# 28\. Security and Safety
 
 This is a network scanner and must behave predictably.
 
@@ -1804,7 +1863,7 @@ The tool should be designed primarily for networks the user is authorized to tes
 
 ---
 
-# 28\. Testing Strategy
+# 29\. Testing Strategy
 
 ## Unit tests
 
@@ -1843,7 +1902,7 @@ Avoid making tests dependent on a real external network.
 
 ---
 
-# 29\. Logging and Diagnostics
+# 30\. Logging and Diagnostics
 
 The application should support optional debug logging.
 
@@ -1861,7 +1920,7 @@ Consider logging to a file or only enabling detailed logs when explicitly reques
 
 ---
 
-# 30\. CLI Design
+# 31\. CLI Design
 
 Initial command structure:
 
@@ -1892,7 +1951,7 @@ Implemented flag worth noting:
 
 ---
 
-# 31\. Suggested MVP User Experience
+# 32\. Suggested MVP User Experience
 
 A user should be able to run:
 
@@ -1938,7 +1997,7 @@ Selecting a host:
 
 ---
 
-# 32\. Development Order
+# 33\. Development Order
 
 Implement in this order:
 
@@ -1957,6 +2016,7 @@ Implement in this order:
 - [x]Filtering.
 - [x]Cancellation.
 - [x]JSON export.
+- [ ]TUI visual polish.
 - [ ]Improve error handling.
 - [ ]Add tests and integration tests.
 - [x]Service detection.
@@ -1971,7 +2031,7 @@ Do not jump ahead to persistence, visualization, or service detection until the 
 
 ---
 
-# 33\. Definition of Done for MVP
+# 34\. Definition of Done for MVP
 
 The MVP is complete when all of the following are true:
 
@@ -2000,7 +2060,7 @@ The MVP is complete when all of the following are true:
 
 ---
 
-# 34\. Implementation Principles for OpenCode
+# 35\. Implementation Principles for OpenCode
 
 When implementing this plan:
 
@@ -2066,7 +2126,7 @@ Network capabilities such as ICMP and ARP can differ across Linux environments. 
 
 ---
 
-# 35\. First Task for OpenCode
+# 36\. First Task for OpenCode
 
 Start with **Phase 1 only**.
 
