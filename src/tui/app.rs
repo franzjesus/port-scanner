@@ -137,9 +137,6 @@ enum NewScanField {
 
 /// A new scan committed from the dialog (Phase 19), waiting to be built into
 /// a [`ScanConfig`] and started by the event loop.
-// Consumed by the run loop in the next step of Phase 19; drop the attribute
-// then.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct NewScanRequest {
     /// The parsed scan target.
@@ -996,11 +993,15 @@ impl App {
     /// provided spawner (Phase 10).
     ///
     /// Called for the first scan at the start of the event loop and again for
-    /// each rescan requested with `r`. The spawner, configuration, master
-    /// sender, and cancellation flag are owned by the caller rather than the
-    /// [`App`], so the app remains a plain, `Debug`/`Default` data container.
+    /// each rescan requested with `r` and each new scan committed from the
+    /// dialog (Phase 19). The spawner, configuration, master sender, and
+    /// cancellation flag are owned by the caller rather than the [`App`], so
+    /// the app remains a plain, `Debug`/`Default` data container.
     /// A fresh scan clears hosts, selection, error text, and the port count,
-    /// and re-raises the cancellation flag to a clean slate.
+    /// re-raises the cancellation flag to a clean slate, and points the
+    /// displayed target at the configuration that is now in flight (a new
+    /// scan may target a different address than the one the TUI was launched
+    /// with).
     fn start_scan(
         &mut self,
         config: &ScanConfig,
@@ -1009,6 +1010,7 @@ impl App {
         cancel: &Arc<AtomicBool>,
     ) {
         self.scan = ScanState::Starting;
+        self.target = Some(config.target.clone());
         self.hosts.clear();
         self.selected_host = None;
         self.scan_error = None;
@@ -1050,8 +1052,6 @@ fn cycle_variant<T: Copy + PartialEq>(value: T, variants: &[T], forward: bool) -
 /// have to re-enter them. With no template (the TUI was started without a
 /// target) a fresh [`ScanConfig::new`] provides the defaults. The target,
 /// discovery strategy, and port profile chosen in the dialog always win.
-// Wired into the run loop in the next step of Phase 19; drop the attribute then.
-#[allow(dead_code)]
 fn build_new_scan_config(
     template: Option<&ScanConfig>,
     target: ScanTarget,
@@ -1121,7 +1121,7 @@ pub fn run(
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
-    current_config: Option<ScanConfig>,
+    mut current_config: Option<ScanConfig>,
     spawner: &ScanSpawner,
     master_tx: &Sender<ScanEvent>,
     events: &Receiver<ScanEvent>,
@@ -1169,6 +1169,23 @@ fn run_loop(
             if let Event::Key(key) = event::read()? {
                 app.handle_key(key.code, cancel);
             }
+        }
+
+        // A new scan was committed from the in-TUI dialog (Phase 19). It wins
+        // over a pending rescan, which is discarded. The freshly built
+        // configuration replaces the one in flight, so a later completion is
+        // persisted with the configuration that was actually used.
+        if let Some(request) = app.new_scan_requested.take() {
+            app.rescan_requested = false;
+            let config = build_new_scan_config(
+                current_config.as_ref(),
+                request.target,
+                request.discovery,
+                request.profile,
+            );
+            app.start_scan(&config, spawner, master_tx, cancel);
+            current_config = Some(config);
+            persisted = false;
         }
 
         // A rescan was requested with `r` while no scan was active; start it
@@ -2179,6 +2196,23 @@ mod tests {
         assert_eq!(config.ports.concurrency, 3);
         assert!(!config.detect_services);
         assert!(!config.enrich);
+    }
+
+    #[test]
+    fn start_scan_points_displayed_target_at_active_config() {
+        let mut app = App::default();
+        app.target = Some(ScanTarget::parse("127.0.0.1").unwrap());
+        let config = ScanConfig::new(ScanTarget::parse("10.0.0.0/28").unwrap());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let spawner: ScanSpawner = Box::new(|_config, _tx, _cancel| {});
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        app.start_scan(&config, &spawner, &tx, &cancel);
+
+        assert_eq!(
+            app.target.as_ref().map(|t| t.to_string()),
+            Some("10.0.0.0/28".to_owned())
+        );
     }
 
     #[test]
