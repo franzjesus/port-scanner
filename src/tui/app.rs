@@ -3491,7 +3491,9 @@ mod tests {
     #[test]
     fn error_event_sets_error_state_and_message() {
         let mut app = App::default();
-        app.apply_event(ScanEvent::Error(ScanError::Socket("boom".to_owned())));
+        app.apply_event(ScanEvent::Error(ScanError::from(std::io::Error::other(
+            "boom",
+        ))));
         assert_eq!(app.scan, ScanState::Error);
         assert_eq!(app.scan_error.as_deref(), Some("socket error: boom"));
     }
@@ -3914,7 +3916,9 @@ mod tests {
 
     #[test]
     fn error_event_freezes_elapsed() {
-        let (app, _) = frozen_elapsed_after(ScanEvent::Error(ScanError::Socket("boom".to_owned())));
+        let (app, _) = frozen_elapsed_after(ScanEvent::Error(ScanError::from(
+            std::io::Error::other("boom"),
+        )));
         assert_eq!(app.scan, ScanState::Error);
         assert_eq!(app.scan_error.as_deref(), Some("socket error: boom"));
     }

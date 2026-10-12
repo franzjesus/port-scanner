@@ -108,12 +108,10 @@ pub(crate) fn sweep(
         let mut in_flight: HashMap<(Ipv4Addr, u16), Instant> = HashMap::with_capacity(chunk.len());
         for (i, addr) in chunk.iter().enumerate() {
             let seq = i as u16;
-            if let Err(e) = socket.send(*addr, seq) {
-                // A send failure is a system error, not a normal network
-                // condition; it aborts the scan.
-                let _ = events.send(ScanEvent::Error(ScanError::Socket(e.to_string())));
-                return Err(ScanError::Socket(e.to_string()));
-            }
+            // A send failure is a system error, not a normal network condition;
+            // it aborts the scan. The orchestrator re-emits it on the event
+            // stream; this stage only reports it upward.
+            socket.send(*addr, seq)?;
             in_flight.insert((*addr, seq), Instant::now());
         }
 
@@ -171,14 +169,11 @@ pub(crate) fn sweep(
 pub struct IcmpDiscovery;
 
 impl IcmpDiscovery {
-    /// Opens the unprivileged ICMP echo socket.
-    ///
-    /// Split out from [`IcmpDiscovery::discover`] so a caller that wants to
-    /// *probe* whether ICMP is available (for example, a discovery-strategy
-    /// selector that falls back to TCP port probing) can open the socket
-    /// itself and react to the failure without running a sweep.
+    /// Opens the unprivileged ICMP echo socket, mapping a socket failure onto
+    /// [`ScanError::Socket`] so callers can inspect it (for example to detect
+    /// a permission denial) without stringifying it.
     pub(crate) fn open() -> Result<PingSocket, ScanError> {
-        PingSocket::new().map_err(|e| ScanError::Socket(e.to_string()))
+        Ok(PingSocket::new()?)
     }
 }
 
@@ -194,15 +189,10 @@ impl HostDiscovery for IcmpDiscovery {
         // batch loop can index and count them.
         let addresses: Vec<Ipv4Addr> = target.iter().collect();
 
-        // Open the socket before any probe so a socket failure is reported as
-        // an error event instead of a half-started scan.
-        let socket = match IcmpDiscovery::open() {
-            Ok(socket) => socket,
-            Err(err) => {
-                let _ = events.send(ScanEvent::Error(err.clone()));
-                return Err(err);
-            }
-        };
+        // Open the socket before any probe so a socket failure is reported
+        // upward instead of a half-started scan; the orchestrator re-emits it
+        // on the event stream.
+        let socket = IcmpDiscovery::open()?;
 
         // Run the reusable probe sweep. It emits HostDiscovered/Progress (and
         // Cancelled on cancellation) but never Started/Finished; the scan
@@ -286,7 +276,7 @@ mod tests {
     fn open_maps_socket_failure_to_a_socket_error() {
         match IcmpDiscovery::open() {
             Ok(_) => {}
-            Err(ScanError::Socket(message)) => assert!(!message.is_empty()),
+            Err(ScanError::Socket { message, .. }) => assert!(!message.is_empty()),
             Err(other) => panic!("expected ScanError::Socket, got {other:?}"),
         }
     }

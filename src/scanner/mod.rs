@@ -142,19 +142,49 @@ pub enum ScanEvent {
 /// connection, a timeout) are not errors and never surface here; they are
 /// represented by host/port state instead. Only conditions that prevent the
 /// scan from continuing are reported as a [`ScanError`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum ScanError {
     /// A socket-level failure (creating the socket or sending a probe).
-    Socket(String),
+    ///
+    /// The raw OS error code and message are stored separately (rather than the
+    /// full [`std::io::Error`]) so the error stays `Clone`: the scan
+    /// orchestrator re-emits a terminal error on the event stream *and* returns
+    /// it, which needs two copies.
+    Socket {
+        /// The raw OS error code when the failure carried one. `EACCES` and
+        /// `EPERM` mark an ICMP permission denial, which is recoverable by
+        /// falling back to TCP port probing.
+        raw_os_error: Option<i32>,
+        /// The human-readable description of the socket failure.
+        message: String,
+    },
     /// A failure sending an event to the TUI, usually because the receiver was
     /// dropped (for example the TUI closed).
     Channel(String),
 }
 
+impl ScanError {
+    /// Whether this error is a permission failure on the socket.
+    ///
+    /// An unprivileged ICMP datagram socket fails with `EACCES` when the
+    /// process group is outside the kernel's `net.ipv4.ping_group_range`, and
+    /// with `EPERM` in the raw-socket case. Both mean ICMP is unavailable on
+    /// this system rather than a transient network condition, so the scanner
+    /// can degrade to TCP port probing instead of aborting the scan.
+    pub fn is_permission_denied(&self) -> bool {
+        match self {
+            ScanError::Socket { raw_os_error, .. } => {
+                matches!(raw_os_error, Some(libc::EPERM) | Some(libc::EACCES))
+            }
+            ScanError::Channel(_) => false,
+        }
+    }
+}
+
 impl fmt::Display for ScanError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ScanError::Socket(msg) => write!(f, "socket error: {msg}"),
+            ScanError::Socket { message, .. } => write!(f, "socket error: {message}"),
             ScanError::Channel(msg) => write!(f, "channel error: {msg}"),
         }
     }
@@ -166,6 +196,19 @@ impl std::error::Error for ScanError {}
 impl From<SendError<ScanEvent>> for ScanError {
     fn from(err: SendError<ScanEvent>) -> Self {
         ScanError::Channel(err.to_string())
+    }
+}
+
+/// Wrap a socket [`std::io::Error`], preserving the raw OS code (when present)
+/// so a permission denial can be detected later and the message kept for
+/// display. This is what lets discovery stages write `socket.send(..)?` and
+/// `PingSocket::new()?` directly in functions returning `Result<_, ScanError>`.
+impl From<std::io::Error> for ScanError {
+    fn from(err: std::io::Error) -> Self {
+        ScanError::Socket {
+            raw_os_error: err.raw_os_error(),
+            message: err.to_string(),
+        }
     }
 }
 
@@ -257,17 +300,21 @@ impl ScanConfig {
 ///
 /// This is the single selection point for how a scan resolves which of the
 /// target's hosts are up. [`Discovery::Auto`] is the default: it tries ICMP
-/// echo first and, when the ICMP socket cannot be opened (for example when
-/// the kernel denies an unprivileged ICMP datagram socket with `EPERM`),
-/// emits a [`ScanEvent::Warning`] and falls back to TCP port probing so the
-/// scan remains usable instead of failing.
+/// echo first and, whenever ICMP is unavailable — the socket cannot be opened
+/// or a probe is denied (for example the kernel rejects an unprivileged ICMP
+/// datagram socket with `EACCES`) — emits a [`ScanEvent::Warning`] and falls
+/// back to TCP port probing so the scan remains usable instead of failing.
+/// [`Discovery::Icmp`] likewise falls back to TCP when ICMP is denied by
+/// permission, but treats any other ICMP failure as a scan error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Discovery {
     /// Try ICMP echo first; fall back to TCP port probing (with a
-    /// [`ScanEvent::Warning`]) if the ICMP socket cannot be opened.
+    /// [`ScanEvent::Warning`]) whenever ICMP is unavailable.
     #[default]
     Auto,
-    /// Resolve hosts with ICMP echo. A socket failure is a scan error.
+    /// Resolve hosts with ICMP echo. A permission failure falls back to TCP
+    /// port probing (with a [`ScanEvent::Warning`]); any other ICMP failure
+    /// is a scan error.
     Icmp,
     /// Resolve hosts by probing a small fixed set of TCP ports.
     Tcp,
@@ -321,26 +368,48 @@ impl HostDiscovery for Discovery {
         cancel: &Arc<AtomicBool>,
     ) -> Result<DiscoveryOutcome, ScanError> {
         match self {
-            Discovery::Icmp => IcmpDiscovery.discover(target, config, events, cancel),
-            Discovery::Tcp => tcp_discovery::TcpDiscovery.discover(target, config, events, cancel),
-            Discovery::Auto => match IcmpDiscovery::open() {
-                // ICMP is available: run the sweep directly on the socket we
-                // just opened.
-                Ok(socket) => {
-                    let addresses: Vec<Ipv4Addr> = target.iter().collect();
-                    discovery::sweep(&socket, &addresses, config, events, cancel)
+            Discovery::Icmp => match IcmpDiscovery.discover(target, config, events, cancel) {
+                Ok(outcome) => Ok(outcome),
+                // ICMP was denied by permission (for example an unprivileged
+                // ICMP datagram socket rejected with EACCES): warn and fall
+                // back to TCP port probing so the scan stays usable.
+                Err(err) if err.is_permission_denied() => {
+                    let _ = events.send(ScanEvent::Warning(icmp_fallback_warning(&err)));
+                    tcp_discovery::TcpDiscovery.discover(target, config, events, cancel)
                 }
-                // ICMP is unavailable (for example EPERM on an unprivileged
-                // ICMP datagram socket): warn and fall back to TCP port
-                // probing so the scan stays usable.
+                // Any other ICMP failure is a genuine scan error and
+                // propagates to the orchestrator.
+                Err(err) => Err(err),
+            },
+            Discovery::Tcp => tcp_discovery::TcpDiscovery.discover(target, config, events, cancel),
+            // Try ICMP first; whenever it is unavailable — the socket cannot
+            // be opened or a probe is denied — warn and fall back to TCP port
+            // probing so the scan stays usable.
+            Discovery::Auto => match IcmpDiscovery.discover(target, config, events, cancel) {
+                Ok(outcome) => Ok(outcome),
                 Err(err) => {
-                    let _ = events.send(ScanEvent::Warning(format!(
-                        "ICMP echo unavailable ({err}); falling back to TCP port probing"
-                    )));
+                    let _ = events.send(ScanEvent::Warning(icmp_fallback_warning(&err)));
                     tcp_discovery::TcpDiscovery.discover(target, config, events, cancel)
                 }
             },
         }
+    }
+}
+
+/// Build the [`ScanEvent::Warning`] shown when ICMP discovery is unavailable
+/// and the scan falls back to TCP port probing.
+///
+/// A permission denial is the common, expected case: the message names the
+/// cause and offers the concrete fixes (run as root, grant `CAP_NET_RAW`, or
+/// widen `net.ipv4.ping_group_range`). Any other failure is reported with its
+/// underlying socket error.
+fn icmp_fallback_warning(err: &ScanError) -> String {
+    if err.is_permission_denied() {
+        "ICMP unavailable (permission denied); falling back to TCP port probing. \
+         Fix: run as root, grant CAP_NET_RAW, or widen net.ipv4.ping_group_range."
+            .to_string()
+    } else {
+        format!("ICMP unavailable ({err}); falling back to TCP port probing")
     }
 }
 
@@ -460,7 +529,17 @@ pub fn run_scan<D: HostDiscovery, P: PortScanner>(
 
     let _ = events.send(ScanEvent::Started { total });
 
-    match discovery.discover(&config.target, &config.discovery, events, cancel)? {
+    let outcome = match discovery.discover(&config.target, &config.discovery, events, cancel) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            // A fatal discovery failure must still reach the event stream: the
+            // orchestrator drops the Result, so without this re-emit neither the
+            // TUI nor the headless runner would see why the scan aborted.
+            let _ = events.send(ScanEvent::Error(err.clone()));
+            return Err(err);
+        }
+    };
+    match outcome {
         DiscoveryOutcome::Completed(up_hosts) => {
             // Port-scan every host that came up. Cancellation is checked before
             // starting each host so a cancelled scan stops scheduling new work.
@@ -584,12 +663,14 @@ mod tests {
         assert!(matches!(ScanEvent::Finished, ScanEvent::Finished));
         assert!(matches!(ScanEvent::Cancelled, ScanEvent::Cancelled));
 
-        let error = ScanEvent::Error(ScanError::Socket("boom".to_string()));
+        let socket_err = std::io::Error::other("boom");
+        let error = ScanEvent::Error(ScanError::from(socket_err));
         let cause = match error {
             ScanEvent::Error(cause) => cause,
             other => panic!("expected Error, got {other:?}"),
         };
-        assert_eq!(cause, ScanError::Socket("boom".to_string()));
+        assert!(matches!(cause, ScanError::Socket { .. }));
+        assert_eq!(cause.to_string(), "socket error: boom");
 
         let warning = ScanEvent::Warning("falling back to TCP discovery".to_string());
         let message = match warning {
@@ -656,7 +737,7 @@ mod tests {
 
     #[test]
     fn error_display_is_descriptive() {
-        let socket = ScanError::Socket("cannot open socket".to_string());
+        let socket = ScanError::from(std::io::Error::other("cannot open socket"));
         assert_eq!(socket.to_string(), "socket error: cannot open socket");
 
         let channel = ScanError::Channel("channel closed".to_string());
@@ -671,6 +752,83 @@ mod tests {
         let err = tx.send(ScanEvent::Finished).unwrap_err();
         let scan_error = ScanError::from(err);
         assert!(matches!(scan_error, ScanError::Channel(_)));
+    }
+
+    #[test]
+    fn permission_denied_detected_from_raw_os_error() {
+        // EACCES (13) — the unprivileged SOCK_DGRAM ICMP case.
+        let eacces = ScanError::Socket {
+            raw_os_error: Some(libc::EACCES),
+            message: "Permission denied (os error 13)".to_string(),
+        };
+        assert!(eacces.is_permission_denied());
+
+        // EPERM (1) — the raw-socket case.
+        let eperm = ScanError::Socket {
+            raw_os_error: Some(libc::EPERM),
+            message: "Operation not permitted (os error 1)".to_string(),
+        };
+        assert!(eperm.is_permission_denied());
+
+        // A different OS code is not a permission denial.
+        let einval = ScanError::Socket {
+            raw_os_error: Some(libc::EINVAL),
+            message: "Invalid argument (os error 22)".to_string(),
+        };
+        assert!(!einval.is_permission_denied());
+
+        // No OS code at all (e.g. a synthetic error) is not a permission denial.
+        let other = ScanError::Socket {
+            raw_os_error: None,
+            message: "boom".to_string(),
+        };
+        assert!(!other.is_permission_denied());
+
+        // Channel errors are never permission denials.
+        let channel = ScanError::Channel("closed".to_string());
+        assert!(!channel.is_permission_denied());
+    }
+
+    #[test]
+    fn from_io_error_preserves_raw_os_code_and_message() {
+        // An io::Error carrying an OS code keeps the code and its message.
+        let io_err = std::io::Error::from_raw_os_error(libc::EACCES);
+        let scan_err = ScanError::from(io_err);
+        assert!(scan_err.is_permission_denied());
+        assert!(scan_err.to_string().starts_with("socket error"));
+
+        // An io::Error without an OS code keeps its message but not a code.
+        let io_err = std::io::Error::other("boom");
+        let scan_err = ScanError::from(io_err);
+        assert!(!scan_err.is_permission_denied());
+        assert_eq!(scan_err.to_string(), "socket error: boom");
+    }
+
+    #[test]
+    fn icmp_fallback_warning_names_the_fix_for_permission_denials() {
+        let permission = ScanError::Socket {
+            raw_os_error: Some(libc::EACCES),
+            message: "Permission denied (os error 13)".to_string(),
+        };
+        let warning = icmp_fallback_warning(&permission);
+        assert!(warning.contains("permission denied"), "warning: {warning}");
+        assert!(warning.contains("TCP port probing"), "warning: {warning}");
+        assert!(
+            warning.contains("net.ipv4.ping_group_range"),
+            "warning: {warning}"
+        );
+
+        // A non-permission failure is reported with its socket error.
+        let other = ScanError::Socket {
+            raw_os_error: Some(libc::EINVAL),
+            message: "Invalid argument (os error 22)".to_string(),
+        };
+        let warning = icmp_fallback_warning(&other);
+        assert!(
+            warning.contains("socket error: Invalid argument (os error 22)"),
+            "warning: {warning}"
+        );
+        assert!(warning.contains("TCP port probing"), "warning: {warning}");
     }
 
     #[test]

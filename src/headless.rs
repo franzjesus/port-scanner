@@ -137,9 +137,10 @@ pub fn run(config: &ScanConfig, output: Option<&Path>) -> ExitCode {
         }
     }
 
-    // The `Result` is the authoritative outcome: a discovery failure returns
-    // `Err` without an `Error` event, and a port-scanner failure returns
-    // `Err` after sending one. On error, report it and write nothing.
+    // The `Result` is the authoritative outcome: both a discovery failure and
+    // a port-scanner failure send an `Error` event (re-emitted by the
+    // orchestrator) and then return `Err`. On error, report it and write
+    // nothing.
     if let Err(err) = result {
         eprintln!("port-scanner: {err}");
         return ExitCode::FAILURE;
@@ -351,7 +352,7 @@ mod tests {
         assert!(apply_event(&mut hosts, ScanEvent::Cancelled));
         assert!(apply_event(
             &mut hosts,
-            ScanEvent::Error(ScanError::Socket("boom".to_string()))
+            ScanEvent::Error(ScanError::from(std::io::Error::other("boom")))
         ));
         assert_eq!(hosts.len(), 1);
     }

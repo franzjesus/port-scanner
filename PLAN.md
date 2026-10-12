@@ -1677,12 +1677,29 @@ the CLI.
 - **Strategy type:** a `Discovery` enum in `src/scanner/mod.rs`
   (`Auto` | `Icmp` | `Tcp`, `#[default] Auto`). `ScanConfig` gains a
   `discovery_strategy: Discovery` field.
-- **`impl HostDiscovery for Discovery`:** `Auto` opens the ICMP socket via the
-  new `IcmpDiscovery::open()`; on success it runs the existing ICMP sweep, on
-  failure it emits `ScanEvent::Warning(...)` and falls back to TCP probing.
-  `Icmp` and `Tcp` delegate directly to the respective strategy with no
-  fallback. `run_scan` is generic over `HostDiscovery`, so the TUI and
+- **`impl HostDiscovery for Discovery`:** the dispatch owns the fallback
+  decision. `Auto` calls `IcmpDiscovery::discover(...)` directly and falls back
+  to `TcpDiscovery::discover(...)` (emitting a `ScanEvent::Warning`) on **any**
+  ICMP failure. `Icmp` likewise falls back to TCP on a **permission** failure
+  (the kernel denying an unprivileged ICMP socket, `EACCES`/`EPERM`) but
+  returns the error unchanged for any other ICMP failure. `Tcp` delegates
+  directly. `run_scan` is generic over `HostDiscovery`, so the TUI and
   headless paths both pass `&config.discovery_strategy`.
+- **`ScanError::Socket` carries the raw OS error:** the variant was restructured
+  from `Socket(String)` to `Socket { raw_os_error: Option<i32>, message: String }`
+  so a permission denial can be detected from the errno (`is_permission_denied()`
+  matches `EACCES`/`EPERM`). `impl From<std::io::Error> for ScanError` populates
+  it; the TUI/headless construction sites now use `ScanError::from(...)` rather
+  than building the variant directly. `ScanError` keeps `Debug`/`Clone` (the
+  `run_scan` re-emit pattern clones the terminal error) but drops `PartialEq`/`Eq`,
+  so tests assert on `matches!` + display text.
+- **Error emission is centralized:** `IcmpDiscovery::discover` and
+  `discovery::sweep` return `Err(ScanError)` and no longer emit
+  `ScanEvent::Error` themselves. The `Discovery` dispatch decides between
+  warning+fallback and a terminal error, and `run_scan` re-emits a terminal
+  discovery error as `ScanEvent::Error` (mirroring the port-scanner path) before
+  returning it, so the TUI always receives the terminal event even though
+  `build_spawner` discards the orchestrator's `Result`.
 - **TCP probing:** a new module `src/scanner/tcp_discovery.rs`. `TcpDiscovery`
   probes `PROBE_PORTS = [22, 80, 443, 3389]` per candidate address with a
   bounded worker pool (same concurrency as the ICMP sweep) and
@@ -1730,17 +1747,27 @@ the CLI.
   report 127.0.0.1 UP with port 631 and no warning; `--discovery bogus` exits
   non-zero with the descriptive error.
 - [x]17.11 Update `PLAN.md`.
+- [x]17.12 Graceful permission-failure fallback: restructure `ScanError::Socket`
+  to carry `raw_os_error`, add `is_permission_denied()` and an actionable
+  `icmp_fallback_warning`; make `Auto` fall back on any ICMP failure and `Icmp`
+  fall back on a permission failure (hard-error only otherwise); centralize
+  error emission in the `Discovery` dispatch / `run_scan`. Unit tests cover
+  permission detection, `From<io::Error>` mapping, and the warning text.
 
 ## Verification
 
-- Full gate: `cargo fmt --check`, `cargo check`, `cargo test` (320 passing),
+- Full gate: `cargo fmt --check`, `cargo check`, `cargo test` (369 passing),
   `cargo clippy --all-targets` clean.
 - PTY smoke test (127.0.0.1, `--ports 631`): the `tcp` and `auto` runs show
   the host UP with port 631 and no warning line; `bogus` is a clean clap
   error.
-- The EPERM fallback branch (ICMP unavailable → `Warning` → TCP) cannot be
-  reproduced in the development environment because ICMP works there; it is
-  covered by review and must be verified manually where EPERM occurs.
+- The permission-failure fallback branch (ICMP unavailable → `Warning` → TCP)
+  cannot be reproduced in the development environment because ICMP works there
+  (`net.ipv4.ping_group_range` is permissive, so no `EACCES`/`EPERM`). The
+  detection (`is_permission_denied` on the stored errno), the `From<io::Error>`
+  mapping, and the actionable warning text are covered by unit tests; the
+  dispatch itself (real `IcmpDiscovery` → `TcpDiscovery`) is integration-level
+  and must be verified manually where ICMP is actually denied.
 
 ---
 
