@@ -1532,6 +1532,18 @@ This should compare structured data rather than textual output.
 - **MVP scope:** saved-record vs saved-record comparison only. Comparing a saved
   record against the current in-memory scan (via `storage::from_scan`) and a
   headless diff mode are possible extensions, explicitly deferred.
+- **Loading a saved record:** the history view can load the selected record
+  into the overview for browsing (`l`), presenting it as a historical result
+  rather than a live scan. The reverse conversion (record types -> the live
+  `Host`/`ProbedPort` model) lives in `storage.rs` (`ScanRecord::to_hosts()`)
+  with a structured `ConvertError`; a record that cannot be loaded or
+  converted is reported in the history view and the view stays put. Loading
+  is browse-only: it restores hosts and target and moves the scan state to
+  `Completed` without fabricating a scan duration, and it does not restore the
+  record's scan config — `r` always rescans with the launch-time config, so
+  after loading a record with a different target, `r` rescans the launch-time
+  target. The overview title is labelled `(loaded)` for such results.
+  Restoring the record's config is a possible extension, explicitly deferred.
 
 ## Tasks
 
@@ -1558,6 +1570,14 @@ This should compare structured data rather than textual output.
 - [x]15.6 Verify `cargo fmt --check`, `cargo check`, `cargo test`, and
   `cargo clippy --all-targets`; smoke-test the history and diff flow against
   two saved records. Update `PLAN.md`.
+- [x]15.7 TUI + storage: load a saved record from the history view.
+  `storage.rs` gains `ScanRecord::to_hosts()` (with per-item reverse
+  conversions) and a structured `ConvertError`; the history view binds `l` to
+  load the selected record into the overview (hosts, target, `Completed`
+  state, no fabricated duration, `loaded_record` flag cleared by
+  `start_scan`); the overview title shows `(loaded)` and the history footer
+  documents the key. Tests cover the conversion, the load key handling, both
+  failure paths, and the rendering.
 
 ---
 

@@ -247,6 +247,12 @@ pub struct App {
     /// Set when `d` picks a second record on the history screen; cleared by
     /// `Esc` on the diff screen.
     diff_selection: Option<DiffSelection>,
+    /// Whether the current host list was loaded from a saved record rather
+    /// than discovered by a live scan (Phase 15).
+    ///
+    /// Set by `l` on the history screen; cleared by [`App::start_scan`]. Lets
+    /// the overview label a loaded scan as historical.
+    loaded_record: bool,
     /// Whether the new-scan dialog is open (Phase 19).
     ///
     /// Opened by `s` when no scan is active; closed by `Enter` (commit) or
@@ -861,6 +867,7 @@ impl App {
                     self.history_selected += 1;
                 }
             }
+            KeyCode::Char('l') => self.load_selected_record(),
             KeyCode::Char('d') => self.toggle_diff_mark(),
             KeyCode::Esc => {
                 self.history_marked = None;
@@ -924,6 +931,53 @@ impl App {
             result: crate::diff::diff_records(&before_record, &after_record),
         });
         self.view = View::Diff;
+    }
+
+    /// Load the selected saved record into the current host list and switch
+    /// to [`View::Overview`] (Phase 15).
+    ///
+    /// The record's hosts become the browseable state and the scan state
+    /// becomes [`ScanState::Completed`]. A loaded scan is historical, not a
+    /// live scan: no scan duration is fabricated (durations were never
+    /// recorded on disk), and [`App::loaded_record`] flags the state so the
+    /// overview can label it. Loading a record whose target cannot be parsed
+    /// leaves the displayed target unchanged. A record that fails to load or
+    /// convert is reported via [`App::history_error`] and the view stays on
+    /// the history screen.
+    fn load_selected_record(&mut self) {
+        let Some(summary) = self.history_summaries.get(self.history_selected).cloned() else {
+            return;
+        };
+        let Ok(record) = crate::storage::load(&summary.path) else {
+            self.history_error = Some("The selected record could not be loaded.".to_owned());
+            return;
+        };
+        let hosts = match record.to_hosts() {
+            Ok(hosts) => hosts,
+            Err(err) => {
+                self.history_error = Some(format!("The selected record is malformed: {err}"));
+                return;
+            }
+        };
+        // The stored target is the normalized scan target; a hand-edited
+        // record could carry something unparseable, in which case the
+        // displayed target is left as it was.
+        if let Ok(target) = ScanTarget::parse(&record.target) {
+            self.target = Some(target);
+        }
+        self.hosts = hosts;
+        self.scan = ScanState::Completed;
+        self.selected_host = None;
+        self.filter = None;
+        self.show_detail = false;
+        self.show_help = false;
+        self.scan_error = None;
+        // The record is complete, so the port gauge shows the full per-host
+        // profile total, as it does after a live scan finishes.
+        self.ports_probed = self.ports_total();
+        self.history_marked = None;
+        self.loaded_record = true;
+        self.view = View::Overview;
     }
 
     /// Handle a keypress on the diff screen (Phase 15).
@@ -997,11 +1051,11 @@ impl App {
     /// dialog (Phase 19). The spawner, configuration, master sender, and
     /// cancellation flag are owned by the caller rather than the [`App`], so
     /// the app remains a plain, `Debug`/`Default` data container.
-    /// A fresh scan clears hosts, selection, error text, and the port count,
-    /// re-raises the cancellation flag to a clean slate, and points the
-    /// displayed target at the configuration that is now in flight (a new
-    /// scan may target a different address than the one the TUI was launched
-    /// with).
+    /// A fresh scan clears hosts, selection, error text, the port count, and
+    /// the loaded-record flag, re-raises the cancellation flag to a clean
+    /// slate, and points the displayed target at the configuration that is
+    /// now in flight (a new scan may target a different address than the one
+    /// the TUI was launched with).
     fn start_scan(
         &mut self,
         config: &ScanConfig,
@@ -1019,6 +1073,7 @@ impl App {
         self.ports_probed = 0;
         self.started_at = None;
         self.scan_duration = None;
+        self.loaded_record = false;
         // A prior scan may have left the flag raised (e.g. after a cancel);
         // start from a clean slate.
         cancel.store(false, Ordering::SeqCst);
@@ -1343,9 +1398,12 @@ fn draw_overview(frame: &mut Frame, app: &App) {
         .split(frame.area());
 
     // Title row: `PORT-SCANNER  <target>` on the left, scan phase on the
-    // right, mirroring the plan's UI mockup.
+    // right, mirroring the plan's UI mockup. A loaded record is labelled
+    // `(loaded)` so it is never mistaken for a live scan (Phase 15).
     let title = match &app.target {
+        Some(target) if app.loaded_record => format!("PORT-SCANNER  {target}  (loaded)"),
         Some(target) => format!("PORT-SCANNER  {target}"),
+        None if app.loaded_record => "PORT-SCANNER  (loaded)".to_owned(),
         None => "PORT-SCANNER".to_owned(),
     };
     let title_chunks = Layout::default()
@@ -1519,7 +1577,7 @@ fn draw_history(frame: &mut Frame, app: &App) {
         );
     }
 
-    let hint = "↑/k Up  ↓/j Down  d Mark/Compare  Esc Back  q Quit";
+    let hint = "↑/k Up  ↓/j Down  l Load  d Mark/Compare  Esc Back  q Quit";
     frame.render_widget(Paragraph::new(hint), chunks[2]);
 }
 
@@ -3896,6 +3954,73 @@ mod tests {
         crate::storage::save(dir, &record).expect("save record");
     }
 
+    /// Save a record with one up host (three probed ports, two with services)
+    /// and one down host, for the load tests.
+    fn save_record_with_hosts(dir: &std::path::Path, timestamp: u64, target: &str) {
+        let record = crate::storage::ScanRecord {
+            version: crate::storage::CURRENT_VERSION,
+            timestamp,
+            target: target.to_owned(),
+            config: crate::storage::RecordConfig {
+                discovery_timeout_ms: 300,
+                discovery_concurrency: 16,
+                ports: vec![22, 80, 443],
+                port_timeout_ms: 300,
+                port_concurrency: 8,
+                detect_services: true,
+                enrich: false,
+            },
+            hosts: vec![
+                crate::storage::RecordHost {
+                    ip: "192.168.1.10".to_owned(),
+                    state: "up".to_owned(),
+                    latency_ms: Some(3.0),
+                    hostname: Some("router".to_owned()),
+                    mac: Some("00:11:22:33:44:55".to_owned()),
+                    vendor: Some("Vendor Co".to_owned()),
+                    ports: vec![
+                        crate::storage::RecordPort {
+                            port: 22,
+                            protocol: "tcp".to_owned(),
+                            state: "open".to_owned(),
+                            service: Some(crate::storage::RecordService {
+                                name: "ssh".to_owned(),
+                                version: Some("OpenSSH_8.4".to_owned()),
+                                extra: None,
+                            }),
+                        },
+                        crate::storage::RecordPort {
+                            port: 80,
+                            protocol: "tcp".to_owned(),
+                            state: "open".to_owned(),
+                            service: Some(crate::storage::RecordService {
+                                name: "http".to_owned(),
+                                version: Some("nginx/1.18".to_owned()),
+                                extra: None,
+                            }),
+                        },
+                        crate::storage::RecordPort {
+                            port: 443,
+                            protocol: "tcp".to_owned(),
+                            state: "closed".to_owned(),
+                            service: None,
+                        },
+                    ],
+                },
+                crate::storage::RecordHost {
+                    ip: "192.168.1.11".to_owned(),
+                    state: "down".to_owned(),
+                    latency_ms: None,
+                    hostname: None,
+                    mac: None,
+                    vendor: None,
+                    ports: vec![],
+                },
+            ],
+        };
+        crate::storage::save(dir, &record).expect("save record");
+    }
+
     /// An app in the history view with two saved records: timestamp 100 (the
     /// older one) and timestamp 200 (the newer one, listed first).
     fn app_with_history(name: &str) -> (App, std::path::PathBuf) {
@@ -4107,6 +4232,132 @@ mod tests {
         assert!(app.history_error.is_some());
         assert_eq!(app.history_marked, None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_reports_failure_and_stays_in_history() {
+        let (mut app, dir) = app_with_history("load-failure");
+        // Point the summary at a nonexistent file.
+        let mut summary = app.history_summaries[0].clone();
+        summary.path = dir.join("missing.json");
+        app.history_summaries = vec![summary];
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('l'), &cancel);
+        assert_eq!(app.view, View::History);
+        assert_eq!(
+            app.history_error.as_deref(),
+            Some("The selected record could not be loaded.")
+        );
+        assert!(app.hosts.is_empty());
+        assert!(!app.loaded_record);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn l_key_loads_selected_record_into_overview() {
+        let dir = temp_record_dir("load-into-overview");
+        save_record_with_hosts(&dir, 100, "192.168.1.0/24");
+        let mut app = App {
+            view: View::History,
+            ports_per_host: 3,
+            ..Default::default()
+        };
+        app.load_history(&dir);
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('l'), &cancel);
+
+        assert_eq!(app.view, View::Overview);
+        assert!(matches!(app.scan, ScanState::Completed));
+        assert_eq!(
+            app.target.as_ref().map(|t| t.to_string()),
+            Some("192.168.1.0/24".to_owned())
+        );
+        assert!(app.loaded_record);
+        assert!(app.selected_host.is_none());
+        assert!(app.filter.is_none());
+        assert!(!app.show_detail);
+        assert!(!app.show_help);
+        assert!(app.scan_error.is_none());
+        assert_eq!(app.ports_probed, app.ports_total());
+        assert_eq!(app.ports_probed, 3);
+
+        let expected_up = Host {
+            ip: Ipv4Addr::new(192, 168, 1, 10),
+            state: HostState::Up,
+            latency: Some(std::time::Duration::from_millis(3)),
+            ports: vec![
+                ProbedPort {
+                    port: Port::new(22).unwrap(),
+                    state: PortState::Open,
+                    service: Some(ServiceInfo {
+                        name: "ssh".to_owned(),
+                        version: Some("OpenSSH_8.4".to_owned()),
+                        extra: None,
+                    }),
+                },
+                ProbedPort {
+                    port: Port::new(80).unwrap(),
+                    state: PortState::Open,
+                    service: Some(ServiceInfo {
+                        name: "http".to_owned(),
+                        version: Some("nginx/1.18".to_owned()),
+                        extra: None,
+                    }),
+                },
+                ProbedPort {
+                    port: Port::new(443).unwrap(),
+                    state: PortState::Closed,
+                    service: None,
+                },
+            ],
+            hostname: Some("router".to_owned()),
+            mac: Some(MacAddress::new([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])),
+            vendor: Some("Vendor Co".to_owned()),
+        };
+        let expected_down = Host {
+            ip: Ipv4Addr::new(192, 168, 1, 11),
+            state: HostState::Down,
+            latency: None,
+            ports: vec![],
+            hostname: None,
+            mac: None,
+            vendor: None,
+        };
+        assert_eq!(app.hosts, vec![expected_up, expected_down]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn start_scan_clears_loaded_record_flag() {
+        let mut app = App {
+            loaded_record: true,
+            ..Default::default()
+        };
+        let config = ScanConfig::new(ScanTarget::parse("10.0.0.0/28").unwrap());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let spawner: ScanSpawner = Box::new(|_config, _tx, _cancel| {});
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.start_scan(&config, &spawner, &tx, &cancel);
+        assert!(!app.loaded_record);
+    }
+
+    #[test]
+    fn overview_title_labels_loaded_records() {
+        let mut app = app_with_target();
+        assert!(!render_app_text(&app, 80, 24).contains("(loaded)"));
+
+        app.loaded_record = true;
+        assert!(render_app_text(&app, 80, 24).contains("(loaded)"));
+    }
+
+    #[test]
+    fn history_footer_documents_the_load_key() {
+        let app = App {
+            view: View::History,
+            ..Default::default()
+        };
+        let text = render_app_text(&app, 80, 24);
+        assert!(text.contains("l Load"));
     }
 
     #[test]

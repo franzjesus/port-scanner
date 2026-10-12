@@ -15,12 +15,13 @@
 use std::fmt;
 use std::fs;
 use std::io;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::network::{Host, PortState, ServiceInfo};
+use crate::network::{Host, HostState, MacAddress, Port, PortState, ProbedPort, ServiceInfo};
 use crate::scanner::ScanConfig;
 use crate::target::ScanTarget;
 
@@ -87,6 +88,51 @@ impl std::error::Error for StorageError {
         }
     }
 }
+
+/// A failure to convert a stored record back into the live network model.
+///
+/// The stored forms keep their values as plain serializable fields (IPs and
+/// states as strings, ports as `u16`); turning them back into the strongly
+/// typed model can fail when a stored value is malformed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConvertError {
+    /// The stored IP address was not a valid IPv4 address.
+    Ip(String),
+    /// The stored host state was not `"up"` or `"down"`.
+    HostState(String),
+    /// The stored MAC address was not a valid MAC.
+    Mac(String),
+    /// The stored port number was outside the valid 1–65535 range.
+    Port(u16),
+    /// The stored port state was not `"open"` or `"closed"`.
+    PortState(String),
+}
+
+impl fmt::Display for ConvertError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConvertError::Ip(ip) => write!(f, "invalid IP address {ip:?}"),
+            ConvertError::HostState(state) => {
+                write!(
+                    f,
+                    "invalid host state {state:?}; expected \"up\" or \"down\""
+                )
+            }
+            ConvertError::Mac(mac) => write!(f, "invalid MAC address {mac:?}"),
+            ConvertError::Port(port) => {
+                write!(f, "invalid port {port}: must be in the range 1–65535")
+            }
+            ConvertError::PortState(state) => {
+                write!(
+                    f,
+                    "invalid port state {state:?}; expected \"open\" or \"closed\""
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ConvertError {}
 
 /// A stored scan: everything the TUI knows after a completed run.
 ///
@@ -213,9 +259,57 @@ impl ScanRecord {
             hosts: hosts.iter().map(RecordHost::from_host).collect(),
         }
     }
+
+    /// Convert the stored hosts back into live [`Host`]s.
+    ///
+    /// The reverse of the host mapping in [`from_scan`](Self::from_scan). Fails
+    /// on the first malformed host.
+    pub fn to_hosts(&self) -> Result<Vec<Host>, ConvertError> {
+        self.hosts.iter().map(RecordHost::to_host).collect()
+    }
 }
 
 impl RecordHost {
+    /// Convert a stored [`RecordHost`] back into a live [`Host`].
+    ///
+    /// The reverse of [`from_host`](Self::from_host). Fails when a stored field
+    /// is malformed (the IP, the host state, a MAC, or a port).
+    pub fn to_host(&self) -> Result<Host, ConvertError> {
+        let ip: Ipv4Addr = self
+            .ip
+            .parse()
+            .map_err(|_| ConvertError::Ip(self.ip.clone()))?;
+        let state = match self.state.as_str() {
+            "up" => HostState::Up,
+            "down" => HostState::Down,
+            other => return Err(ConvertError::HostState(other.to_owned())),
+        };
+        let latency = self
+            .latency_ms
+            .map(|ms| Duration::from_secs_f64(ms / 1000.0));
+        let mac = match &self.mac {
+            Some(text) => Some(
+                text.parse::<MacAddress>()
+                    .map_err(|_| ConvertError::Mac(text.clone()))?,
+            ),
+            None => None,
+        };
+        let ports = self
+            .ports
+            .iter()
+            .map(RecordPort::to_probed_port)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Host {
+            ip,
+            state,
+            latency,
+            ports,
+            hostname: self.hostname.clone(),
+            mac,
+            vendor: self.vendor.clone(),
+        })
+    }
+
     /// Convert a live [`Host`] into its stored form.
     pub fn from_host(host: &Host) -> Self {
         Self {
@@ -247,7 +341,40 @@ impl RecordHost {
     }
 }
 
+impl RecordPort {
+    /// Convert a stored [`RecordPort`] back into a live [`ProbedPort`].
+    ///
+    /// The reverse of the port mapping in [`RecordHost::from_host`]. Fails when
+    /// the port number is out of range or the state is not `"open"`/`"closed"`.
+    pub fn to_probed_port(&self) -> Result<ProbedPort, ConvertError> {
+        let port = Port::new(self.port).map_err(|_| ConvertError::Port(self.port))?;
+        let state = match self.state.as_str() {
+            "open" => PortState::Open,
+            "closed" => PortState::Closed,
+            other => return Err(ConvertError::PortState(other.to_owned())),
+        };
+        let service = self.service.as_ref().map(RecordService::to_service);
+        Ok(ProbedPort {
+            port,
+            state,
+            service,
+        })
+    }
+}
+
 impl RecordService {
+    /// Copy a stored [`RecordService`] back into a live [`ServiceInfo`].
+    ///
+    /// The reverse of [`from_service`](Self::from_service). Infallible — every
+    /// stored field maps directly onto a model field.
+    pub fn to_service(&self) -> ServiceInfo {
+        ServiceInfo {
+            name: self.name.clone(),
+            version: self.version.clone(),
+            extra: self.extra.clone(),
+        }
+    }
+
     /// Copy a live [`ServiceInfo`] into its stored form.
     pub fn from_service(service: &ServiceInfo) -> Self {
         Self {
@@ -788,5 +915,117 @@ mod tests {
         assert_eq!(target_slug("Host.Example.COM"), "host.example.com");
         assert_eq!(target_slug("10.0.0.5"), "10.0.0.5");
         assert_eq!(target_slug("a b/c"), "a_b_c");
+    }
+
+    fn minimal_record_host() -> RecordHost {
+        RecordHost {
+            ip: "192.168.1.10".to_owned(),
+            state: "up".to_owned(),
+            latency_ms: None,
+            hostname: None,
+            mac: None,
+            vendor: None,
+            ports: vec![RecordPort {
+                port: 80,
+                protocol: "tcp".to_owned(),
+                state: "open".to_owned(),
+                service: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn to_hosts_round_trip_preserves_host_fields() {
+        let original = host_with_ports();
+        let config = test_config();
+        let record =
+            ScanRecord::from_scan(&config.target, &[original.clone()], &config, 1_700_000_000);
+        let hosts = record.to_hosts().expect("convert");
+        assert_eq!(hosts.len(), 1);
+        let host = &hosts[0];
+        assert_eq!(host.ip, original.ip);
+        assert_eq!(host.state, original.state);
+        // Latency round-trips through f64 milliseconds and is not
+        // bit-exact, so compare with a tolerance instead.
+        let got = host.latency.expect("latency");
+        let want = original.latency.expect("latency");
+        assert!(
+            got.abs_diff(want) < Duration::from_micros(1),
+            "latency {got:?} not within 1µs of {want:?}",
+        );
+        assert_eq!(host.hostname.as_deref(), Some("router"));
+        assert_eq!(
+            host.mac,
+            Some(MacAddress::new([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]))
+        );
+        assert_eq!(host.vendor.as_deref(), Some("Vendor Co"));
+        assert_eq!(host.ports.len(), 3);
+        assert_eq!(host.ports[0].port, Port::new(80).unwrap());
+        assert_eq!(host.ports[0].state, PortState::Open);
+        let service = host.ports[0].service.as_ref().expect("service");
+        assert_eq!(service.name, "http");
+        assert_eq!(service.version.as_deref(), Some("nginx/1.18"));
+        assert!(service.extra.is_none());
+        assert_eq!(
+            host.ports[1].service.as_ref().unwrap().extra.as_deref(),
+            Some("OpenSSH_8.4")
+        );
+        assert_eq!(host.ports[2].state, PortState::Closed);
+        assert!(host.ports[2].service.is_none());
+    }
+
+    #[test]
+    fn to_hosts_empty_record_yields_empty_hosts() {
+        let config = test_config();
+        let record = ScanRecord::from_scan(&config.target, &[], &config, 1_700_000_000);
+        let hosts = record.to_hosts().expect("convert");
+        assert!(hosts.is_empty());
+    }
+
+    #[test]
+    fn to_host_rejects_invalid_ip() {
+        let mut host = minimal_record_host();
+        host.ip = "not-an-ip".to_owned();
+        assert_eq!(
+            host.to_host().unwrap_err(),
+            ConvertError::Ip("not-an-ip".to_owned())
+        );
+    }
+
+    #[test]
+    fn to_host_rejects_invalid_host_state() {
+        let mut host = minimal_record_host();
+        host.state = "maybe".to_owned();
+        assert_eq!(
+            host.to_host().unwrap_err(),
+            ConvertError::HostState("maybe".to_owned())
+        );
+    }
+
+    #[test]
+    fn to_host_rejects_invalid_mac() {
+        let mut host = minimal_record_host();
+        host.mac = Some("zz:zz".to_owned());
+        assert_eq!(
+            host.to_host().unwrap_err(),
+            ConvertError::Mac("zz:zz".to_owned())
+        );
+    }
+
+    #[test]
+    fn to_host_rejects_invalid_port_number() {
+        let mut host = minimal_record_host();
+        host.ports[0].port = 0;
+        assert_eq!(host.to_host().unwrap_err(), ConvertError::Port(0));
+    }
+
+    #[test]
+    fn to_host_rejects_invalid_port_state() {
+        let mut host = minimal_record_host();
+        host.ports[0].state = "filtered".to_owned();
+        assert_eq!(
+            host.to_host().unwrap_err(),
+            ConvertError::PortState("filtered".to_owned())
+        );
     }
 }
