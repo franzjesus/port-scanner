@@ -1783,7 +1783,90 @@ live progress gauge, and host-state colors so the screen reads at a glance.
 
 ---
 
-# 25\. Future IPv6 Support
+# 25\. Phase 19 — In-TUI New Scan
+
+Before this phase, the only way to change what the app scans was to exit and
+restart with a different CLI target; `r` could only rescan the current target.
+This phase adds a new-scan dialog: press `s` on the overview screen while
+idle to choose a target, discovery strategy, and port profile, then start a
+scan without leaving the TUI.
+
+## Design decisions
+
+- **Dialog:** while `new_scan_mode` is set, `handle_key` routes every key to
+  `handle_new_scan_key` and a modal panel is drawn on top of the active view —
+  a centered bordered panel titled `New Scan` (width 40, clamped to the
+  terminal), one row per field (Target, Strategy, Profile), hint rows
+  (` Tab Field   ←/→ Choose` / ` Enter Start  Esc Cancel`), and an inline red
+  error line when parsing fails. The focused field's label is bold; an empty
+  target renders a dark-gray placeholder, `IPv4 address or CIDR`. While the
+  dialog is open it consumes every key (nothing else is reachable, including
+  quit), and `Esc` is the only way back without committing.
+- **Prefill:** the target field starts from the app's current target string
+  (empty if the app was launched without one); strategy and profile start at
+  their defaults, `Discovery::Auto` and `PortProfile::Quick`.
+- **Keys:** `Tab` cycles focus Target → Strategy → Profile, wrapping;
+  `←`/`→` cycles the focused strategy (`Auto`/`Icmp`/`Tcp`) or profile
+  (`Quick`/`Common`/`Full`) and is ignored on Target; printable characters
+  append to the target and move focus back to it; `Backspace` removes the last
+  character; typing and backspacing clear a pending error; `Enter` parses the
+  target — a valid one records a `NewScanRequest` and closes the dialog, an
+  invalid one shows the `TargetError` message and keeps the dialog open;
+  `Esc` cancels and clears the error.
+- **Config build:** `build_new_scan_config(template, target, discovery,
+  profile)` clones the current config (or falls back to `ScanConfig::new` when
+  there is no template), then applies the dialog's target, discovery strategy,
+  and port set (`profile.ports()`). The per-stage tunables — timeout,
+  concurrency, `detect_services`, `enrich` — are carried over so the user does
+  not re-enter them.
+- **Precedence:** `run_loop` consumes `new_scan_requested` *before* the rescan
+  block: a committed new scan wins over a pending `r` rescan, which is
+  dropped. The freshly built config replaces `current_config`, and
+  `persisted` resets to `false`, so completion saves with the config that was
+  actually used.
+- **Target sync:** `start_scan` — the single scan-launch entry point — now
+  sets `app.target` from the config, keeping the header, export, and history
+  in sync with the active scan (a no-op for rescans).
+- **No new dependencies.**
+
+## Tasks
+
+- [x]19.1 Rework `StorageError`/`ExportError` into structured variants
+  (`StorageError::{DataDir, Io { path, source }, Serialize, Parse}` and
+  `ExportError::{Serialize, Io { path, source }}`), no blanket
+  `From<io::Error>` impls, infallible `next_record_path`/`next_export_path` —
+  foundation for a second in-TUI save whose failures must surface in the TUI
+  without crashing.
+- [x]19.2 `run_loop` owns `current_config: Option<ScanConfig>` by value
+  instead of borrowing the launch-time config.
+- [x]19.3 `build_new_scan_config(template, target, discovery, profile)` and
+  unit tests.
+- [x]19.4 Dialog state and keys: `NewScanField`, `NewScanRequest`, the seven
+  `new_scan_*` fields, the `s` binding (overview screen, idle only),
+  `open_new_scan`, `handle_new_scan_key`, and the `new_scan_mode` early return
+  in `handle_key`; unit tests.
+- [x]19.5 Dialog rendering: topmost modal panel with placeholder and bold
+  focus labels; `discovery_name`/`profile_name` static-name helpers; `s
+  New Scan` added to the help overlay and the overview bottom hint; render
+  tests.
+- [x]19.6 Consume `NewScanRequest` in `run_loop` before the rescan block
+  (build config, `start_scan`, replace `current_config`, `persisted = false`);
+  `start_scan` syncs `app.target`; unit tests.
+- [x]19.7 End-to-end PTY smoke and this PLAN.md section.
+
+## Verification
+
+- Full gate: `cargo fmt --check`, `cargo check`, `cargo test`,
+  `cargo clippy` clean (350 tests).
+- PTY smoke: initial scan completes and saves; `s` opens the dialog prefilled
+  with the launch target; backspacing clears the field to the placeholder;
+  typing a new target updates it; `Enter` closes the dialog and starts a scan
+  against the new target (header updates), which completes and saves again;
+  `q` exits.
+
+---
+
+# 26\. Future IPv6 Support
 
 IPv6 should be considered in the architecture from the beginning, but does not need to be implemented in the MVP.
 
@@ -1799,7 +1882,7 @@ Initial implementation may explicitly reject IPv6 with a clear message.
 
 ---
 
-# 26\. Error Handling
+# 27\. Error Handling
 
 Errors should be structured and user-friendly.
 
@@ -1827,7 +1910,7 @@ Unexpected programmer errors may still panic during development, but user/networ
 
 ---
 
-# 27\. Performance Requirements
+# 28\. Performance Requirements
 
 The application should remain responsive during large scans.
 
@@ -1844,7 +1927,7 @@ Large subnet scans should provide continuous progress feedback.
 
 ---
 
-# 28\. Security and Safety
+# 29\. Security and Safety
 
 This is a network scanner and must behave predictably.
 
@@ -1863,7 +1946,7 @@ The tool should be designed primarily for networks the user is authorized to tes
 
 ---
 
-# 29\. Testing Strategy
+# 30\. Testing Strategy
 
 ## Unit tests
 
@@ -1902,7 +1985,7 @@ Avoid making tests dependent on a real external network.
 
 ---
 
-# 30\. Logging and Diagnostics
+# 31\. Logging and Diagnostics
 
 The application should support optional debug logging.
 
@@ -1920,7 +2003,7 @@ Consider logging to a file or only enabling detailed logs when explicitly reques
 
 ---
 
-# 31\. CLI Design
+# 32\. CLI Design
 
 Initial command structure:
 
@@ -1951,7 +2034,7 @@ Implemented flag worth noting:
 
 ---
 
-# 32\. Suggested MVP User Experience
+# 33\. Suggested MVP User Experience
 
 A user should be able to run:
 
@@ -1997,7 +2080,7 @@ Selecting a host:
 
 ---
 
-# 33\. Development Order
+# 34\. Development Order
 
 Implement in this order:
 
@@ -2017,6 +2100,7 @@ Implement in this order:
 - [x]Cancellation.
 - [x]JSON export.
 - [x]TUI visual polish.
+- [x]In-TUI new scan.
 - [ ]Improve error handling.
 - [ ]Add tests and integration tests.
 - [x]Service detection.
@@ -2031,7 +2115,7 @@ Do not jump ahead to persistence, visualization, or service detection until the 
 
 ---
 
-# 34\. Definition of Done for MVP
+# 35\. Definition of Done for MVP
 
 The MVP is complete when all of the following are true:
 
@@ -2060,7 +2144,7 @@ The MVP is complete when all of the following are true:
 
 ---
 
-# 35\. Implementation Principles for OpenCode
+# 36\. Implementation Principles for OpenCode
 
 When implementing this plan:
 
@@ -2126,7 +2210,7 @@ Network capabilities such as ICMP and ARP can differ across Linux environments. 
 
 ---
 
-# 36\. First Task for OpenCode
+# 37\. First Task for OpenCode
 
 Start with **Phase 1 only**.
 
