@@ -33,7 +33,8 @@ use ratatui::{
 
 use crate::diff::ScanDiff;
 use crate::network::{Host, HostState, PortState, ProbedPort, ServiceInfo};
-use crate::scanner::{ScanConfig, ScanEvent, ScanSpawner};
+use crate::ports::PortProfile;
+use crate::scanner::{Discovery, ScanConfig, ScanEvent, ScanSpawner};
 use crate::storage::RecordSummary;
 use crate::subnet::group_by_subnet;
 use crate::target::ScanTarget;
@@ -869,6 +870,32 @@ impl App {
         cancel.store(false, Ordering::SeqCst);
         spawner(config.clone(), master_tx.clone(), cancel.clone());
     }
+}
+
+/// Build the [`ScanConfig`] for a new scan requested from the in-TUI dialog.
+///
+/// When a `template` is given (the configuration the TUI was launched with),
+/// its per-stage tunables — timeouts, concurrency, and the
+/// `detect_services`/`enrich` toggles — are carried over so the user does not
+/// have to re-enter them. With no template (the TUI was started without a
+/// target) a fresh [`ScanConfig::new`] provides the defaults. The target,
+/// discovery strategy, and port profile chosen in the dialog always win.
+// Wired into the run loop in the next step of Phase 19; drop the attribute then.
+#[allow(dead_code)]
+fn build_new_scan_config(
+    template: Option<&ScanConfig>,
+    target: ScanTarget,
+    discovery: Discovery,
+    profile: PortProfile,
+) -> ScanConfig {
+    let mut config = match template {
+        Some(template) => template.clone(),
+        None => ScanConfig::new(target.clone()),
+    };
+    config.target = target;
+    config.discovery_strategy = discovery;
+    config.ports.ports = profile.ports();
+    config
 }
 
 /// Run the terminal UI until the user quits, then restore the terminal.
@@ -1763,7 +1790,8 @@ fn format_open_ports(ports: &[ProbedPort]) -> String {
 mod tests {
     use super::*;
     use crate::network::{MacAddress, Port};
-    use crate::scanner::ScanError;
+    use crate::ports::PortConfig;
+    use crate::scanner::{DiscoveryConfig, ScanError};
     use std::net::Ipv4Addr;
 
     fn app_with_target() -> App {
@@ -1839,6 +1867,59 @@ mod tests {
             app.target.as_ref().map(|t| t.to_string()),
             Some("192.168.1.0/24".to_owned())
         );
+    }
+
+    #[test]
+    fn new_scan_config_uses_defaults_without_template() {
+        let target = ScanTarget::parse("10.0.0.5").unwrap();
+        let config =
+            build_new_scan_config(None, target.clone(), Discovery::Tcp, PortProfile::Common);
+
+        assert_eq!(config.target, target);
+        assert_eq!(config.discovery_strategy, Discovery::Tcp);
+        assert_eq!(config.ports.ports, PortProfile::Common.ports());
+        // Unselected tunables fall back to the defaults.
+        assert_eq!(config.discovery, DiscoveryConfig::default());
+        assert_eq!(config.ports.timeout, PortConfig::default().timeout);
+        assert_eq!(config.ports.concurrency, PortConfig::default().concurrency);
+        assert!(config.detect_services);
+        assert!(config.enrich);
+    }
+
+    #[test]
+    fn new_scan_config_carries_template_tunables() {
+        let template = ScanConfig {
+            target: ScanTarget::parse("192.168.1.10").unwrap(),
+            discovery_strategy: Discovery::Icmp,
+            discovery: DiscoveryConfig {
+                timeout: Duration::from_millis(1234),
+                concurrency: 7,
+            },
+            ports: PortConfig {
+                ports: PortProfile::Full.ports(),
+                timeout: Duration::from_millis(5678),
+                concurrency: 3,
+            },
+            detect_services: false,
+            enrich: false,
+        };
+        let target = ScanTarget::parse("10.1.0.0/28").unwrap();
+        let config = build_new_scan_config(
+            Some(&template),
+            target.clone(),
+            Discovery::Tcp,
+            PortProfile::Quick,
+        );
+
+        assert_eq!(config.target, target);
+        assert_eq!(config.discovery_strategy, Discovery::Tcp);
+        assert_eq!(config.ports.ports, PortProfile::Quick.ports());
+        // Tunables are inherited from the template.
+        assert_eq!(config.discovery, template.discovery);
+        assert_eq!(config.ports.timeout, Duration::from_millis(5678));
+        assert_eq!(config.ports.concurrency, 3);
+        assert!(!config.detect_services);
+        assert!(!config.enrich);
     }
 
     #[test]
