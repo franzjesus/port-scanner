@@ -209,9 +209,10 @@ pub const DEFAULT_CONCURRENCY: usize = 128;
 /// Profiles give the user quick access to sensible port selections without
 /// typing them out. `Quick` is a small, fast probe; `Common` is a curated set
 /// of well-known service ports; `Full` covers every TCP port.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum PortProfile {
     /// A small, fast set of the most commonly exposed services.
+    #[default]
     Quick,
     /// A curated set of well-known service ports.
     Common,

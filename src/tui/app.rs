@@ -123,6 +123,33 @@ pub struct DiffSelection {
     pub result: ScanDiff,
 }
 
+/// A focusable field of the new-scan dialog (Phase 19).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum NewScanField {
+    /// The target input line.
+    #[default]
+    Target,
+    /// The discovery strategy selector.
+    Strategy,
+    /// The port profile selector.
+    Profile,
+}
+
+/// A new scan committed from the dialog (Phase 19), waiting to be built into
+/// a [`ScanConfig`] and started by the event loop.
+// Consumed by the run loop in the next step of Phase 19; drop the attribute
+// then.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct NewScanRequest {
+    /// The parsed scan target.
+    target: ScanTarget,
+    /// The discovery strategy selected in the dialog.
+    discovery: Discovery,
+    /// The port profile selected in the dialog.
+    profile: PortProfile,
+}
+
 /// Central application state.
 #[derive(Debug, Default)]
 pub struct App {
@@ -223,6 +250,35 @@ pub struct App {
     /// Set when `d` picks a second record on the history screen; cleared by
     /// `Esc` on the diff screen.
     diff_selection: Option<DiffSelection>,
+    /// Whether the new-scan dialog is open (Phase 19).
+    ///
+    /// Opened by `s` when no scan is active; closed by `Enter` (commit) or
+    /// `Esc` (cancel). While open, every key goes to
+    /// [`App::handle_new_scan_key`] instead of the overview handlers.
+    new_scan_mode: bool,
+    /// The target text the user is editing in the new-scan dialog.
+    ///
+    /// Prefilled with the current target's string when the dialog opens
+    /// (empty when the app was launched without a target).
+    new_scan_target: String,
+    /// The discovery strategy selected in the new-scan dialog.
+    new_scan_discovery: Discovery,
+    /// The port profile selected in the new-scan dialog.
+    new_scan_profile: PortProfile,
+    /// The focused field in the new-scan dialog.
+    new_scan_focus: NewScanField,
+    /// The error message for the most recent failed dialog submit (Phase 19),
+    /// if any.
+    ///
+    /// Set when `Enter` cannot parse the target; cleared by typing,
+    /// backspacing, or cancelling the dialog.
+    new_scan_error: Option<String>,
+    /// A new scan committed from the dialog and waiting to be started by the
+    /// event loop (Phase 19).
+    ///
+    /// Set by `Enter` on a valid target; the event loop consumes the request,
+    /// builds the scan configuration, and starts the scan.
+    new_scan_requested: Option<NewScanRequest>,
 }
 
 impl App {
@@ -477,7 +533,15 @@ impl App {
     /// second mark on another record opens the diff), and `Esc` returns to the
     /// overview. On the diff screen, only `Esc` (back to history) and `q`
     /// (quit) act.
+    ///
+    /// While the new-scan dialog is open (started with `s` on the overview
+    /// screen), every key is routed to [`App::handle_new_scan_key`] instead of
+    /// the overview handlers (Phase 19).
     pub fn handle_key(&mut self, key: KeyCode, cancel: &AtomicBool) {
+        if self.new_scan_mode {
+            self.handle_new_scan_key(key);
+            return;
+        }
         if self.show_help {
             match key {
                 KeyCode::Char('?') | KeyCode::Esc => self.show_help = false,
@@ -520,6 +584,9 @@ impl App {
             KeyCode::Char('r') if !self.scan.is_active() => {
                 self.rescan_requested = true;
             }
+            KeyCode::Char('s') if !self.scan.is_active() => {
+                self.open_new_scan();
+            }
             KeyCode::Char('e') => self.export_results(),
             KeyCode::Char('h') => self.open_history(),
             KeyCode::Char('n') => self.view = View::Network,
@@ -532,6 +599,91 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Enter if self.selected().is_some() => self.show_detail = true,
+            _ => {}
+        }
+    }
+
+    /// Open the new-scan dialog (Phase 19), prefilled from the current target.
+    ///
+    /// Called from the `s` binding on the overview screen when no scan is
+    /// active. The target field starts with the current target's string (empty
+    /// when the app was launched without one), and the strategy and profile
+    /// start at their defaults ([`Discovery::Auto`] and
+    /// [`PortProfile::Quick`]).
+    fn open_new_scan(&mut self) {
+        self.new_scan_target = self
+            .target
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        self.new_scan_discovery = Discovery::Auto;
+        self.new_scan_profile = PortProfile::Quick;
+        self.new_scan_focus = NewScanField::Target;
+        self.new_scan_error = None;
+        self.new_scan_mode = true;
+    }
+
+    /// Handle a keypress while the new-scan dialog is open (Phase 19).
+    ///
+    /// `Tab` moves focus Target → Strategy → Profile, wrapping around;
+    /// `Left`/`Right` cycle the focused strategy or profile value. Printable
+    /// characters append to the target and move focus back to it; `Backspace`
+    /// removes the last character. Typing and backspacing also clear a pending
+    /// error. `Enter` parses the target: on success it records a
+    /// [`NewScanRequest`] for the event loop and closes the dialog; on failure
+    /// it shows the error and keeps the dialog open. `Esc` cancels and clears
+    /// the error.
+    fn handle_new_scan_key(&mut self, key: KeyCode) {
+        const DISCOVERIES: [Discovery; 3] = [Discovery::Auto, Discovery::Icmp, Discovery::Tcp];
+        const PROFILES: [PortProfile; 3] =
+            [PortProfile::Quick, PortProfile::Common, PortProfile::Full];
+
+        match key {
+            KeyCode::Tab => {
+                self.new_scan_focus = match self.new_scan_focus {
+                    NewScanField::Target => NewScanField::Strategy,
+                    NewScanField::Strategy => NewScanField::Profile,
+                    NewScanField::Profile => NewScanField::Target,
+                };
+            }
+            KeyCode::Left | KeyCode::Right => {
+                let forward = key == KeyCode::Right;
+                match self.new_scan_focus {
+                    NewScanField::Strategy => {
+                        self.new_scan_discovery =
+                            cycle_variant(self.new_scan_discovery, &DISCOVERIES, forward);
+                    }
+                    NewScanField::Profile => {
+                        self.new_scan_profile =
+                            cycle_variant(self.new_scan_profile, &PROFILES, forward);
+                    }
+                    NewScanField::Target => {}
+                }
+            }
+            KeyCode::Char(c) => {
+                self.new_scan_target.push(c);
+                self.new_scan_focus = NewScanField::Target;
+                self.new_scan_error = None;
+            }
+            KeyCode::Backspace => {
+                self.new_scan_target.pop();
+                self.new_scan_error = None;
+            }
+            KeyCode::Enter => match ScanTarget::parse(&self.new_scan_target) {
+                Ok(target) => {
+                    self.new_scan_requested = Some(NewScanRequest {
+                        target,
+                        discovery: self.new_scan_discovery,
+                        profile: self.new_scan_profile,
+                    });
+                    self.new_scan_mode = false;
+                }
+                Err(error) => self.new_scan_error = Some(error.to_string()),
+            },
+            KeyCode::Esc => {
+                self.new_scan_mode = false;
+                self.new_scan_error = None;
+            }
             _ => {}
         }
     }
@@ -870,6 +1022,24 @@ impl App {
         cancel.store(false, Ordering::SeqCst);
         spawner(config.clone(), master_tx.clone(), cancel.clone());
     }
+}
+
+/// Return the next (or previous) value in a closed list of variants, wrapping
+/// around at the ends.
+///
+/// Used by the new-scan dialog to cycle the discovery strategy and port
+/// profile selectors (Phase 19).
+fn cycle_variant<T: Copy + PartialEq>(value: T, variants: &[T], forward: bool) -> T {
+    let current = variants
+        .iter()
+        .position(|variant| *variant == value)
+        .expect("the current value must be one of the variants");
+    let next = if forward {
+        (current + 1) % variants.len()
+    } else {
+        (variants.len() - 1 + current) % variants.len()
+    };
+    variants[next]
 }
 
 /// Build the [`ScanConfig`] for a new scan requested from the in-TUI dialog.
@@ -2085,6 +2255,201 @@ mod tests {
         app.handle_key(KeyCode::Char('r'), &cancel);
         assert!(app.rescan_requested);
         assert_eq!(app.scan, ScanState::Completed);
+    }
+
+    #[test]
+    fn new_scan_key_opens_dialog_prefilled_from_target() {
+        let mut app = app_with_target();
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('s'), &cancel);
+        assert!(app.new_scan_mode);
+        assert_eq!(app.new_scan_target, "127.0.0.1");
+        assert_eq!(app.new_scan_discovery, Discovery::Auto);
+        assert_eq!(app.new_scan_profile, PortProfile::Quick);
+        assert_eq!(app.new_scan_focus, NewScanField::Target);
+        assert!(app.new_scan_error.is_none());
+        assert!(!app.should_quit);
+        assert!(!cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn new_scan_key_opens_dialog_without_target() {
+        let mut app = App::default();
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('s'), &cancel);
+        assert!(app.new_scan_mode);
+        assert_eq!(app.new_scan_target, "");
+    }
+
+    #[test]
+    fn new_scan_key_ignored_while_scan_active() {
+        let mut app = App {
+            scan: ScanState::Discovering {
+                completed: 0,
+                total: 4,
+            },
+            ..Default::default()
+        };
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('s'), &cancel);
+        assert!(!app.new_scan_mode);
+    }
+
+    #[test]
+    fn new_scan_dialog_char_appends_and_moves_focus_to_target() {
+        let mut app = app_with_target();
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('s'), &cancel);
+        app.new_scan_focus = NewScanField::Profile;
+        app.handle_key(KeyCode::Char('5'), &cancel);
+        assert_eq!(app.new_scan_target, "127.0.0.15");
+        assert_eq!(app.new_scan_focus, NewScanField::Target);
+    }
+
+    #[test]
+    fn new_scan_dialog_backspace_pops_char() {
+        let mut app = app_with_target();
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('s'), &cancel);
+        app.new_scan_target = "10.0.0.1".to_string();
+        app.handle_key(KeyCode::Backspace, &cancel);
+        assert_eq!(app.new_scan_target, "10.0.0.");
+    }
+
+    #[test]
+    fn new_scan_dialog_tab_cycles_focus() {
+        let mut app = App::default();
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('s'), &cancel);
+        assert_eq!(app.new_scan_focus, NewScanField::Target);
+        app.handle_key(KeyCode::Tab, &cancel);
+        assert_eq!(app.new_scan_focus, NewScanField::Strategy);
+        app.handle_key(KeyCode::Tab, &cancel);
+        assert_eq!(app.new_scan_focus, NewScanField::Profile);
+        app.handle_key(KeyCode::Tab, &cancel);
+        assert_eq!(app.new_scan_focus, NewScanField::Target);
+    }
+
+    #[test]
+    fn new_scan_dialog_right_cycles_discovery_forward() {
+        let mut app = App::default();
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('s'), &cancel);
+        app.new_scan_focus = NewScanField::Strategy;
+        app.handle_key(KeyCode::Right, &cancel);
+        assert_eq!(app.new_scan_discovery, Discovery::Icmp);
+        app.handle_key(KeyCode::Right, &cancel);
+        assert_eq!(app.new_scan_discovery, Discovery::Tcp);
+        app.handle_key(KeyCode::Right, &cancel);
+        assert_eq!(app.new_scan_discovery, Discovery::Auto);
+    }
+
+    #[test]
+    fn new_scan_dialog_left_cycles_discovery_backward() {
+        let mut app = App::default();
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('s'), &cancel);
+        app.new_scan_focus = NewScanField::Strategy;
+        app.handle_key(KeyCode::Left, &cancel);
+        assert_eq!(app.new_scan_discovery, Discovery::Tcp);
+    }
+
+    #[test]
+    fn new_scan_dialog_arrows_cycle_profile() {
+        let mut app = App::default();
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('s'), &cancel);
+        app.new_scan_focus = NewScanField::Profile;
+        app.handle_key(KeyCode::Right, &cancel);
+        assert_eq!(app.new_scan_profile, PortProfile::Common);
+        app.handle_key(KeyCode::Right, &cancel);
+        assert_eq!(app.new_scan_profile, PortProfile::Full);
+        app.handle_key(KeyCode::Right, &cancel);
+        assert_eq!(app.new_scan_profile, PortProfile::Quick);
+        app.handle_key(KeyCode::Left, &cancel);
+        assert_eq!(app.new_scan_profile, PortProfile::Full);
+    }
+
+    #[test]
+    fn new_scan_dialog_arrows_ignored_on_target_focus() {
+        let mut app = app_with_target();
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('s'), &cancel);
+        app.handle_key(KeyCode::Left, &cancel);
+        assert_eq!(app.new_scan_focus, NewScanField::Target);
+        assert_eq!(app.new_scan_discovery, Discovery::Auto);
+        assert_eq!(app.new_scan_profile, PortProfile::Quick);
+    }
+
+    #[test]
+    fn new_scan_dialog_enter_valid_target_sets_request() {
+        let mut app = app_with_target();
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('s'), &cancel);
+        app.new_scan_target = "10.0.0.1".to_string();
+        app.new_scan_discovery = Discovery::Tcp;
+        app.new_scan_profile = PortProfile::Full;
+        app.handle_key(KeyCode::Enter, &cancel);
+        assert!(!app.new_scan_mode);
+        let request = app
+            .new_scan_requested
+            .take()
+            .expect("a request should be recorded");
+        assert_eq!(request.target, ScanTarget::parse("10.0.0.1").unwrap());
+        assert_eq!(request.discovery, Discovery::Tcp);
+        assert_eq!(request.profile, PortProfile::Full);
+        assert!(!cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn new_scan_dialog_enter_invalid_target_shows_error() {
+        let mut app = app_with_target();
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('s'), &cancel);
+        app.new_scan_target = "not-an-ip".to_string();
+        app.handle_key(KeyCode::Enter, &cancel);
+        assert!(app.new_scan_mode);
+        assert!(app.new_scan_error.is_some());
+        assert!(app.new_scan_requested.is_none());
+    }
+
+    #[test]
+    fn new_scan_dialog_typing_and_backspace_clear_error() {
+        let mut app = app_with_target();
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('s'), &cancel);
+        app.new_scan_target = "nope".to_string();
+        app.handle_key(KeyCode::Enter, &cancel);
+        assert!(app.new_scan_error.is_some());
+        app.handle_key(KeyCode::Char('x'), &cancel);
+        assert!(app.new_scan_error.is_none());
+        app.handle_key(KeyCode::Enter, &cancel);
+        assert!(app.new_scan_error.is_some());
+        app.handle_key(KeyCode::Backspace, &cancel);
+        assert!(app.new_scan_error.is_none());
+    }
+
+    #[test]
+    fn new_scan_dialog_esc_cancels_and_clears_error() {
+        let mut app = app_with_target();
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('s'), &cancel);
+        app.new_scan_error = Some("boom".to_string());
+        app.handle_key(KeyCode::Esc, &cancel);
+        assert!(!app.new_scan_mode);
+        assert!(app.new_scan_error.is_none());
+        assert!(app.new_scan_requested.is_none());
+    }
+
+    #[test]
+    fn new_scan_dialog_consumes_overview_keys() {
+        let mut app = app_with_target();
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('s'), &cancel);
+        app.handle_key(KeyCode::Char('q'), &cancel);
+        assert!(!app.should_quit);
+        assert!(!cancel.load(Ordering::SeqCst));
+        assert_eq!(app.new_scan_target, "127.0.0.1q");
     }
 
     #[test]
