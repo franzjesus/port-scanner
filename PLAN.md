@@ -1768,9 +1768,9 @@ live progress gauge, and host-state colors so the screen reads at a glance.
   (error, empty, populated); `row_space` uses the inner height.
 - [x]18.4 Frame the diff view (`Diff`) in both branches (empty and content).
 - [x]18.5 `hosts_frame_title` filter-count title helper with unit tests.
-- [ ]18.6 One-line `Gauge` in the overview summary line while a scan is
+- [x]18.6 One-line `Gauge` in the overview summary line while a scan is
   active, driven by `App::scan_progress()`; unit tests.
-- [ ]18.7 Color host states (`UP` green, `DOWN` dark gray) in the host table
+- [x]18.7 Color host states (`UP` green, `DOWN` dark gray) in the host table
   and the network list.
 
 ## Verification
@@ -2016,7 +2016,7 @@ Implement in this order:
 - [x]Filtering.
 - [x]Cancellation.
 - [x]JSON export.
-- [ ]TUI visual polish.
+- [x]TUI visual polish.
 - [ ]Improve error handling.
 - [ ]Add tests and integration tests.
 - [x]Service detection.

@@ -26,8 +26,8 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Styled},
-    text::Line,
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
+    text::{Line, Span},
+    widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table},
     Frame, Terminal,
 };
 
@@ -257,6 +257,50 @@ impl App {
         } else {
             None
         }
+    }
+
+    /// Live scan progress for the overview gauge: a 0–1 ratio plus a label
+    /// describing the current phase.
+    ///
+    /// `Some` while a scan is active (`Starting`, `Discovering`, or
+    /// `ScanningPorts`), `None` in every other state so the summary line falls
+    /// back to its plain-text parts. The elapsed time is appended only when it
+    /// is known; before `ScanEvent::Started` it is not, which also keeps the
+    /// label deterministic for a given scan state.
+    pub fn scan_progress(&self) -> Option<(f64, String)> {
+        let (ratio, label) = match &self.scan {
+            ScanState::Starting => (0.0, "Starting…".to_owned()),
+            ScanState::Discovering { completed, total } => {
+                let ratio = if *total > 0 {
+                    *completed as f64 / *total as f64
+                } else {
+                    0.0
+                };
+                (
+                    ratio,
+                    format!("Discovering {completed}/{total} · {} up", self.up_count()),
+                )
+            }
+            ScanState::ScanningPorts => {
+                let total = self.ports_total();
+                let probed = self.ports_probed;
+                let ratio = if total > 0 {
+                    probed as f64 / total as f64
+                } else {
+                    0.0
+                };
+                (
+                    ratio,
+                    format!("Probing ports {probed}/{total} · {} up", self.up_count()),
+                )
+            }
+            _ => return None,
+        };
+        let label = match self.elapsed(Instant::now()) {
+            Some(elapsed) => format!("{label} · {}", format_duration(elapsed)),
+            None => label,
+        };
+        Some((ratio, label))
     }
 
     /// The host at the [`App::selected_host`] index, if a host is selected
@@ -1035,18 +1079,20 @@ fn draw_network_list(frame: &mut Frame, app: &App, area: Rect) {
             if selected {
                 selected_position = Some(lines.len());
             }
-            let style = if selected {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default()
-            };
-            let text = format!(
-                "  {}  {:<4}  {}",
-                host.ip,
-                host.state,
-                format_open_ports(&host.ports)
-            );
-            lines.push(Line::from(text).style(style));
+            // The state span carries the state color; a selected line is
+            // reversed as a whole, which composes with the span color.
+            let mut line = Line::from(vec![
+                Span::raw(format!("  {}", host.ip)),
+                Span::styled(
+                    format!("{:<4}", host.state),
+                    Style::default().fg(state_color(host.state)),
+                ),
+                Span::raw(format!("  {}", format_open_ports(&host.ports))),
+            ]);
+            if selected {
+                line = line.style(Modifier::REVERSED);
+            }
+            lines.push(line);
         }
     }
 
@@ -1088,36 +1134,44 @@ fn draw_overview(frame: &mut Frame, app: &App) {
     let status = Paragraph::new(app.scan.label()).alignment(Alignment::Right);
     frame.render_widget(status, title_chunks[1]);
 
-    // Summary line: host counts, live port progress, scan progress (only while
-    // scanning), and elapsed time (live while scanning, frozen afterwards).
-    let mut parts = vec![format!(
-        "Hosts: {} up / {} down",
-        app.up_count(),
-        app.down_count()
-    )];
-    if let Some(progress) = app.port_progress() {
-        parts.push(progress);
+    // Summary line: while a scan is active it is a live gauge (0–1 ratio plus
+    // a phase label that already carries the counts and elapsed time); in
+    // every other state it is plain text — host counts, port progress, and
+    // elapsed time (frozen after the scan ends), plus any
+    // error/warning/export/save status.
+    match app.scan_progress() {
+        Some((ratio, label)) => {
+            let gauge = Gauge::default().ratio(ratio).label(label);
+            frame.render_widget(gauge, chunks[1]);
+        }
+        None => {
+            let mut parts = vec![format!(
+                "Hosts: {} up / {} down",
+                app.up_count(),
+                app.down_count()
+            )];
+            if let Some(progress) = app.port_progress() {
+                parts.push(progress);
+            }
+            if let Some(elapsed) = app.elapsed(Instant::now()) {
+                parts.push(format!("Elapsed: {}", format_duration(elapsed)));
+            }
+            if let Some(err) = &app.scan_error {
+                parts.push(format!("Error: {err}"));
+            }
+            if let Some(warning) = &app.warning {
+                parts.push(format!("Warning: {warning}"));
+            }
+            if let Some(status) = &app.export_status {
+                parts.push(status.clone());
+            }
+            if let Some(status) = &app.save_status {
+                parts.push(status.clone());
+            }
+            let status_line = Paragraph::new(parts.join("  "));
+            frame.render_widget(status_line, chunks[1]);
+        }
     }
-    if let ScanState::Discovering { completed, total } = app.scan {
-        parts.push(format!("Progress: {completed}/{total}"));
-    }
-    if let Some(elapsed) = app.elapsed(Instant::now()) {
-        parts.push(format!("Elapsed: {}", format_duration(elapsed)));
-    }
-    if let Some(err) = &app.scan_error {
-        parts.push(format!("Error: {err}"));
-    }
-    if let Some(warning) = &app.warning {
-        parts.push(format!("Warning: {warning}"));
-    }
-    if let Some(status) = &app.export_status {
-        parts.push(status.clone());
-    }
-    if let Some(status) = &app.save_status {
-        parts.push(status.clone());
-    }
-    let status_line = Paragraph::new(parts.join("  "));
-    frame.render_widget(status_line, chunks[1]);
 
     if app.target.is_some() {
         if app.show_detail {
@@ -1418,6 +1472,15 @@ fn format_age(timestamp: u64, now: u64) -> String {
     }
 }
 
+/// The foreground color for a host's liveness state: up hosts stand out in
+/// green, down hosts are dimmed so they recede in the list.
+fn state_color(state: HostState) -> Color {
+    match state {
+        HostState::Up => Color::Green,
+        HostState::Down => Color::DarkGray,
+    }
+}
+
 fn host_table<'a>(app: &'a App, visible: &'a [usize], area: Rect) -> Table<'a> {
     let header = Row::new(vec!["", "IP", "STATE", "LATENCY", "OPEN PORTS"])
         .style(Style::default().add_modifier(Modifier::BOLD));
@@ -1445,16 +1508,16 @@ fn host_table<'a>(app: &'a App, visible: &'a [usize], area: Rect) -> Table<'a> {
             } else {
                 Style::default()
             };
-            let cells: Vec<Cell<'_>> = vec![
-                Cell::from(if selected { "▸ " } else { "  " }),
-                Cell::from(host.ip.to_string()),
-                Cell::from(host.state.to_string()),
-                Cell::from(format_latency(host.latency)),
-                Cell::from(format_open_ports(&host.ports)),
-            ]
-            .into_iter()
-            .map(|cell| cell.set_style(style))
-            .collect();
+            // The state cell gets the row style patched with the state color
+            // (not replaced) so a selected row keeps its reversed background.
+            let state_style = style.patch(state_color(host.state));
+            let cells = vec![
+                Cell::from(if selected { "▸ " } else { "  " }).set_style(style),
+                Cell::from(host.ip.to_string()).set_style(style),
+                Cell::from(host.state.to_string()).set_style(state_style),
+                Cell::from(format_latency(host.latency)).set_style(style),
+                Cell::from(format_open_ports(&host.ports)).set_style(style),
+            ];
             Row::new(cells)
         })
         .collect();
@@ -3385,5 +3448,98 @@ mod tests {
     #[test]
     fn hosts_frame_title_shows_match_count_with_a_filter() {
         assert_eq!(hosts_frame_title(Some(3), 42), "Hosts  3 of 42");
+    }
+
+    #[test]
+    fn scan_progress_is_none_when_idle() {
+        let app = App::default();
+        assert_eq!(app.scan_progress(), None);
+    }
+
+    #[test]
+    fn scan_progress_is_none_after_the_scan_finishes() {
+        for scan in [ScanState::Completed, ScanState::Cancelled, ScanState::Error] {
+            let app = App {
+                scan,
+                ..Default::default()
+            };
+            assert_eq!(app.scan_progress(), None);
+        }
+    }
+
+    #[test]
+    fn scan_progress_starts_at_zero_while_starting() {
+        let app = App {
+            scan: ScanState::Starting,
+            ..Default::default()
+        };
+        // No scan has started yet, so there is no elapsed time to report.
+        assert_eq!(app.scan_progress(), Some((0.0, "Starting…".to_owned())));
+    }
+
+    #[test]
+    fn scan_progress_reports_discovery_ratio_and_up_count() {
+        let app = App {
+            scan: ScanState::Discovering {
+                completed: 5,
+                total: 10,
+            },
+            hosts: vec![Host::up(
+                "10.0.0.1".parse().unwrap(),
+                Duration::from_millis(1),
+            )],
+            ..Default::default()
+        };
+        assert_eq!(
+            app.scan_progress(),
+            Some((0.5, "Discovering 5/10 · 1 up".to_owned()))
+        );
+    }
+
+    #[test]
+    fn scan_progress_discovery_keeps_ratio_zero_without_a_total() {
+        let app = App {
+            scan: ScanState::Discovering {
+                completed: 3,
+                total: 0,
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            app.scan_progress(),
+            Some((0.0, "Discovering 3/0 · 0 up".to_owned()))
+        );
+    }
+
+    #[test]
+    fn scan_progress_reports_port_probe_ratio() {
+        let app = App {
+            scan: ScanState::ScanningPorts,
+            ports_per_host: 4,
+            ports_probed: 2,
+            hosts: vec![Host::up(
+                "10.0.0.1".parse().unwrap(),
+                Duration::from_millis(1),
+            )],
+            ..Default::default()
+        };
+        assert_eq!(
+            app.scan_progress(),
+            Some((0.5, "Probing ports 2/4 · 1 up".to_owned()))
+        );
+    }
+
+    #[test]
+    fn scan_progress_port_ratio_is_zero_without_up_hosts() {
+        let app = App {
+            scan: ScanState::ScanningPorts,
+            ports_per_host: 4,
+            ports_probed: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            app.scan_progress(),
+            Some((0.0, "Probing ports 2/0 · 0 up".to_owned()))
+        );
     }
 }
