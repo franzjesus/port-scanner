@@ -1769,7 +1769,10 @@ live progress gauge, and host-state colors so the screen reads at a glance.
   `Discovering {completed}/{total} · {up} up`, and
   `Probing ports {probed}/{total} · {up} up`; ` · {elapsed}` is appended only
   when a start time is known. Idle and terminal states keep the existing
-  summary text.
+  summary text. The ratio is clamped to `[0, 1]` (a non-finite value becomes
+  `0`) before it reaches ratatui's `Gauge`, which asserts that range and
+  panics otherwise; a counting mismatch such as `ports_probed` running past
+  `ports_total` degrades the gauge instead of crashing (see 19.9).
 - **State colors:** `UP` is green and `DOWN` is dark gray in the host table
   (state cell styled via `style.patch(fg)` so selection REVERSED is not
   clobbered) and in the network list (per-host lines built from styled
@@ -1846,7 +1849,11 @@ scan without leaving the TUI.
   actually used.
 - **Target sync:** `start_scan` — the single scan-launch entry point — now
   sets `app.target` from the config, keeping the header, export, and history
-  in sync with the active scan (a no-op for rescans).
+  in sync with the active scan (a no-op for rescans). It also re-derives
+  `ports_per_host` from `config.ports.ports.len()`: the field was set once at
+  launch and went stale when a new scan chose a different port profile, so
+  `ports_total()` could fall below `ports_probed` and drive the gauge ratio
+  past 1 (19.9).
 - **No new dependencies.**
 
 ## Tasks
@@ -1885,6 +1892,15 @@ scan without leaving the TUI.
   `ratatui::buffer::Cell::EMPTY`; PTY smoke asserts the rows covered by each
   panel lose the table markers while rows outside the panel keep their `UP`
   state.
+- [ ]19.9 Guard the overview progress gauge against an out-of-range ratio:
+  `App::scan_progress()` clamps the computed ratio to `[0, 1]` (a non-finite
+  value becomes `0`) before it reaches ratatui's `Gauge`, which asserts the
+  range and panics otherwise. Root cause of the panic on a live `/23`:
+  `ports_per_host` was captured once at `App` construction and not re-derived
+  when a dialog-committed scan used a larger port profile, so `ports_probed`
+  could run past `ports_total`. `start_scan` now re-derives
+  `ports_per_host` from the config; regression tests cover the sync and both
+  clamps.
 
 ## Verification
 

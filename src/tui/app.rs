@@ -328,7 +328,7 @@ impl App {
     /// is known; before `ScanEvent::Started` it is not, which also keeps the
     /// label deterministic for a given scan state.
     pub fn scan_progress(&self) -> Option<(f64, String)> {
-        let (ratio, label) = match &self.scan {
+        let (raw_ratio, label) = match &self.scan {
             ScanState::Starting => (0.0, "Starting…".to_owned()),
             ScanState::Discovering { completed, total } => {
                 let ratio = if *total > 0 {
@@ -355,6 +355,16 @@ impl App {
                 )
             }
             _ => return None,
+        };
+        // The overview gauge requires a ratio in [0, 1]; ratatui's `Gauge`
+        // panics otherwise. Clamp any out-of-range value (for example
+        // `ports_probed` running past `ports_total`, or `completed` running
+        // past `total`) and fall back to 0 for a non-finite one, so a counting
+        // mismatch can never panic the render.
+        let ratio = if raw_ratio.is_finite() {
+            raw_ratio.clamp(0.0, 1.0)
+        } else {
+            0.0
         };
         let label = match self.elapsed(Instant::now()) {
             Some(elapsed) => format!("{label} · {}", format_duration(elapsed)),
@@ -1055,7 +1065,10 @@ impl App {
     /// the loaded-record flag, re-raises the cancellation flag to a clean
     /// slate, and points the displayed target at the configuration that is
     /// now in flight (a new scan may target a different address than the one
-    /// the TUI was launched with).
+    /// the TUI was launched with). The per-host port count is also re-derived
+    /// from the configuration so the live progress display stays accurate when
+    /// a new scan uses a different port profile than the one the TUI was
+    /// launched with.
     fn start_scan(
         &mut self,
         config: &ScanConfig,
@@ -1071,6 +1084,10 @@ impl App {
         self.export_status = None;
         self.save_status = None;
         self.ports_probed = 0;
+        // Re-derive the per-host port count from the configuration actually
+        // being scanned; it can differ from the launch-time value when a new
+        // scan is committed with a different port profile.
+        self.ports_per_host = config.ports.ports.len();
         self.started_at = None;
         self.scan_duration = None;
         self.loaded_record = false;
@@ -2277,6 +2294,23 @@ mod tests {
             app.target.as_ref().map(|t| t.to_string()),
             Some("10.0.0.0/28".to_owned())
         );
+    }
+
+    #[test]
+    fn start_scan_syncs_ports_per_host_from_config() {
+        let mut app = App {
+            ports_per_host: 999, // a stale launch-time value
+            ..Default::default()
+        };
+        let mut config = ScanConfig::new(ScanTarget::parse("10.0.0.0/28").unwrap());
+        config.ports.ports = PortProfile::Full.ports();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let spawner: ScanSpawner = Box::new(|_config, _tx, _cancel| {});
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        app.start_scan(&config, &spawner, &tx, &cancel);
+
+        assert_eq!(app.ports_per_host, config.ports.ports.len());
     }
 
     #[test]
@@ -4491,6 +4525,41 @@ mod tests {
         assert_eq!(
             app.scan_progress(),
             Some((0.0, "Probing ports 2/0 · 0 up".to_owned()))
+        );
+    }
+
+    #[test]
+    fn scan_progress_clamps_port_ratio_when_probed_exceeds_total() {
+        let app = App {
+            scan: ScanState::ScanningPorts,
+            ports_per_host: 4,
+            ports_probed: 10,
+            hosts: vec![Host::up(
+                "10.0.0.1".parse().unwrap(),
+                Duration::from_millis(1),
+            )],
+            ..Default::default()
+        };
+        // The raw ratio (10/4) exceeds 1; the gauge must never see a value > 1.
+        assert_eq!(
+            app.scan_progress(),
+            Some((1.0, "Probing ports 10/4 · 1 up".to_owned()))
+        );
+    }
+
+    #[test]
+    fn scan_progress_clamps_discovery_ratio_when_completed_exceeds_total() {
+        let app = App {
+            scan: ScanState::Discovering {
+                completed: 12,
+                total: 5,
+            },
+            ..Default::default()
+        };
+        // The raw ratio (12/5) exceeds 1; the gauge must never see a value > 1.
+        assert_eq!(
+            app.scan_progress(),
+            Some((1.0, "Discovering 12/5 · 0 up".to_owned()))
         );
     }
 }
