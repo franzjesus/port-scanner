@@ -1191,7 +1191,8 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io
 }
 
 /// Draw the top-level view: the overview, the saved-scan history, the scan
-/// diff (Phase 15), or the network view (Phase 16).
+/// diff (Phase 15), or the network view (Phase 16). The help overlay and the
+/// new-scan dialog (Phase 19) render on top of the active view.
 fn draw(frame: &mut Frame, app: &App) {
     match app.view {
         View::Overview => draw_overview(frame, app),
@@ -1202,6 +1203,10 @@ fn draw(frame: &mut Frame, app: &App) {
 
     if app.show_help {
         draw_help_overlay(frame);
+    }
+
+    if app.new_scan_mode {
+        draw_new_scan_dialog(frame, app);
     }
 }
 
@@ -1408,7 +1413,7 @@ fn draw_overview(frame: &mut Frame, app: &App) {
     } else if let Some(filter) = app.filter.as_deref() {
         format!("Filter: {filter}  / Edit  Esc Clear  ? Help  q Quit")
     } else {
-        "↑/k Up  ↓/j Down  Enter Detail  / Filter  e Export  h History  n Network  ? Help  c Cancel  q Quit"
+        "↑/k Up  ↓/j Down  Enter Detail  / Filter  e Export  h History  n Network  s New Scan  ? Help  c Cancel  q Quit"
             .to_string()
     };
     frame.render_widget(Paragraph::new(hint), chunks[3]);
@@ -1819,7 +1824,7 @@ fn hosts_frame_title(shown: Option<usize>, total: usize) -> String {
 fn draw_help_overlay(frame: &mut Frame) {
     let area = frame.area();
     let width = 26u16.min(area.width);
-    let height = 12u16.min(area.height);
+    let height = 13u16.min(area.height);
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let overlay_area = Rect {
@@ -1838,6 +1843,7 @@ fn draw_help_overlay(frame: &mut Frame) {
         "  n      Network",
         "  ?      Help",
         "  r      Rescan",
+        "  s      New Scan",
         "  c      Cancel",
         "  q      Quit",
     ];
@@ -1846,6 +1852,89 @@ fn draw_help_overlay(frame: &mut Frame) {
         .alignment(Alignment::Center);
     frame.render_widget(content, block.inner(overlay_area));
     frame.render_widget(block, overlay_area);
+}
+
+/// The display name of a discovery strategy in the new-scan dialog (Phase 19).
+fn discovery_name(discovery: Discovery) -> &'static str {
+    match discovery {
+        Discovery::Auto => "Auto",
+        Discovery::Icmp => "ICMP",
+        Discovery::Tcp => "TCP",
+    }
+}
+
+/// The display name of a port profile in the new-scan dialog (Phase 19).
+fn profile_name(profile: PortProfile) -> &'static str {
+    match profile {
+        PortProfile::Quick => "Quick",
+        PortProfile::Common => "Common",
+        PortProfile::Full => "Full",
+    }
+}
+
+/// Draw the new-scan dialog (Phase 19) as a centered bordered panel on top
+/// of the current view.
+///
+/// The dialog lists its three fields — target, discovery strategy, and port
+/// profile — one per line, with the focused field's label in bold. An empty
+/// target shows a dim placeholder, two hint lines document the dialog keys,
+/// and the target parse error raised by `Enter` is shown in red.
+fn draw_new_scan_dialog(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let width = 40u16.min(area.width);
+    let inner_height = 6u16 + if app.new_scan_error.is_some() { 1 } else { 0 };
+    let height = inner_height.saturating_add(2).min(area.height);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let dialog_area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    let label = |focused: bool, name: &str| {
+        let style = if focused {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        Span::styled(format!("{name:<9}"), style)
+    };
+    let target_value = if app.new_scan_target.is_empty() {
+        Span::styled("IPv4 address or CIDR", Style::default().fg(Color::DarkGray))
+    } else {
+        Span::raw(app.new_scan_target.clone())
+    };
+
+    let mut lines = vec![
+        Line::from(vec![
+            label(app.new_scan_focus == NewScanField::Target, "Target"),
+            target_value,
+        ]),
+        Line::from(vec![
+            label(app.new_scan_focus == NewScanField::Strategy, "Strategy"),
+            Span::raw(discovery_name(app.new_scan_discovery)),
+        ]),
+        Line::from(vec![
+            label(app.new_scan_focus == NewScanField::Profile, "Profile"),
+            Span::raw(profile_name(app.new_scan_profile)),
+        ]),
+        Line::raw(""),
+        Line::raw(" Tab Field   ←/→ Choose"),
+        Line::raw(" Enter Start  Esc Cancel"),
+    ];
+    if let Some(error) = &app.new_scan_error {
+        lines.push(Line::from(Span::styled(
+            error.clone(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    let block = Block::default().borders(Borders::ALL).title("New Scan");
+    let content = Paragraph::new(lines);
+    frame.render_widget(content, block.inner(dialog_area));
+    frame.render_widget(block, dialog_area);
 }
 
 /// Draw the detail screen for the selected host.
@@ -2450,6 +2539,54 @@ mod tests {
         assert!(!app.should_quit);
         assert!(!cancel.load(Ordering::SeqCst));
         assert_eq!(app.new_scan_target, "127.0.0.1q");
+    }
+
+    /// Render the app into an in-memory buffer and return its text content.
+    fn render_app_text(app: &App, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test backend");
+        let frame = terminal
+            .draw(|frame| draw(frame, app))
+            .expect("draw into test backend");
+        frame
+            .buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn new_scan_dialog_renders_fields() {
+        let mut app = app_with_target();
+        app.open_new_scan();
+        let text = render_app_text(&app, 80, 24);
+        assert!(text.contains("New Scan"));
+        assert!(text.contains("Target"));
+        assert!(text.contains("127.0.0.1"));
+        assert!(text.contains("Strategy"));
+        assert!(text.contains("Auto"));
+        assert!(text.contains("Profile"));
+        assert!(text.contains("Quick"));
+        assert!(text.contains("Enter Start"));
+        assert!(text.contains("Esc Cancel"));
+    }
+
+    #[test]
+    fn new_scan_dialog_shows_placeholder_for_empty_target() {
+        let mut app = App::default();
+        app.open_new_scan();
+        let text = render_app_text(&app, 80, 24);
+        assert!(text.contains("IPv4 address or CIDR"));
+    }
+
+    #[test]
+    fn new_scan_dialog_renders_error_line() {
+        let mut app = app_with_target();
+        app.open_new_scan();
+        app.new_scan_error = Some("not a target".to_string());
+        let text = render_app_text(&app, 80, 24);
+        assert!(text.contains("not a target"));
     }
 
     #[test]
