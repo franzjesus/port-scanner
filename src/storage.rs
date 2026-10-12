@@ -938,8 +938,12 @@ mod tests {
     fn to_hosts_round_trip_preserves_host_fields() {
         let original = host_with_ports();
         let config = test_config();
-        let record =
-            ScanRecord::from_scan(&config.target, &[original.clone()], &config, 1_700_000_000);
+        let record = ScanRecord::from_scan(
+            &config.target,
+            std::slice::from_ref(&original),
+            &config,
+            1_700_000_000,
+        );
         let hosts = record.to_hosts().expect("convert");
         assert_eq!(hosts.len(), 1);
         let host = &hosts[0];

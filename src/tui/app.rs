@@ -2281,8 +2281,10 @@ mod tests {
 
     #[test]
     fn start_scan_points_displayed_target_at_active_config() {
-        let mut app = App::default();
-        app.target = Some(ScanTarget::parse("127.0.0.1").unwrap());
+        let mut app = App {
+            target: Some(ScanTarget::parse("127.0.0.1").unwrap()),
+            ..Default::default()
+        };
         let config = ScanConfig::new(ScanTarget::parse("10.0.0.0/28").unwrap());
         let (tx, _rx) = std::sync::mpsc::channel();
         let spawner: ScanSpawner = Box::new(|_config, _tx, _cancel| {});
