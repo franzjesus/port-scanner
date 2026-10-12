@@ -1853,16 +1853,32 @@ scan without leaving the TUI.
   (build config, `start_scan`, replace `current_config`, `persisted = false`);
   `start_scan` syncs `app.target`; unit tests.
 - [x]19.7 End-to-end PTY smoke and this PLAN.md section.
+- [x]19.8 Opaque modal backgrounds. ratatui 0.29's `Terminal::draw`
+  alternates two frame buffers, so a modal frame reuses the slot that held
+  the overview from two frames earlier; cells the modal never writes (the
+  dialog's empty line, the centered key-line margins of the help overlay)
+  kept the stale overview content and the diff engine never re-emitted them —
+  the host table showed through the panel interiors. `draw_new_scan_dialog`
+  and `draw_help_overlay` now render `Clear` over their rectangle before the
+  block and content. Regression: multi-frame draw on a persistent
+  `TestBackend` terminal asserting the stale cells become
+  `ratatui::buffer::Cell::EMPTY`; PTY smoke asserts the rows covered by each
+  panel lose the table markers while rows outside the panel keep their `UP`
+  state.
 
 ## Verification
 
 - Full gate: `cargo fmt --check`, `cargo check`, `cargo test`,
-  `cargo clippy` clean (350 tests).
+  `cargo clippy` clean (351 tests).
 - PTY smoke: initial scan completes and saves; `s` opens the dialog prefilled
   with the launch target; backspacing clears the field to the placeholder;
   typing a new target updates it; `Enter` closes the dialog and starts a scan
   against the new target (header updates), which completes and saves again;
   `q` exits.
+- Modal opacity: after a completed scan, opening the new-scan dialog and the
+  help overlay erases the host-table cells their rectangles cover (rows
+  outside the panels keep their `UP` markers); verified by the multi-frame
+  unit test and a second PTY smoke against a populated loopback table.
 
 ---
 

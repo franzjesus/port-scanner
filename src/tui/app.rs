@@ -27,7 +27,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Styled},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table},
     Frame, Terminal,
 };
 
@@ -1838,6 +1838,10 @@ fn hosts_frame_title(shown: Option<usize>, total: usize) -> String {
 }
 
 /// Draw the static key-binding help overlay, centered over the whole screen.
+///
+/// The overlay's rectangle is cleared first: ratatui reuses its frame
+/// buffers, so any cell the overlay does not write would otherwise keep the
+/// stale content of the view behind it, making the panel look transparent.
 fn draw_help_overlay(frame: &mut Frame) {
     let area = frame.area();
     let width = 26u16.min(area.width);
@@ -1867,6 +1871,7 @@ fn draw_help_overlay(frame: &mut Frame) {
     let block = Block::default().borders(Borders::ALL).title("Keys");
     let content = Paragraph::new(keys.iter().map(|key| Line::from(*key)).collect::<Vec<_>>())
         .alignment(Alignment::Center);
+    frame.render_widget(Clear, overlay_area);
     frame.render_widget(content, block.inner(overlay_area));
     frame.render_widget(block, overlay_area);
 }
@@ -1950,6 +1955,7 @@ fn draw_new_scan_dialog(frame: &mut Frame, app: &App) {
 
     let block = Block::default().borders(Borders::ALL).title("New Scan");
     let content = Paragraph::new(lines);
+    frame.render_widget(Clear, dialog_area);
     frame.render_widget(content, block.inner(dialog_area));
     frame.render_widget(block, dialog_area);
 }
@@ -2621,6 +2627,79 @@ mod tests {
         app.new_scan_error = Some("not a target".to_string());
         let text = render_app_text(&app, 80, 24);
         assert!(text.contains("not a target"));
+    }
+
+    #[test]
+    fn modals_clear_the_stale_content_behind_them() {
+        // Regression test: ratatui reuses two alternating frame buffers, so
+        // cells that a frame's widgets never write keep the stale content of
+        // the frame two renders back. A modal opening over an unchanged
+        // screen must therefore clear its rectangle first, otherwise the
+        // host table behind it would show through the panel.
+        let mut app = app_with_target();
+        // 15 up hosts so the host table has rows behind the modal interiors
+        // (data rows start at y=4).
+        for i in 1..=15u8 {
+            app.hosts.push(Host::up(
+                Ipv4Addr::new(10, 0, 0, i),
+                Duration::from_millis(1),
+            ));
+        }
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("test backend");
+
+        // Draw the overview twice so the buffer slot the next frame reuses
+        // already holds overview content.
+        let _ = terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("first frame");
+        let overview = terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("second frame");
+
+        // The new-scan dialog (no error) is a 40x8 panel at x:20..=59,
+        // y:8..=15; its fourth paragraph line is empty and renders at y=12,
+        // where row 9 of the host table shows the latency "1.0 ms" at
+        // x:32..=37. The help overlay (26x13 at x:27..=52, y:5..=17)
+        // center-aligns its key lines, so its first line only spans
+        // x:34..=44 and the cell at x=32, y=6 (the latency "1.0 ms" of
+        // table row 3) is never written by the paragraph. Verify both cells
+        // really hold stale table content before drawing the modals.
+        assert_ne!(
+            overview
+                .buffer
+                .cell((33, 12))
+                .expect("overview cell exists")
+                .symbol(),
+            " "
+        );
+        assert_ne!(
+            overview
+                .buffer
+                .cell((32, 6))
+                .expect("overview cell exists")
+                .symbol(),
+            " "
+        );
+
+        app.open_new_scan();
+        let dialog = terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("dialog frame");
+        assert_eq!(
+            dialog.buffer.cell((33, 12)),
+            Some(&ratatui::buffer::Cell::EMPTY)
+        );
+
+        app.new_scan_mode = false;
+        app.show_help = true;
+        let help = terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("help frame");
+        assert_eq!(
+            help.buffer.cell((32, 6)),
+            Some(&ratatui::buffer::Cell::EMPTY)
+        );
     }
 
     #[test]
