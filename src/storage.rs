@@ -12,6 +12,7 @@
 //! This module performs file I/O but no network I/O, and it has no dependency
 //! on the TUI.
 
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -28,6 +29,64 @@ pub const CURRENT_VERSION: u32 = 1;
 
 /// Directory (relative to the XDG data root) that holds scan records.
 const RECORD_DIR: &str = "port-scanner";
+
+/// A failure while reading from or writing to saved-scan storage.
+///
+/// Each variant carries enough context to be reported to the user without a
+/// stack trace: the file involved (where known) and the underlying cause.
+#[derive(Debug)]
+pub enum StorageError {
+    /// The data directory could not be resolved from the environment.
+    DataDir {
+        /// What was missing or wrong in the environment.
+        message: String,
+    },
+    /// A file operation on a record failed.
+    Io {
+        /// The file being read or written, if known.
+        path: Option<PathBuf>,
+        source: io::Error,
+    },
+    /// The record could not be serialized.
+    Serialize { source: serde_json::Error },
+    /// A stored record could not be parsed.
+    Parse {
+        /// The file that was read.
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+}
+
+impl fmt::Display for StorageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StorageError::DataDir { message } => {
+                write!(f, "Data directory could not be determined: {message}")
+            }
+            StorageError::Io { path, source } => match path {
+                Some(path) => write!(f, "I/O error for {}: {source}", path.display()),
+                None => write!(f, "I/O error: {source}"),
+            },
+            StorageError::Serialize { source } => {
+                write!(f, "Failed to serialize the scan record: {source}")
+            }
+            StorageError::Parse { path, source } => {
+                write!(f, "Failed to parse {}: {source}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for StorageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            StorageError::DataDir { .. } => None,
+            StorageError::Io { source, .. } => Some(source),
+            StorageError::Serialize { source } => Some(source),
+            StorageError::Parse { source, .. } => Some(source),
+        }
+    }
+}
 
 /// A stored scan: everything the TUI knows after a completed run.
 ///
@@ -211,29 +270,28 @@ impl RecordService {
 /// Taking the values as parameters keeps the precedence logic pure and testable
 /// without mutating the process environment; [`data_dir`] is the thin wrapper
 /// that reads the real environment.
-pub fn resolve_data_dir(xdg: Option<&str>, home: Option<&str>) -> io::Result<PathBuf> {
+pub fn resolve_data_dir(xdg: Option<&str>, home: Option<&str>) -> Result<PathBuf, StorageError> {
     match xdg {
         Some(dir) if !dir.is_empty() => {
             let path = Path::new(dir);
             if path.is_absolute() {
                 Ok(path.join(RECORD_DIR))
             } else {
-                Err(invalid_data_dir(format!(
-                    "XDG_DATA_HOME is set to the relative path {dir:?}; it must be absolute"
-                )))
+                Err(StorageError::DataDir {
+                    message: format!(
+                        "XDG_DATA_HOME is set to the relative path {dir:?}; it must be absolute"
+                    ),
+                })
             }
         }
         _ => match home {
             Some(home) => Ok(Path::new(home).join(".local/share").join(RECORD_DIR)),
-            None => Err(invalid_data_dir(
-                "neither XDG_DATA_HOME nor HOME is set; cannot locate the data directory",
-            )),
+            None => Err(StorageError::DataDir {
+                message: "neither XDG_DATA_HOME nor HOME is set; cannot locate the data directory"
+                    .to_owned(),
+            }),
         },
     }
-}
-
-fn invalid_data_dir(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
 /// The data directory for scan records, creating it on demand.
@@ -241,11 +299,14 @@ fn invalid_data_dir(message: impl Into<String>) -> io::Error {
 /// Reads `XDG_DATA_HOME` and `HOME` from the process environment. A variable
 /// that is set but not valid UTF-8 is treated as unset (falling back to `HOME`
 /// when `XDG_DATA_HOME` is affected).
-pub fn data_dir() -> io::Result<PathBuf> {
+pub fn data_dir() -> Result<PathBuf, StorageError> {
     let xdg = env_str("XDG_DATA_HOME");
     let home = env_str("HOME");
     let dir = resolve_data_dir(xdg.as_deref(), home.as_deref())?;
-    fs::create_dir_all(&dir)?;
+    fs::create_dir_all(&dir).map_err(|source| StorageError::Io {
+        path: Some(dir.clone()),
+        source,
+    })?;
     Ok(dir)
 }
 
@@ -286,10 +347,10 @@ pub fn record_path(dir: &Path, record: &ScanRecord) -> PathBuf {
 /// Returns [`record_path`] while it is free, otherwise the first free suffixed
 /// name `<stem>-<n>.json` (starting at `n = 2`), so two scans that complete in
 /// the same second for the same target never overwrite each other.
-pub fn next_record_path(dir: &Path, record: &ScanRecord) -> io::Result<PathBuf> {
+pub fn next_record_path(dir: &Path, record: &ScanRecord) -> PathBuf {
     let base = record_path(dir, record);
     if !base.exists() {
-        return Ok(base);
+        return base;
     }
     let stem = base
         .file_stem()
@@ -303,25 +364,38 @@ pub fn next_record_path(dir: &Path, record: &ScanRecord) -> io::Result<PathBuf> 
     loop {
         let candidate = dir.join(format!("{stem}-{suffix}.{extension}"));
         if !candidate.exists() {
-            return Ok(candidate);
+            return candidate;
         }
         suffix += 1;
     }
 }
 
 /// Write a record to disk as pretty JSON, returning the path it was written to.
-pub fn save(dir: &Path, record: &ScanRecord) -> io::Result<PathBuf> {
-    fs::create_dir_all(dir)?;
-    let path = next_record_path(dir, record)?;
-    let json = serde_json::to_string_pretty(record).map_err(io::Error::other)?;
-    fs::write(&path, json)?;
+pub fn save(dir: &Path, record: &ScanRecord) -> Result<PathBuf, StorageError> {
+    fs::create_dir_all(dir).map_err(|source| StorageError::Io {
+        path: Some(dir.to_path_buf()),
+        source,
+    })?;
+    let path = next_record_path(dir, record);
+    let json = serde_json::to_string_pretty(record)
+        .map_err(|source| StorageError::Serialize { source })?;
+    fs::write(&path, json).map_err(|source| StorageError::Io {
+        path: Some(path.clone()),
+        source,
+    })?;
     Ok(path)
 }
 
 /// Read a record from disk, validating it as JSON.
-pub fn load(path: &Path) -> io::Result<ScanRecord> {
-    let bytes = fs::read(path)?;
-    serde_json::from_slice(&bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+pub fn load(path: &Path) -> Result<ScanRecord, StorageError> {
+    let bytes = fs::read(path).map_err(|source| StorageError::Io {
+        path: Some(path.to_path_buf()),
+        source,
+    })?;
+    serde_json::from_slice(&bytes).map_err(|source| StorageError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 /// A saved scan's summary, enough for the history view to display it without
@@ -345,11 +419,16 @@ pub struct RecordSummary {
 /// A missing directory is not an error and yields an empty list. Files that
 /// are not `.json` or that fail to load are skipped rather than surfaced as
 /// errors, so one corrupt record never hides the rest of the history.
-pub fn list_records(dir: &Path) -> io::Result<Vec<RecordSummary>> {
+pub fn list_records(dir: &Path) -> Result<Vec<RecordSummary>, StorageError> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err),
+        Err(err) => {
+            return Err(StorageError::Io {
+                path: Some(dir.to_path_buf()),
+                source: err,
+            })
+        }
     };
 
     let mut summaries = Vec::new();
@@ -402,7 +481,11 @@ fn now_unix_secs() -> u64 {
 
 /// Convenience wrapper used by the TUI: resolve the data directory, build the
 /// record for the finished scan, and persist it. Returns the written path.
-pub fn save_scan(target: &ScanTarget, hosts: &[Host], config: &ScanConfig) -> io::Result<PathBuf> {
+pub fn save_scan(
+    target: &ScanTarget,
+    hosts: &[Host],
+    config: &ScanConfig,
+) -> Result<PathBuf, StorageError> {
     let record = ScanRecord::from_scan(target, hosts, config, now_unix_secs());
     let dir = data_dir()?;
     save(&dir, &record)
@@ -558,14 +641,14 @@ mod tests {
         let record = ScanRecord::from_scan(&config.target, &[], &config, 42);
         let first = record_path(&dir, &record);
         fs::write(&first, "{}").expect("seed collision");
-        let next = next_record_path(&dir, &record).expect("next path");
+        let next = next_record_path(&dir, &record);
         assert_eq!(
             next.file_name().and_then(|s| s.to_str()),
             Some("42_192.168.1.0_24-2.json")
         );
         // A second collision bumps to the next suffix.
         fs::write(&next, "{}").expect("seed second collision");
-        let next2 = next_record_path(&dir, &record).expect("next path");
+        let next2 = next_record_path(&dir, &record);
         assert_eq!(
             next2.file_name().and_then(|s| s.to_str()),
             Some("42_192.168.1.0_24-3.json")
@@ -577,7 +660,13 @@ mod tests {
     fn load_missing_file_errors() {
         let dir = temp_dir("missing");
         let err = load(&dir.join("nope.json")).expect_err("missing file");
-        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(matches!(
+            err,
+            StorageError::Io {
+                ref source,
+                ..
+            } if source.kind() == io::ErrorKind::NotFound
+        ));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -587,7 +676,7 @@ mod tests {
         let path = dir.join("bad.json");
         fs::write(&path, "this is not json").expect("write");
         let err = load(&path).expect_err("invalid json");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(err, StorageError::Parse { .. }));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -684,13 +773,13 @@ mod tests {
     #[test]
     fn resolve_data_dir_rejects_relative_xdg() {
         let err = resolve_data_dir(Some("relative"), Some("/home/u")).expect_err("relative");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(matches!(err, StorageError::DataDir { .. }));
     }
 
     #[test]
     fn resolve_data_dir_requires_home_when_no_xdg() {
         let err = resolve_data_dir(None, None).expect_err("no home");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(matches!(err, StorageError::DataDir { .. }));
     }
 
     #[test]

@@ -10,6 +10,7 @@
 //! is free, otherwise a numeric suffix is incremented
 //! (`port-scanner-export-2.json`, `port-scanner-export-3.json`, ...).
 
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -23,6 +24,44 @@ use crate::target::ScanTarget;
 /// Base file name for exports, chosen without a clock or timezone so the name
 /// is deterministic.
 pub const EXPORT_BASE_NAME: &str = "port-scanner-export.json";
+
+/// A failure while writing an export file.
+///
+/// Each variant carries enough context to be reported to the user without a
+/// stack trace: the file involved and the underlying cause.
+#[derive(Debug)]
+pub enum ExportError {
+    /// The export document could not be serialized to JSON.
+    Serialize { source: serde_json::Error },
+    /// Writing the export file failed.
+    Io {
+        /// The file that could not be written.
+        path: PathBuf,
+        source: io::Error,
+    },
+}
+
+impl fmt::Display for ExportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExportError::Serialize { source } => {
+                write!(f, "Failed to serialize the export document: {source}")
+            }
+            ExportError::Io { path, source } => {
+                write!(f, "I/O error for {}: {source}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for ExportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ExportError::Serialize { source } => Some(source),
+            ExportError::Io { source, .. } => Some(source),
+        }
+    }
+}
 
 /// The exported scan results document.
 ///
@@ -118,10 +157,10 @@ impl ExportHost {
 /// Returns [`EXPORT_BASE_NAME`] while it is free, otherwise the first free
 /// suffixed name `port-scanner-export-N.json` (starting at `N = 2`), so an
 /// export never overwrites an earlier one.
-fn next_export_path(dir: &Path) -> io::Result<PathBuf> {
+fn next_export_path(dir: &Path) -> PathBuf {
     let base = dir.join(EXPORT_BASE_NAME);
     if !base.exists() {
-        return Ok(base);
+        return base;
     }
     let stem = base
         .file_stem()
@@ -135,32 +174,35 @@ fn next_export_path(dir: &Path) -> io::Result<PathBuf> {
     loop {
         let candidate = dir.join(format!("{stem}-{suffix}.{extension}"));
         if !candidate.exists() {
-            return Ok(candidate);
+            return candidate;
         }
         suffix += 1;
     }
 }
 
 /// Serialize the given scan state to the JSON export format.
-fn render(target: &ScanTarget, hosts: &[Host]) -> io::Result<String> {
+fn render(target: &ScanTarget, hosts: &[Host]) -> Result<String, ExportError> {
     let document = ExportDocument::from_scan(target, hosts);
-    Ok(serde_json::to_string_pretty(&document)?)
+    serde_json::to_string_pretty(&document).map_err(|source| ExportError::Serialize { source })
 }
 
 /// Export the scan state to a JSON file in `dir`, returning the path written.
 ///
 /// The file name is chosen by [`next_export_path`], so existing exports in
 /// `dir` are never overwritten.
-pub fn export_to(dir: &Path, target: &ScanTarget, hosts: &[Host]) -> io::Result<PathBuf> {
-    let path = next_export_path(dir)?;
+pub fn export_to(dir: &Path, target: &ScanTarget, hosts: &[Host]) -> Result<PathBuf, ExportError> {
+    let path = next_export_path(dir);
     let json = render(target, hosts)?;
-    fs::write(&path, json)?;
+    fs::write(&path, json).map_err(|source| ExportError::Io {
+        path: path.clone(),
+        source,
+    })?;
     Ok(path)
 }
 
 /// Export the scan state to a JSON file in the current directory, returning
 /// the path written.
-pub fn export(target: &ScanTarget, hosts: &[Host]) -> io::Result<PathBuf> {
+pub fn export(target: &ScanTarget, hosts: &[Host]) -> Result<PathBuf, ExportError> {
     export_to(Path::new("."), target, hosts)
 }
 
@@ -313,20 +355,17 @@ mod tests {
     #[test]
     fn next_export_path_increments_suffix_on_collision() {
         let dir = temp_dir("suffix");
-        assert_eq!(
-            next_export_path(&dir).expect("path"),
-            dir.join(EXPORT_BASE_NAME)
-        );
+        assert_eq!(next_export_path(&dir), dir.join(EXPORT_BASE_NAME));
 
         fs::write(dir.join(EXPORT_BASE_NAME), "{}").expect("seed base name");
         assert_eq!(
-            next_export_path(&dir).expect("path"),
+            next_export_path(&dir),
             dir.join("port-scanner-export-2.json")
         );
 
         fs::write(dir.join("port-scanner-export-2.json"), "{}").expect("seed suffix 2");
         assert_eq!(
-            next_export_path(&dir).expect("path"),
+            next_export_path(&dir),
             dir.join("port-scanner-export-3.json")
         );
 
