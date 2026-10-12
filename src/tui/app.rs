@@ -900,7 +900,7 @@ pub fn run(
     let result = run_loop(
         &mut terminal,
         &mut app,
-        config.as_ref(),
+        config,
         &spawner,
         &master_tx,
         &events,
@@ -917,17 +917,21 @@ pub fn run(
     }
 }
 
+/// The event loop owns the configuration of the scan currently in flight as
+/// `current_config`. Launching a scan and persisting its results both read it,
+/// so a scan started with a changed configuration (e.g. a later new-scan
+/// request) is also persisted with the configuration that was actually used.
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
-    config: Option<&ScanConfig>,
+    current_config: Option<ScanConfig>,
     spawner: &ScanSpawner,
     master_tx: &Sender<ScanEvent>,
     events: &Receiver<ScanEvent>,
     cancel: &Arc<AtomicBool>,
 ) -> io::Result<()> {
     // Launch the first scan if a target and its configuration are present.
-    if let Some(config) = config {
+    if let Some(config) = current_config.as_ref() {
         app.start_scan(config, spawner, master_tx, cancel);
     }
     // Whether the current scan has already been persisted (Phase 14). Reset
@@ -948,7 +952,7 @@ fn run_loop(
         // [`App::apply_event`].
         if !persisted && matches!(app.scan, ScanState::Completed) {
             persisted = true;
-            if let Some(config) = config {
+            if let Some(config) = current_config.as_ref() {
                 match crate::storage::save_scan(&config.target, &app.hosts, config) {
                     Ok(path) => app.save_status = Some(format!("Saved {}", path.display())),
                     Err(err) => app.save_status = Some(format!("Save failed: {err}")),
@@ -975,7 +979,7 @@ fn run_loop(
         // simply discarded.
         if app.rescan_requested {
             app.rescan_requested = false;
-            if let Some(config) = config {
+            if let Some(config) = current_config.as_ref() {
                 app.start_scan(config, spawner, master_tx, cancel);
                 persisted = false;
             }
