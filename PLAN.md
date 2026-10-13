@@ -786,6 +786,11 @@ Follow normal terminal/TUI conventions where possible.
   selection, the first `↓` selects the first host and the first `↑` selects the
   last. An existing selection steps by one, clamped at both ends; a stale
   out-of-range index is first clamped into range.
+- **The help overlay's box height must track its key rows:** when 7.8 grew the
+  key list to 13 rows, the 14-tall box (12 inner rows) clipped the last row
+  (`q Quit`). The height was raised to 15 and a render test
+  (`help_overlay_renders_all_key_rows_without_clipping`) asserts every key row
+  is visible.
 - **Elapsed time is testable:** `App::elapsed(now)` takes the reference instant as
   a parameter. While a scan runs it is `now - started_at`; after a terminal state
   the frozen total (`scan_duration`) is returned regardless of `now`, so a

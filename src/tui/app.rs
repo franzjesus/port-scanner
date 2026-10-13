@@ -1960,7 +1960,7 @@ fn hosts_frame_title(shown: Option<usize>, total: usize) -> String {
 fn draw_help_overlay(frame: &mut Frame) {
     let area = frame.area();
     let width = 26u16.min(area.width);
-    let height = 14u16.min(area.height);
+    let height = 15u16.min(area.height);
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let overlay_area = Rect {
@@ -2813,7 +2813,7 @@ mod tests {
         // The new-scan dialog (no error) is a 40x8 panel at x:20..=59,
         // y:8..=15; its fourth paragraph line is empty and renders at y=12,
         // where row 9 of the host table shows the latency "1.0 ms" at
-        // x:32..=37. The help overlay (26x13 at x:27..=52, y:5..=17)
+        // x:32..=37. The help overlay (26x15 at x:27..=52, y:4..=18)
         // center-aligns its key lines, so its first line only spans
         // x:34..=44 and the cell at x=32, y=6 (the latency "1.0 ms" of
         // table row 3) is never written by the paragraph. Verify both cells
@@ -2853,6 +2853,32 @@ mod tests {
             help.buffer.cell((32, 6)),
             Some(&ratatui::buffer::Cell::EMPTY)
         );
+    }
+
+    #[test]
+    fn help_overlay_renders_all_key_rows_without_clipping() {
+        // Regression: the overlay box was one row too short for its 13 key
+        // rows, so the last one ("q Quit") was clipped.
+        let mut app = app_with_target();
+        app.show_help = true;
+        let text = render_app_text(&app, 80, 24);
+        for row in [
+            "↑/k    Up",
+            "↓/j    Down",
+            "PgUp   Page Up",
+            "PgDn   Page Down",
+            "/      Filter",
+            "e      Export",
+            "h      History",
+            "n      Network",
+            "?      Help",
+            "r      Rescan",
+            "s      New Scan",
+            "c      Cancel",
+            "q      Quit",
+        ] {
+            assert!(text.contains(row), "help overlay missing row: {row}");
+        }
     }
 
     #[test]
