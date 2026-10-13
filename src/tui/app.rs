@@ -198,6 +198,14 @@ pub struct App {
     /// Set by `Enter` on the overview screen (only when a host is selected)
     /// and cleared by `Esc`. While open, only `Esc` (back) and `q` (quit) act.
     show_detail: bool,
+    /// Number of host-table rows that fit on screen, used to size Page Up /
+    /// Page Down navigation (Phase 10).
+    ///
+    /// Set from the terminal size each event-loop iteration. The derived
+    /// `Default` value is `0`, which [`App::move_selection_page`] treats as a
+    /// single row so page navigation still works (and tests can) without a
+    /// terminal attached.
+    page_size: usize,
     /// Text typed into the filter input since `/` was pressed.
     ///
     /// While non-empty it takes precedence over the committed
@@ -611,6 +619,8 @@ impl App {
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
+            KeyCode::PageUp => self.move_selection_page(-1),
+            KeyCode::PageDown => self.move_selection_page(1),
             KeyCode::Enter if self.selected().is_some() => self.show_detail = true,
             _ => {}
         }
@@ -710,19 +720,30 @@ impl App {
     /// the visible ends; a stale (out-of-range) or hidden index is treated as
     /// no selection.
     fn move_selection(&mut self, direction: i8) {
-        self.move_within(&self.visible_indices(), direction)
+        self.move_within(&self.visible_indices(), direction, 1)
     }
 
-    /// Move the selection by `direction` (-1 up, +1 down) within an explicit
-    /// display order.
+    /// Move the host selection by one page of `direction` (-1 up, +1 down)
+    /// among the currently visible hosts.
+    ///
+    /// The step is [`App::page_size`] (the number of host-table rows that fit
+    /// on screen); a step of `0` degrades to a single row. Anchoring and
+    /// clamping behave like [`App::move_within`].
+    fn move_selection_page(&mut self, direction: i8) {
+        self.move_within(&self.visible_indices(), direction, self.page_size.max(1))
+    }
+
+    /// Move the selection by `direction` (-1 up, +1 down) and `step` rows
+    /// within an explicit display order.
     ///
     /// `order` is a list of `hosts` indices in display order (for example
     /// the overview's filtered list or the network view's grouped order).
     /// With an empty order the selection is cleared. With no selection in the
-    /// order, down anchors on the first entry and up on the last. Otherwise
-    /// the selection steps to the adjacent entry, clamped at the ends; a
-    /// stale (out-of-range) or out-of-order index is treated as no selection.
-    fn move_within(&mut self, order: &[usize], direction: i8) {
+    /// order, the selection anchors on the first entry (moving down) or the
+    /// last (moving up). Otherwise the selection moves `step` entries in the
+    /// given direction, clamped at the ends; a stale (out-of-range) or
+    /// out-of-order index is treated as no selection.
+    fn move_within(&mut self, order: &[usize], direction: i8, step: usize) {
         if direction == 0 {
             return;
         }
@@ -733,18 +754,19 @@ impl App {
         }
         let first = order[0];
         let last = *order.last().expect("order checked non-empty");
+        let step = step.max(1);
         let next = match self.selected_host {
-            // A selection that is in the order steps to the adjacent entry,
-            // clamped at the order's ends.
+            // A selection that is in the order moves `step` entries in the
+            // direction, clamped at the order's ends.
             Some(index) if order.contains(&index) => {
                 let position = order
                     .iter()
                     .position(|&order_index| order_index == index)
                     .expect("selection is an order index");
                 if direction > 0 {
-                    *order.get(position + 1).unwrap_or(&last)
+                    *order.get(position.saturating_add(step)).unwrap_or(&last)
                 } else {
-                    *order.get(position.saturating_sub(1)).unwrap_or(&first)
+                    *order.get(position.saturating_sub(step)).unwrap_or(&first)
                 }
             }
             // No selection, or a stale/out-of-order index: anchor at the end
@@ -1013,8 +1035,8 @@ impl App {
             KeyCode::Char('q') => self.quit(cancel),
             KeyCode::Esc => self.view = View::Overview,
             KeyCode::Char('?') => self.show_help = true,
-            KeyCode::Up | KeyCode::Char('k') => self.move_within(&self.network_order(), -1),
-            KeyCode::Down | KeyCode::Char('j') => self.move_within(&self.network_order(), 1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_within(&self.network_order(), -1, 1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_within(&self.network_order(), 1, 1),
             KeyCode::Enter if self.selected().is_some() => self.show_detail = true,
             _ => {}
         }
@@ -1213,6 +1235,15 @@ fn run_loop(
         // started); there is nothing more to apply.
         while let Ok(event) = events.try_recv() {
             app.apply_event(event);
+        }
+
+        // Track how many host-table rows fit on screen so Page Up / Page Down
+        // move by a full page (Phase 10). Re-queried each iteration to follow
+        // terminal resizes. The fixed chrome is the title, status, and hint
+        // lines (3), the table's top and bottom borders (2), and the header
+        // row (1), leaving `height - 6` data rows.
+        if let Ok(size) = terminal.size() {
+            app.page_size = (size.height as usize).saturating_sub(6).max(1);
         }
 
         // Persist the scan exactly once, the moment it transitions to
@@ -1505,7 +1536,7 @@ fn draw_overview(frame: &mut Frame, app: &App) {
     } else if let Some(filter) = app.filter.as_deref() {
         format!("Filter: {filter}  / Edit  Esc Clear  ? Help  q Quit")
     } else {
-        "↑/k Up  ↓/j Down  Enter Detail  / Filter  e Export  h History  n Network  s New Scan  ? Help  c Cancel  q Quit"
+        "↑/k Up  ↓/j Down  PgUp/PgDn Page  Enter Detail  / Filter  e Export  h History  n Network  s New Scan  ? Help  c Cancel  q Quit"
             .to_string()
     };
     frame.render_widget(Paragraph::new(hint), chunks[3]);
@@ -1920,7 +1951,7 @@ fn hosts_frame_title(shown: Option<usize>, total: usize) -> String {
 fn draw_help_overlay(frame: &mut Frame) {
     let area = frame.area();
     let width = 26u16.min(area.width);
-    let height = 13u16.min(area.height);
+    let height = 14u16.min(area.height);
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let overlay_area = Rect {
@@ -1933,6 +1964,8 @@ fn draw_help_overlay(frame: &mut Frame) {
     let keys = [
         "  ↑/k    Up",
         "  ↓/j    Down",
+        "  PgUp   Page Up",
+        "  PgDn   Page Down",
         "  /      Filter",
         "  e      Export",
         "  h      History",
@@ -3657,6 +3690,108 @@ mod tests {
         app.selected_host = Some(9);
         app.handle_key(KeyCode::Char('k'), &cancel);
         assert_eq!(app.selected_host, Some(1));
+    }
+
+    #[test]
+    fn page_down_moves_by_page_size() {
+        let mut app = app_with_hosts(10);
+        app.page_size = 4;
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        assert_eq!(app.selected_host, Some(0));
+        app.handle_key(KeyCode::PageDown, &cancel);
+        assert_eq!(app.selected_host, Some(4));
+        app.handle_key(KeyCode::PageDown, &cancel);
+        assert_eq!(app.selected_host, Some(8));
+    }
+
+    #[test]
+    fn page_down_clamps_at_last_host() {
+        let mut app = app_with_hosts(10);
+        app.page_size = 4;
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        app.handle_key(KeyCode::PageDown, &cancel);
+        assert_eq!(app.selected_host, Some(4));
+        app.handle_key(KeyCode::PageDown, &cancel);
+        assert_eq!(app.selected_host, Some(8));
+        // A further page down would run past the last host, so it clamps.
+        app.handle_key(KeyCode::PageDown, &cancel);
+        assert_eq!(app.selected_host, Some(9));
+    }
+
+    #[test]
+    fn page_up_moves_by_page_size() {
+        let mut app = app_with_hosts(10);
+        app.page_size = 4;
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('k'), &cancel);
+        assert_eq!(app.selected_host, Some(9));
+        app.handle_key(KeyCode::PageUp, &cancel);
+        assert_eq!(app.selected_host, Some(5));
+        app.handle_key(KeyCode::PageUp, &cancel);
+        assert_eq!(app.selected_host, Some(1));
+    }
+
+    #[test]
+    fn page_up_clamps_at_first_host() {
+        let mut app = app_with_hosts(10);
+        app.page_size = 4;
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('k'), &cancel);
+        app.handle_key(KeyCode::PageUp, &cancel);
+        assert_eq!(app.selected_host, Some(5));
+        app.handle_key(KeyCode::PageUp, &cancel);
+        assert_eq!(app.selected_host, Some(1));
+        // A further page up would run past the first host, so it clamps.
+        app.handle_key(KeyCode::PageUp, &cancel);
+        assert_eq!(app.selected_host, Some(0));
+    }
+
+    #[test]
+    fn page_down_without_selection_anchors_first() {
+        let mut app = app_with_hosts(10);
+        app.page_size = 4;
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::PageDown, &cancel);
+        assert_eq!(app.selected_host, Some(0));
+    }
+
+    #[test]
+    fn page_up_without_selection_anchors_last() {
+        let mut app = app_with_hosts(10);
+        app.page_size = 4;
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::PageUp, &cancel);
+        assert_eq!(app.selected_host, Some(9));
+    }
+
+    #[test]
+    fn page_navigation_with_zero_page_size_steps_single_row() {
+        // The derived Default leaves `page_size` at 0; page navigation then
+        // degrades to a single-row step rather than a no-op.
+        let mut app = app_with_hosts(10);
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        assert_eq!(app.selected_host, Some(0));
+        app.handle_key(KeyCode::PageDown, &cancel);
+        assert_eq!(app.selected_host, Some(1));
+    }
+
+    #[test]
+    fn page_down_skips_hosts_hidden_by_filter() {
+        let mut app = app_with_three_hosts();
+        app.filter = Some("1.1".to_owned());
+        app.page_size = 1;
+        let cancel = AtomicBool::new(false);
+        // Host 1 is hidden, so the visible order is [0, 2].
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        assert_eq!(app.selected_host, Some(0));
+        app.handle_key(KeyCode::PageDown, &cancel);
+        assert_eq!(app.selected_host, Some(2));
+        // Clamped at the last visible host.
+        app.handle_key(KeyCode::PageDown, &cancel);
+        assert_eq!(app.selected_host, Some(2));
     }
 
     /// Hosts spanning two /24 subnets, deliberately not in IP order.

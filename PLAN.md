@@ -745,6 +745,7 @@ At minimum:
 ```
 ↑ / k       Move up
 ↓ / j       Move down
+PgUp / PgDn Page up / down
 Enter       Open host
 r           Rescan
 /           Filter
@@ -771,7 +772,9 @@ Follow normal terminal/TUI conventions where possible.
   reached.
 - [x]7.7 Tests for selection movement, the help overlay, elapsed timing,
   `format_duration`, `window_start`, and `down_count`.
-- [x]7.8 Update `PLAN.md`.
+- [x]7.8 Move the host selection by page with `PgUp`/`PgDn`, stepping by the
+  visible host-table page size and clamping at the first/last visible host.
+- [x]7.9 Update `PLAN.md`.
 
 ## Notes
 
