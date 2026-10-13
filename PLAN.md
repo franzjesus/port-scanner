@@ -1965,7 +1965,7 @@ scan without leaving the TUI.
   `ratatui::buffer::Cell::EMPTY`; PTY smoke asserts the rows covered by each
   panel lose the table markers while rows outside the panel keep their `UP`
   state.
-- [ ]19.9 Guard the overview progress gauge against an out-of-range ratio:
+- [x]19.9 Guard the overview progress gauge against an out-of-range ratio:
   `App::scan_progress()` clamps the computed ratio to `[0, 1]` (a non-finite
   value becomes `0`) before it reaches ratatui's `Gauge`, which asserts the
   range and panics otherwise. Root cause of the panic on a live `/23`:
