@@ -1991,7 +1991,61 @@ scan without leaving the TUI.
 
 ---
 
-# 26\. Future IPv6 Support
+# 26\. Phase 20 — CI and Release Automation
+
+Automate the project's quality gates and publishing. Every push to `main`
+and every pull request runs a CI job (format, clippy, tests, dependency
+audit), and version tags produce a GitHub Release containing a binary
+tarball and a Debian package.
+
+## Design decisions
+
+- **CI job:** a single `check` job on `ubuntu-latest` with the stable
+  toolchain (rustfmt, clippy components) and `Swatinem/rust-cache@v2`. It
+  runs `cargo fmt --all --check`, `cargo clippy --all-targets -- -D
+  warnings`, `cargo test`, and `cargo audit` (cargo-audit pinned to
+  v0.22.2, installed from the rustsec release binary).
+- **Version resolution:** on a `v*` tag push the version is the tag minus
+  the leading `v`; a manual `workflow_dispatch` may supply an explicit
+  `version` input; with neither, the workflow falls back to
+  `0.0.0+<short-sha>` so a release can always be built.
+- **Artifacts:** `port-scanner-<version>-x86_64-linux.tar.gz` (the release
+  binary) and `port-scanner_<version>_amd64.deb` (binary installed to
+  `/usr/bin/port-scanner`), plus a `SHA256SUMS` covering both.
+- **Debian control:** `Depends: libc6 (>= 2.39)` is derived from the
+  highest GLIBC symbol version referenced by the built binary
+  (`objdump -T`), not hardcoded; `Installed-Size` is computed with `du -sk`
+  at packaging time; the maintainer is the GitHub actor that triggered the
+  release.
+- **Publishing:** `softprops/action-gh-release@v2` uploads the dist
+  artifacts and marks the release as latest. The workflow requests only the
+  `contents: write` permission.
+
+## Tasks
+
+- [x]20.1 Add `ci.yml`: format check, clippy with `-D warnings`, tests, and
+  `cargo audit` on push to `main` and on pull requests.
+- [x]20.2 Add `release.yml`: resolve the version, build the release binary,
+  package the tarball and the `.deb`, generate `SHA256SUMS`, and publish
+  everything to a GitHub Release.
+- [ ]20.3 Verify the first CI run on GitHub (push to `main`) and the first
+  tag-driven release (`v*` tag → published release with both artifacts).
+
+## Verification
+
+- Both workflow files parse as valid YAML; the release steps (version
+  resolution, tarball, `.deb`) were executed locally end-to-end against the
+  real release build: `dpkg-deb` produced `port-scanner_0.1.0_amd64.deb`
+  with the expected control fields and `./usr/bin/port-scanner` inside, and
+  the tarball contains the binary.
+- The `Depends: libc6 (>= 2.39)` lower bound matches the highest GLIBC
+  symbol version required by the release binary.
+- Task 20.3 remains open until the repository has a GitHub remote and the
+  first CI/release runs have been observed.
+
+---
+
+# 27\. Future IPv6 Support
 
 IPv6 should be considered in the architecture from the beginning, but does not need to be implemented in the MVP.
 
@@ -2007,7 +2061,7 @@ Initial implementation may explicitly reject IPv6 with a clear message.
 
 ---
 
-# 27\. Error Handling
+# 28\. Error Handling
 
 Errors should be structured and user-friendly.
 
@@ -2035,7 +2089,7 @@ Unexpected programmer errors may still panic during development, but user/networ
 
 ---
 
-# 28\. Performance Requirements
+# 29\. Performance Requirements
 
 The application should remain responsive during large scans.
 
@@ -2052,7 +2106,7 @@ Large subnet scans should provide continuous progress feedback.
 
 ---
 
-# 29\. Security and Safety
+# 30\. Security and Safety
 
 This is a network scanner and must behave predictably.
 
@@ -2071,7 +2125,7 @@ The tool should be designed primarily for networks the user is authorized to tes
 
 ---
 
-# 30\. Testing Strategy
+# 31\. Testing Strategy
 
 ## Unit tests
 
@@ -2110,7 +2164,7 @@ Avoid making tests dependent on a real external network.
 
 ---
 
-# 31\. Logging and Diagnostics
+# 32\. Logging and Diagnostics
 
 The application should support optional debug logging.
 
@@ -2128,7 +2182,7 @@ Consider logging to a file or only enabling detailed logs when explicitly reques
 
 ---
 
-# 32\. CLI Design
+# 33\. CLI Design
 
 Initial command structure:
 
@@ -2159,7 +2213,7 @@ Implemented flag worth noting:
 
 ---
 
-# 33\. Suggested MVP User Experience
+# 34\. Suggested MVP User Experience
 
 A user should be able to run:
 
@@ -2205,7 +2259,7 @@ Selecting a host:
 
 ---
 
-# 34\. Development Order
+# 35\. Development Order
 
 Implement in this order:
 
@@ -2234,13 +2288,14 @@ Implement in this order:
 - [x]Scan history.
 - [x]Scan diff.
 - [x]Network visualization.
+- [x]CI and release automation.
 - [ ]IPv6.
 
 Do not jump ahead to persistence, visualization, or service detection until the basic scanner and TUI are stable.
 
 ---
 
-# 35\. Definition of Done for MVP
+# 36\. Definition of Done for MVP
 
 The MVP is complete when all of the following are true:
 
@@ -2269,7 +2324,7 @@ The MVP is complete when all of the following are true:
 
 ---
 
-# 36\. Implementation Principles for OpenCode
+# 37\. Implementation Principles for OpenCode
 
 When implementing this plan:
 
@@ -2335,7 +2390,7 @@ Network capabilities such as ICMP and ARP can differ across Linux environments. 
 
 ---
 
-# 37\. First Task for OpenCode
+# 38\. First Task for OpenCode
 
 Start with **Phase 1 only**.
 

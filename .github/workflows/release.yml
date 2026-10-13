@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (e.g. 0.2.0); defaults to the git tag or 0.0.0+<sha>"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          elif [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="0.0.0+$(git rev-parse --short HEAD)"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package tarball
+        run: |
+          mkdir -p dist
+          tar czf "dist/port-scanner-${{ steps.version.outputs.version }}-x86_64-linux.tar.gz" \
+            -C target/release port-scanner
+
+      - name: Build .deb package
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          PKG="port-scanner_${VERSION}_amd64"
+          STAGE="build/${PKG}"
+          mkdir -p dist "${STAGE}/DEBIAN" "${STAGE}/usr/bin"
+          install -m 0755 target/release/port-scanner "${STAGE}/usr/bin/port-scanner"
+          cat > "${STAGE}/DEBIAN/control" <<EOF
+          Package: port-scanner
+          Version: ${VERSION}
+          Architecture: amd64
+          Maintainer: ${GITHUB_ACTOR} <${GITHUB_ACTOR}@users.noreply.github.com>
+          Installed-Size: $(du -sk "${STAGE}/usr/bin" | cut -f1)
+          Depends: libc6 (>= 2.39)
+          Section: net
+          Priority: optional
+          Description: Interactive terminal network exploration
+           Discovers live hosts on an IP address or subnet, scans TCP
+           ports, detects services, and tracks changes between scans
+           in an interactive terminal UI.
+          EOF
+          dpkg-deb --build --root-owner-group "${STAGE}" "dist/${PKG}.deb"
+
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/port-scanner-*-x86_64-linux.tar.gz
+            dist/*.deb
+            dist/SHA256SUMS
+          make_latest: true
