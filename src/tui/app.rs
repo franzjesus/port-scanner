@@ -1496,7 +1496,7 @@ fn draw_network_list(frame: &mut Frame, app: &App, area: Rect) {
             // The state span carries the state color; a selected line is
             // reversed as a whole, which composes with the span color.
             let mut line = Line::from(vec![
-                Span::raw(format!("  {}", host.ip)),
+                Span::raw(format!("  {}  ", host.ip)),
                 Span::styled(
                     format!("{:<4}", host.state),
                     Style::default().fg(state_color(host.state)),
@@ -4115,6 +4115,23 @@ mod tests {
         // ...and the next Esc returns to the overview.
         app.handle_key(KeyCode::Esc, &cancel);
         assert_eq!(app.view, View::Overview);
+    }
+
+    #[test]
+    fn network_view_rows_keep_the_gap_between_ip_and_state_columns() {
+        // Regression: the state column lost its leading gap from the IP
+        // column, so rows rendered as "10.0.0.9UP" instead of "10.0.0.9  UP".
+        // The two-space gap keeps the state column readable next to
+        // variable-length IPs.
+        let mut app = app_with_multi_subnet_hosts();
+        app.view = View::Network;
+        let text = render_app_text(&app, 80, 24);
+        for ip in ["192.168.2.5", "10.0.0.9", "192.168.2.3", "10.0.0.2"] {
+            assert!(
+                text.contains(&format!("{ip}  UP")),
+                "network view row for {ip} lost the IP/state gap"
+            );
+        }
     }
 
     #[test]

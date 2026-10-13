@@ -1861,6 +1861,13 @@ live progress gauge, and host-state colors so the screen reads at a glance.
   The clipping regression test asserts every section header, key row, and the
   hint; the stale-content test now asserts the symbol (a bold padding space)
   at the covered cell instead of full equality with an empty cell.
+- [x]18.9 Restore the two-space gap between the IP and state columns in the
+  network list rows. 18.7 rebuilt each row from styled `Span`s and dropped the
+  leading gap, so rows rendered as `10.0.0.9UP` instead of `10.0.0.9  UP` and
+  the state column drifted off next to variable-length IPs. The IP span is now
+  `"  {ip}  "` (two trailing spaces) so the colored state span stays pure state
+  text; a regression test renders the network view and asserts `{ip}  UP` for
+  every host.
 
 ## Verification
 
