@@ -2036,10 +2036,14 @@ fn hosts_frame_title(shown: Option<usize>, total: usize) -> String {
 /// The overlay's rectangle is cleared first: ratatui reuses its frame
 /// buffers, so any cell the overlay does not write would otherwise keep the
 /// stale content of the view behind it, making the panel look transparent.
+///
+/// Keys are grouped into sections (navigation, views, scan, general) with a
+/// bold key column of fixed width, so the rows stay aligned regardless of
+/// key length and the layout no longer depends on Paragraph alignment.
 fn draw_help_overlay(frame: &mut Frame) {
     let area = frame.area();
-    let width = 26u16.min(area.width);
-    let height = 15u16.min(area.height);
+    let width = 32u16.min(area.width);
+    let height = 22u16.min(area.height);
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let overlay_area = Rect {
@@ -2049,24 +2053,53 @@ fn draw_help_overlay(frame: &mut Frame) {
         height,
     };
 
-    let keys = [
-        "  ↑/k    Up",
-        "  ↓/j    Down",
-        "  PgUp   Page Up",
-        "  PgDn   Page Down",
-        "  /      Filter",
-        "  e      Export",
-        "  h      History",
-        "  n      Network",
-        "  ?      Help",
-        "  r      Rescan",
-        "  s      New Scan",
-        "  c      Cancel",
-        "  q      Quit",
+    // Sections of (key, description) rows, in display order.
+    let sections: [(&str, &[(&str, &str)]); 4] = [
+        (
+            "Navigation",
+            &[
+                ("↑/k", "Up"),
+                ("↓/j", "Down"),
+                ("PgUp/PgDn", "Page up / down"),
+                ("Enter", "Host detail"),
+                ("Esc", "Back / close"),
+            ],
+        ),
+        (
+            "Views",
+            &[("/", "Filter"), ("h", "History"), ("n", "Network")],
+        ),
+        (
+            "Scan",
+            &[
+                ("s", "New scan"),
+                ("r", "Rescan"),
+                ("c", "Cancel"),
+                ("e", "Export"),
+            ],
+        ),
+        ("General", &[("?", "Help"), ("q", "Quit")]),
     ];
-    let block = Block::default().borders(Borders::ALL).title("Keys");
-    let content = Paragraph::new(keys.iter().map(|key| Line::from(*key)).collect::<Vec<_>>())
-        .alignment(Alignment::Center);
+
+    let key_style = Style::default().add_modifier(Modifier::BOLD);
+    let mut lines: Vec<Line> = Vec::with_capacity(20);
+    for (title, rows) in sections {
+        lines.push(Line::from(Span::styled(title.to_string(), key_style)));
+        for (key, description) in rows {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {key:<10}"), key_style),
+                Span::raw(*description),
+            ]));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Press ? or Esc to close",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let block = Block::default().borders(Borders::ALL).title("Help");
+    let content = Paragraph::new(lines);
     frame.render_widget(Clear, overlay_area);
     frame.render_widget(content, block.inner(overlay_area));
     frame.render_widget(block, overlay_area);
@@ -2906,11 +2939,11 @@ mod tests {
         // The new-scan dialog (no error) is a 40x8 panel at x:20..=59,
         // y:8..=15; its fourth paragraph line is empty and renders at y=12,
         // where row 9 of the host table shows the latency "1.0 ms" at
-        // x:32..=37. The help overlay (26x15 at x:27..=52, y:4..=18)
-        // center-aligns its key lines, so its first line only spans
-        // x:34..=44 and the cell at x=32, y=6 (the latency "1.0 ms" of
-        // table row 3) is never written by the paragraph. Verify both cells
-        // really hold stale table content before drawing the modals.
+        // x:32..=37. The help overlay (32x22 at x:24..=55, y:1..=22)
+        // covers the cell at x=32, y=6 (the latency "1.0 ms" of table row
+        // 3); its leading Clear removes the stale table content there.
+        // Verify both cells really hold stale table content before drawing
+        // the modals.
         assert_ne!(
             overview
                 .buffer
@@ -2942,33 +2975,48 @@ mod tests {
         let help = terminal
             .draw(|frame| draw(frame, &app))
             .expect("help frame");
+        // The leading Clear removes the stale "1" of the latency, but the
+        // overlay's paragraph then writes its own (bold) key-column padding
+        // to the cell, so assert on the symbol rather than full equality
+        // with an empty cell.
         assert_eq!(
-            help.buffer.cell((32, 6)),
-            Some(&ratatui::buffer::Cell::EMPTY)
+            help.buffer
+                .cell((32, 6))
+                .expect("help cell exists")
+                .symbol(),
+            " "
         );
     }
 
     #[test]
     fn help_overlay_renders_all_key_rows_without_clipping() {
-        // Regression: the overlay box was one row too short for its 13 key
-        // rows, so the last one ("q Quit") was clipped.
+        // Regression: the overlay box was one row too short for its key
+        // rows, so the last one was clipped. The structured layout (section
+        // headers plus key rows plus the close hint) must also fit the box
+        // entirely; every section, key row, and the hint is asserted.
         let mut app = app_with_target();
         app.show_help = true;
         let text = render_app_text(&app, 80, 24);
         for row in [
-            "↑/k    Up",
-            "↓/j    Down",
-            "PgUp   Page Up",
-            "PgDn   Page Down",
-            "/      Filter",
-            "e      Export",
-            "h      History",
-            "n      Network",
-            "?      Help",
-            "r      Rescan",
-            "s      New Scan",
-            "c      Cancel",
-            "q      Quit",
+            "Navigation",
+            "↑/k       Up",
+            "↓/j       Down",
+            "PgUp/PgDn Page up / down",
+            "Enter     Host detail",
+            "Esc       Back / close",
+            "Views",
+            "/         Filter",
+            "h         History",
+            "n         Network",
+            "Scan",
+            "s         New scan",
+            "r         Rescan",
+            "c         Cancel",
+            "e         Export",
+            "General",
+            "?         Help",
+            "q         Quit",
+            "Press ? or Esc to close",
         ] {
             assert!(text.contains(row), "help overlay missing row: {row}");
         }

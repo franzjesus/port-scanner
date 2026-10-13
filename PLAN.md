@@ -1854,6 +1854,13 @@ live progress gauge, and host-state colors so the screen reads at a glance.
   active, driven by `App::scan_progress()`; unit tests.
 - [x]18.7 Color host states (`UP` green, `DOWN` dark gray) in the host table
   and the network list.
+- [x]18.8 Restructure the `?` help overlay from a flat 13-key centered list
+  into a 32x22 box ("Help") with grouped sections (Navigation, Views, Scan,
+  General), a bold fixed-width key column, and a `DarkGray` close hint. Adds
+  the previously missing `Enter` (Host detail) and `Esc` (Back / close) rows.
+  The clipping regression test asserts every section header, key row, and the
+  hint; the stale-content test now asserts the symbol (a bold padding space)
+  at the covered cell instead of full equality with an empty cell.
 
 ## Verification
 
