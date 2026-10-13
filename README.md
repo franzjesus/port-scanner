@@ -7,6 +7,10 @@ hosts on an IP address or subnet. It discovers live hosts, probes TCP ports,
 detects services, enriches hosts with hostname/MAC/vendor information, and lets
 you compare scans over time — all from a responsive terminal interface.
 
+[![CI](https://github.com/franzjesus/port-scanner/actions/workflows/ci.yml/badge.svg)](https://github.com/franzjesus/port-scanner/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/franzjesus/port-scanner)](https://github.com/franzjesus/port-scanner/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 ## Features
 
 - **Target parsing** — single IPv4 addresses and CIDR subnets (host bits
