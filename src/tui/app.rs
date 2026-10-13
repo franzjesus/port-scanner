@@ -196,8 +196,9 @@ pub struct App {
     /// Whether the host detail screen is open for the selected host.
     ///
     /// Set by `Enter` on the overview screen (only when a host is selected)
-    /// and cleared by `Esc`. While open, `Esc` (back), `c` (toggle closed
-    /// ports) and `q` (quit) act.
+    /// and cleared by `Esc`. While open, `Esc` (back), `j`/`k`/`Up`/`Down`
+    /// and `PgUp`/`PgDn` (scroll the port list), `c` (toggle closed ports)
+    /// and `q` (quit) act.
     show_detail: bool,
     /// Whether closed ports are visible in the host detail screen (Phase 10).
     ///
@@ -213,6 +214,22 @@ pub struct App {
     /// single row so page navigation still works (and tests can) without a
     /// terminal attached.
     page_size: usize,
+    /// Index of the first visible line in the "Ports" block of the host
+    /// detail screen (Phase 10).
+    ///
+    /// Adjusted by `j`/`k`/`Up`/`Down` (one line) and `PgUp`/`PgDn` (one page)
+    /// while the detail screen is open, and reset to zero whenever the screen
+    /// opens. Clamped by [`App::clamp_port_scroll`] so it never points past
+    /// the last line that can be shown.
+    port_scroll: usize,
+    /// Number of port lines that fit in the "Ports" block of the host detail
+    /// screen, used to size Page Up / Page Down scrolling (Phase 10).
+    ///
+    /// Set from the terminal size and the selected host each event-loop
+    /// iteration. The derived `Default` value is `0`, which callers treat as
+    /// one line so page scrolling still works (and tests can) without a
+    /// terminal attached.
+    port_page_size: usize,
     /// Text typed into the filter input since `/` was pressed.
     ///
     /// While non-empty it takes precedence over the committed
@@ -582,7 +599,14 @@ impl App {
         if self.show_detail {
             match key {
                 KeyCode::Esc => self.show_detail = false,
-                KeyCode::Char('c') => self.show_closed_ports = !self.show_closed_ports,
+                KeyCode::Char('c') => {
+                    self.show_closed_ports = !self.show_closed_ports;
+                    self.clamp_port_scroll();
+                }
+                KeyCode::Up | KeyCode::Char('k') => self.scroll_ports(-1, 1),
+                KeyCode::Down | KeyCode::Char('j') => self.scroll_ports(1, 1),
+                KeyCode::PageUp => self.scroll_ports(-1, self.port_page_size.max(1)),
+                KeyCode::PageDown => self.scroll_ports(1, self.port_page_size.max(1)),
                 KeyCode::Char('q') => self.quit(cancel),
                 _ => {}
             }
@@ -630,7 +654,7 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::PageUp => self.move_selection_page(-1),
             KeyCode::PageDown => self.move_selection_page(1),
-            KeyCode::Enter if self.selected().is_some() => self.show_detail = true,
+            KeyCode::Enter if self.selected().is_some() => self.open_detail(),
             _ => {}
         }
     }
@@ -740,6 +764,51 @@ impl App {
     /// clamping behave like [`App::move_within`].
     fn move_selection_page(&mut self, direction: i8) {
         self.move_within(&self.visible_indices(), direction, self.page_size.max(1))
+    }
+
+    /// Open the host detail screen for the selected host (Phase 8).
+    ///
+    /// Resets [`App::port_scroll`] so the screen always opens at the top of
+    /// the port list, even when returning from another host.
+    fn open_detail(&mut self) {
+        self.show_detail = true;
+        self.port_scroll = 0;
+    }
+
+    /// Scroll the "Ports" block of the host detail screen by `step` lines in
+    /// `direction` (positive down, negative up), then clamp (Phase 10).
+    ///
+    /// `step` is one line for `j`/`k`/`Up`/`Down` and
+    /// [`App::port_page_size`] for `PgUp`/`PgDn`; a step of `0` degrades to a
+    /// single line. The host selection is never touched.
+    fn scroll_ports(&mut self, direction: i8, step: usize) {
+        if direction == 0 {
+            return;
+        }
+        let step = step.max(1);
+        if direction > 0 {
+            self.port_scroll = self.port_scroll.saturating_add(step);
+        } else {
+            self.port_scroll = self.port_scroll.saturating_sub(step);
+        }
+        self.clamp_port_scroll();
+    }
+
+    /// Clamp [`App::port_scroll`] to the range valid for the port lines
+    /// currently shown in the host detail screen.
+    ///
+    /// Called after every scroll and whenever the shown set of lines changes
+    /// (the closed-port view is toggled), so the offset never points past the
+    /// last line that can be shown. Without a selected host the offset is
+    /// reset to zero.
+    fn clamp_port_scroll(&mut self) {
+        let Some(host) = self.selected() else {
+            self.port_scroll = 0;
+            return;
+        };
+        let total = port_detail_lines(host, self.show_closed_ports).len();
+        let max_start = total.saturating_sub(self.port_page_size.max(1));
+        self.port_scroll = self.port_scroll.min(max_start);
     }
 
     /// Move the selection by `direction` (-1 up, +1 down) and `step` rows
@@ -1046,7 +1115,7 @@ impl App {
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Up | KeyCode::Char('k') => self.move_within(&self.network_order(), -1, 1),
             KeyCode::Down | KeyCode::Char('j') => self.move_within(&self.network_order(), 1, 1),
-            KeyCode::Enter if self.selected().is_some() => self.show_detail = true,
+            KeyCode::Enter if self.selected().is_some() => self.open_detail(),
             _ => {}
         }
     }
@@ -1251,8 +1320,18 @@ fn run_loop(
         // terminal resizes. The fixed chrome is the title, status, and hint
         // lines (3), the table's top and bottom borders (2), and the header
         // row (1), leaving `height - 6` data rows.
+        //
+        // The detail screen's "Ports" block likewise holds whatever the main
+        // area leaves after the "Host" block: `height - 3` (title, status,
+        // hint) minus the host block (host lines plus its 2 border lines),
+        // minus the ports block's own 2 border lines.
         if let Ok(size) = terminal.size() {
             app.page_size = (size.height as usize).saturating_sub(6).max(1);
+            let host_lines = app
+                .selected()
+                .map(|host| host_detail_lines(host).len())
+                .unwrap_or(3);
+            app.port_page_size = (size.height as usize).saturating_sub(host_lines + 7).max(1);
         }
 
         // Persist the scan exactly once, the moment it transitions to
@@ -1373,7 +1452,7 @@ fn draw_network(frame: &mut Frame, app: &App) {
     }
 
     let hint = if app.show_detail {
-        "Esc Back  c Closed  q Quit".to_string()
+        "↑/k Up  ↓/j Down  PgUp/PgDn Page  Esc Back  c Closed  q Quit".to_string()
     } else {
         "↑/k Up  ↓/j Down  Enter Detail  Esc Back  ? Help  q Quit".to_string()
     };
@@ -1539,7 +1618,7 @@ fn draw_overview(frame: &mut Frame, app: &App) {
     }
 
     let hint = if app.show_detail {
-        "Esc Back  c Closed  q Quit".to_string()
+        "↑/k Up  ↓/j Down  PgUp/PgDn Page  Esc Back  c Closed  q Quit".to_string()
     } else if app.filter_mode {
         format!("Filter: {}", app.filter_input)
     } else if let Some(filter) = app.filter.as_deref() {
@@ -2106,8 +2185,22 @@ fn draw_host_detail(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(host_content, host_block.inner(chunks[0]));
     frame.render_widget(host_block, chunks[0]);
 
+    // The offset is clamped at draw time as well as in the key handlers, so a
+    // terminal that shrank between the last scroll and this frame (or test
+    // state without a page size) can never scroll past the end.
+    let visible = chunks[1].height.saturating_sub(2) as usize;
+    let start = app
+        .port_scroll
+        .min(port_lines.len().saturating_sub(visible));
     let ports_block = Block::default().borders(Borders::ALL).title("Ports");
-    let ports_content = Paragraph::new(port_lines.into_iter().map(Line::from).collect::<Vec<_>>());
+    let ports_content = Paragraph::new(
+        port_lines
+            .iter()
+            .skip(start)
+            .take(visible)
+            .map(|line| Line::from(line.as_str()))
+            .collect::<Vec<_>>(),
+    );
     frame.render_widget(ports_content, ports_block.inner(chunks[1]));
     frame.render_widget(ports_block, chunks[1]);
 }
@@ -4139,6 +4232,148 @@ mod tests {
         app.handle_key(KeyCode::Char('c'), &cancel);
         assert!(!app.show_closed_ports);
         assert!(!cancel.load(Ordering::SeqCst));
+    }
+
+    /// An app with one selected host probed on `count` ports in `state`, with
+    /// the detail screen open (Phase 10).
+    fn app_with_detail_and_ports(count: usize, state: PortState) -> App {
+        let mut app = app_with_target();
+        let mut host = Host::up(Ipv4Addr::new(10, 0, 0, 1), Duration::from_millis(1));
+        for port in 1..=count as u16 {
+            host.add_probed_port(Port::new(port).expect("valid port"), state);
+        }
+        app.hosts.push(host);
+        app.selected_host = Some(0);
+        app.show_detail = true;
+        app
+    }
+
+    #[test]
+    fn detail_jk_and_arrows_scroll_the_port_list() {
+        let mut app = app_with_detail_and_ports(10, PortState::Open);
+        app.port_page_size = 4;
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('j'), &cancel);
+        assert_eq!(app.port_scroll, 1);
+        app.handle_key(KeyCode::Down, &cancel);
+        assert_eq!(app.port_scroll, 2);
+        app.handle_key(KeyCode::Char('k'), &cancel);
+        assert_eq!(app.port_scroll, 1);
+        app.handle_key(KeyCode::Up, &cancel);
+        assert_eq!(app.port_scroll, 0);
+        // Scrolling the port list never moves the host selection.
+        assert_eq!(app.selected_host, Some(0));
+        assert!(!cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn detail_port_scroll_clamps_at_the_top_and_bottom() {
+        let mut app = app_with_detail_and_ports(10, PortState::Open);
+        app.port_page_size = 4; // 10 lines - 4 visible = max start 6
+        let cancel = AtomicBool::new(false);
+        for _ in 0..5 {
+            app.handle_key(KeyCode::Char('k'), &cancel);
+        }
+        assert_eq!(app.port_scroll, 0);
+        for _ in 0..50 {
+            app.handle_key(KeyCode::Char('j'), &cancel);
+        }
+        assert_eq!(app.port_scroll, 6);
+    }
+
+    #[test]
+    fn detail_pgup_pgdn_scroll_by_page() {
+        let mut app = app_with_detail_and_ports(10, PortState::Open);
+        app.port_page_size = 4;
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::PageDown, &cancel);
+        assert_eq!(app.port_scroll, 4);
+        app.handle_key(KeyCode::PageDown, &cancel);
+        assert_eq!(app.port_scroll, 6); // clamped to 10 - 4
+        app.handle_key(KeyCode::PageUp, &cancel);
+        assert_eq!(app.port_scroll, 2);
+        app.handle_key(KeyCode::PageUp, &cancel);
+        assert_eq!(app.port_scroll, 0);
+    }
+
+    #[test]
+    fn opening_the_detail_screen_resets_port_scroll() {
+        let mut app = app_with_target();
+        let mut host = Host::up(Ipv4Addr::new(10, 0, 0, 1), Duration::from_millis(1));
+        for port in 1..=10u16 {
+            host.add_probed_port(Port::new(port).expect("valid port"), PortState::Open);
+        }
+        app.hosts.push(host);
+        app.selected_host = Some(0);
+        app.port_page_size = 4;
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Enter, &cancel);
+        assert!(app.show_detail);
+        app.handle_key(KeyCode::PageDown, &cancel);
+        assert_eq!(app.port_scroll, 4);
+        app.handle_key(KeyCode::Esc, &cancel);
+        assert!(!app.show_detail);
+        // Reopening starts at the top again.
+        app.handle_key(KeyCode::Enter, &cancel);
+        assert!(app.show_detail);
+        assert_eq!(app.port_scroll, 0);
+    }
+
+    #[test]
+    fn c_toggle_clamps_port_scroll_to_the_new_line_count() {
+        let mut app = app_with_target();
+        let mut host = Host::up(Ipv4Addr::new(10, 0, 0, 1), Duration::from_millis(1));
+        for port in [1u16, 2] {
+            host.add_probed_port(Port::new(port).expect("valid port"), PortState::Open);
+        }
+        for port in 100..=109u16 {
+            host.add_probed_port(Port::new(port).expect("valid port"), PortState::Closed);
+        }
+        app.hosts.push(host);
+        app.selected_host = Some(0);
+        app.show_detail = true;
+        app.port_page_size = 4;
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('c'), &cancel); // 12 lines -> max start 8
+        for _ in 0..20 {
+            app.handle_key(KeyCode::Char('j'), &cancel);
+        }
+        assert_eq!(app.port_scroll, 8);
+        app.handle_key(KeyCode::Char('c'), &cancel); // 2 lines -> max start 0
+        assert!(!app.show_closed_ports);
+        assert_eq!(app.port_scroll, 0);
+    }
+
+    #[test]
+    fn detail_port_list_renders_from_the_scroll_offset() {
+        let mut app = app_with_target();
+        let mut host = Host::up(Ipv4Addr::new(10, 0, 0, 1), Duration::from_millis(1));
+        for port in 100..=119u16 {
+            host.add_probed_port(Port::new(port).expect("valid port"), PortState::Open);
+        }
+        app.hosts.push(host);
+        app.selected_host = Some(0);
+        app.show_detail = true;
+
+        // An 80x24 terminal gives the ports block 14 visible lines, so at
+        // scroll 0 the lines for ports 100..=113 are shown and 114 is not.
+        let text = render_app_text(&app, 80, 24);
+        assert!(text.contains("100/tcp"), "first line visible at scroll 0");
+        assert!(text.contains("113/tcp"), "14th line visible at scroll 0");
+        assert!(
+            !text.contains("114/tcp"),
+            "15th line not visible at scroll 0"
+        );
+
+        // Scrolling 6 lines moves the window to 106..=119.
+        app.port_scroll = 6;
+        let text = render_app_text(&app, 80, 24);
+        assert!(!text.contains("100/tcp"), "first line scrolled out of view");
+        assert!(text.contains("106/tcp"), "line 7 is now the first visible");
+        assert!(
+            text.contains("119/tcp"),
+            "last line visible after scrolling"
+        );
     }
 
     #[test]

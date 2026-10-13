@@ -860,6 +860,12 @@ Quit`; the overview key list gains `Enter Detail`.
   no ports probed, `No open ports.` when every probed port is closed and
   hidden). The key is detail-view-only (the overview `c` stays the cancel key),
   and the hint reads `Esc Back  c Closed  q Quit`.
+- [x]8.9 The detail screen's port list is scrollable (Phase 10): `↑/k` and
+  `↓/j` step one line, `PgUp`/`PgDn` step one page, the offset is clamped to
+  the visible line range (and re-clamped when the closed-port toggle changes
+  the line count), and opening the detail screen resets it to the top. The
+  detail hint now reads `↑/k Up  ↓/j Down  PgUp/PgDn Page  Esc Back  c Closed
+  q Quit`; scrolling never moves the host selection.
 
 ## Notes
 
@@ -883,6 +889,13 @@ Quit`; the overview key list gains `Enter Detail`.
   when the selection or detail screen changes, so it stays out of the way and
   needs no extra state plumbing. `c` is deliberately detail-view-only and is not
   added to the global `?` help overlay, where `c` already means Cancel.
+- **Scrollable port list (8.9):** the Ports block scrolls with `↑/k`, `↓/j`,
+  `PgUp`, and `PgDn`; the scroll offset and page size live on `App`
+  (`port_scroll`, `port_page_size`, the latter refreshed from the terminal
+  size each frame), so the draw path stays a pure function of `&App`. Scrolling
+  never moves the host selection, the offset clamps to the visible line range,
+  and `open_detail` (Enter) resets it to the top. Toggling closed ports (8.8)
+  re-clamps the offset to the new line count.
 - **Verified:** `cargo fmt --check` (clean), `cargo check` (no warnings),
   `cargo test` (145 passed), `cargo clippy --all-targets` (no warnings),
   `cargo build` (clean); a PTY smoke test (pyte terminal emulation) confirmed
