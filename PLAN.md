@@ -849,6 +849,12 @@ Quit`; the overview key list gains `Enter Detail`.
 - [x]8.6 Tests: `Enter`/`Esc`/key gating (including a stale selection),
   recording closed port results, and `format_open_ports` excluding closed ports.
 - [x]8.7 Update `PLAN.md`.
+- [x]8.8 `c` toggles closed-port visibility on the detail screen (Phase 10):
+  `show_closed_ports` defaults to false so the view focuses on the open
+  ports/services found; `port_detail_lines` renders the filtered list (`-` when
+  no ports probed, `No open ports.` when every probed port is closed and
+  hidden). The key is detail-view-only (the overview `c` stays the cancel key),
+  and the hint reads `Esc Back  c Closed  q Quit`.
 
 ## Notes
 
@@ -867,6 +873,11 @@ Quit`; the overview key list gains `Enter Detail`.
   detail screen (`OPEN`/`CLOSED`); `PortState::Display` stays lowercase.
 - **`ProbedPort` lives in `network/port.rs`** (re-exported from `network`),
   keeping the model self-contained; no TUI types leak into network code.
+- **Closed-ports toggle (8.8):** `show_closed_ports` is a persistent
+  per-session view preference (like a file browser's "show hidden"), not reset
+  when the selection or detail screen changes, so it stays out of the way and
+  needs no extra state plumbing. `c` is deliberately detail-view-only and is not
+  added to the global `?` help overlay, where `c` already means Cancel.
 - **Verified:** `cargo fmt --check` (clean), `cargo check` (no warnings),
   `cargo test` (145 passed), `cargo clippy --all-targets` (no warnings),
   `cargo build` (clean); a PTY smoke test (pyte terminal emulation) confirmed

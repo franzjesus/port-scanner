@@ -196,8 +196,15 @@ pub struct App {
     /// Whether the host detail screen is open for the selected host.
     ///
     /// Set by `Enter` on the overview screen (only when a host is selected)
-    /// and cleared by `Esc`. While open, only `Esc` (back) and `q` (quit) act.
+    /// and cleared by `Esc`. While open, `Esc` (back), `c` (toggle closed
+    /// ports) and `q` (quit) act.
     show_detail: bool,
+    /// Whether closed ports are visible in the host detail screen (Phase 10).
+    ///
+    /// Defaults to false so the detail view focuses on the open ports/services
+    /// the scan found; the `c` key on the detail screen toggles it. It is a
+    /// per-session view preference that persists across hosts.
+    show_closed_ports: bool,
     /// Number of host-table rows that fit on screen, used to size Page Up /
     /// Page Down navigation (Phase 10).
     ///
@@ -539,9 +546,10 @@ impl App {
     /// While the help overlay is open, only `?` and `Esc` dismiss it and `q`
     /// still quits; every other key is ignored until it is closed.
     ///
-    /// While the host detail screen is open, only `Esc` (back) and `q` (quit)
-    /// act; every other key is ignored until it is closed. On the overview
-    /// screen, `Enter` opens the detail screen for the selected host.
+    /// While the host detail screen is open, `Esc` (back), `c` (toggle closed
+    /// ports) and `q` (quit) act; every other key is ignored until it is
+    /// closed. On the overview screen, `Enter` opens the detail screen for the
+    /// selected host.
     ///
     /// While filter input is active (started with `/` on the overview
     /// screen), every key is routed to `handle_filter_input` instead of the
@@ -574,6 +582,7 @@ impl App {
         if self.show_detail {
             match key {
                 KeyCode::Esc => self.show_detail = false,
+                KeyCode::Char('c') => self.show_closed_ports = !self.show_closed_ports,
                 KeyCode::Char('q') => self.quit(cancel),
                 _ => {}
             }
@@ -1364,7 +1373,7 @@ fn draw_network(frame: &mut Frame, app: &App) {
     }
 
     let hint = if app.show_detail {
-        "Esc Back  q Quit".to_string()
+        "Esc Back  c Closed  q Quit".to_string()
     } else {
         "↑/k Up  ↓/j Down  Enter Detail  Esc Back  ? Help  q Quit".to_string()
     };
@@ -1530,7 +1539,7 @@ fn draw_overview(frame: &mut Frame, app: &App) {
     }
 
     let hint = if app.show_detail {
-        "Esc Back  q Quit".to_string()
+        "Esc Back  c Closed  q Quit".to_string()
     } else if app.filter_mode {
         format!("Filter: {}", app.filter_input)
     } else if let Some(filter) = app.filter.as_deref() {
@@ -2079,25 +2088,7 @@ fn draw_host_detail(frame: &mut Frame, app: &App, area: Rect) {
     let (host_lines, port_lines) = match app.selected() {
         Some(host) => (
             host_detail_lines(host),
-            if host.ports.is_empty() {
-                vec!["-".to_owned()]
-            } else {
-                host.ports
-                    .iter()
-                    .map(|p| {
-                        let mut line = format!(
-                            "{:<12}{}",
-                            format!("{}/tcp", p.port),
-                            p.state.to_string().to_uppercase()
-                        );
-                        if let Some(service) = &p.service {
-                            line.push(' ');
-                            line.push_str(&service_label(service));
-                        }
-                        line
-                    })
-                    .collect()
-            },
+            port_detail_lines(host, app.show_closed_ports),
         ),
         None => (vec!["No host selected.".to_owned()], vec!["-".to_owned()]),
     };
@@ -2157,6 +2148,41 @@ fn service_label(service: &ServiceInfo) -> String {
     match &service.version {
         Some(version) => format!("{} {}", service.name, version),
         None => service.name.clone(),
+    }
+}
+
+/// The display lines for the "Ports" block of the host detail screen
+/// (Phase 10).
+///
+/// When `show_closed` is false, closed ports are omitted so the view focuses
+/// on the open ports/services the scan found; the `c` key on the detail screen
+/// toggles `show_closed`. A host with no probed ports shows a dash, and one
+/// whose probed ports are all closed shows a "no open ports" placeholder.
+fn port_detail_lines(host: &Host, show_closed: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    for p in &host.ports {
+        if !show_closed && p.state == PortState::Closed {
+            continue;
+        }
+        let mut line = format!(
+            "{:<12}{}",
+            format!("{}/tcp", p.port),
+            p.state.to_string().to_uppercase()
+        );
+        if let Some(service) = &p.service {
+            line.push(' ');
+            line.push_str(&service_label(service));
+        }
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        if host.ports.is_empty() {
+            vec!["-".to_owned()]
+        } else {
+            vec!["No open ports.".to_owned()]
+        }
+    } else {
+        lines
     }
 }
 
@@ -3510,6 +3536,64 @@ mod tests {
     }
 
     #[test]
+    fn port_detail_lines_shows_dash_when_host_has_no_ports() {
+        let host = Host::up("10.0.0.1".parse().unwrap(), Duration::from_millis(1));
+        assert_eq!(port_detail_lines(&host, false), vec!["-".to_owned()]);
+        assert_eq!(port_detail_lines(&host, true), vec!["-".to_owned()]);
+    }
+
+    #[test]
+    fn port_detail_lines_hides_closed_ports_by_default() {
+        let mut host = Host::up("10.0.0.1".parse().unwrap(), Duration::from_millis(1));
+        host.add_probed_port(Port::new(22).unwrap(), PortState::Open);
+        host.ports
+            .iter_mut()
+            .find(|p| p.port == Port::new(22).unwrap())
+            .unwrap()
+            .service = Some(ServiceInfo::new("ssh"));
+        host.add_probed_port(Port::new(23).unwrap(), PortState::Closed);
+        // By default the view focuses on the open ports/services the scan
+        // found; the closed port is still recorded on the host but omitted.
+        assert_eq!(
+            port_detail_lines(&host, false),
+            vec!["22/tcp      OPEN ssh".to_owned()]
+        );
+    }
+
+    #[test]
+    fn port_detail_lines_shows_closed_ports_when_enabled() {
+        let mut host = Host::up("10.0.0.1".parse().unwrap(), Duration::from_millis(1));
+        host.add_probed_port(Port::new(22).unwrap(), PortState::Open);
+        host.add_probed_port(Port::new(23).unwrap(), PortState::Closed);
+        assert_eq!(
+            port_detail_lines(&host, true),
+            vec![
+                "22/tcp      OPEN".to_owned(),
+                "23/tcp      CLOSED".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn port_detail_lines_all_closed_and_hidden_shows_placeholder() {
+        let mut host = Host::up("10.0.0.1".parse().unwrap(), Duration::from_millis(1));
+        host.add_probed_port(Port::new(23).unwrap(), PortState::Closed);
+        host.add_probed_port(Port::new(80).unwrap(), PortState::Closed);
+        assert_eq!(
+            port_detail_lines(&host, false),
+            vec!["No open ports.".to_owned()]
+        );
+        // With closed ports visible, both closed ports are shown.
+        assert_eq!(
+            port_detail_lines(&host, true),
+            vec![
+                "23/tcp      CLOSED".to_owned(),
+                "80/tcp      CLOSED".to_owned()
+            ]
+        );
+    }
+
+    #[test]
     fn finished_event_sets_completed() {
         let mut app = App::default();
         app.apply_event(ScanEvent::Finished);
@@ -4000,6 +4084,35 @@ mod tests {
         app.handle_key(KeyCode::Char('q'), &cancel);
         assert!(app.should_quit);
         assert!(cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn c_toggles_closed_ports_while_detail_is_open() {
+        let mut app = App {
+            show_detail: true,
+            ..Default::default()
+        };
+        assert!(!app.show_closed_ports);
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('c'), &cancel);
+        assert!(app.show_closed_ports);
+        // A second press toggles it back; the toggle does not set the shared
+        // cancellation flag (that is the overview `c` behaviour).
+        app.handle_key(KeyCode::Char('c'), &cancel);
+        assert!(!app.show_closed_ports);
+        assert!(!cancel.load(Ordering::SeqCst));
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn c_does_not_toggle_closed_ports_on_the_overview() {
+        // On the overview screen `c` is the cancel key (and only acts while a
+        // scan is running), so it must not touch the detail view preference.
+        let mut app = app_with_hosts(3);
+        let cancel = AtomicBool::new(false);
+        app.handle_key(KeyCode::Char('c'), &cancel);
+        assert!(!app.show_closed_ports);
+        assert!(!cancel.load(Ordering::SeqCst));
     }
 
     #[test]
