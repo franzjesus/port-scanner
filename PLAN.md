@@ -2005,6 +2005,12 @@ tarball and a Debian package.
   runs `cargo fmt --all --check`, `cargo clippy --all-targets -- -D
   warnings`, `cargo test`, and `cargo audit` (cargo-audit pinned to
   v0.22.2, installed from the rustsec release binary).
+- **Toolchain pin:** `rust-toolchain.toml` pins the channel to `1.99.0`
+  (rustfmt, clippy components), and both workflows install the same pinned
+  ref (`dtolnay/rust-toolchain@1.99.0`) instead of tracking `@stable`. This
+  keeps local and CI on an identical toolchain so the `-D warnings` gate
+  cannot drift ("green locally, red in CI"). To upgrade, bump the version in
+  `rust-toolchain.toml` and both workflow refs together.
 - **Version resolution:** on a `v*` tag push the version is the tag minus
   the leading `v`; a manual `workflow_dispatch` may supply an explicit
   `version` input; with neither, the workflow falls back to

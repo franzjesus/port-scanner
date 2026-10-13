@@ -43,7 +43,7 @@ pub fn group_by_subnet<'a>(hosts: &'a [Host]) -> Vec<SubnetGroup<'a>> {
     by_network
         .into_iter()
         .map(|(network, mut group_hosts)| {
-            group_hosts.sort_by(|a, b| a.ip.cmp(&b.ip));
+            group_hosts.sort_by_key(|a| a.ip);
             SubnetGroup {
                 network,
                 hosts: group_hosts,
