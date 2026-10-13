@@ -626,6 +626,7 @@ pub fn run_scan<D: HostDiscovery, P: PortScanner>(
 
 #[cfg(test)]
 mod tests {
+    use super::discovery::icmp_echo_available;
     use super::enrichment::{EnrichmentError, HostEnrichment};
     use super::*;
     use std::net::Ipv4Addr;
@@ -688,6 +689,13 @@ mod tests {
     /// the fallback path under test here does not run.
     #[test]
     fn auto_uses_icmp_when_the_socket_opens() {
+        // `Auto` falls back to TCP when ICMP is unavailable, so the result
+        // alone cannot signal unavailability; probe up front and skip.
+        if !icmp_echo_available() {
+            eprintln!("test skipped: ICMP echo unavailable in this environment");
+            return;
+        }
+
         let target = ScanTarget::Host(Ipv4Addr::LOCALHOST);
         let config = DiscoveryConfig::default();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -695,7 +703,7 @@ mod tests {
 
         let outcome = match Discovery::Auto.discover(&target, &config, &tx, &cancel) {
             Ok(outcome) => outcome,
-            Err(err) => panic!("ICMP echo unavailable in this environment: {err:?}"),
+            Err(err) => panic!("unexpected discovery error: {err:?}"),
         };
         drop(tx);
         let events: Vec<ScanEvent> = rx.try_iter().collect();
@@ -865,6 +873,12 @@ mod tests {
         use crate::network::HostState;
         use crate::ports::PortSpec;
 
+        // Skip when ICMP echo is unavailable (e.g. CI without a raw socket).
+        if !icmp_echo_available() {
+            eprintln!("test skipped: ICMP echo unavailable in this environment");
+            return;
+        }
+
         // Bind a real listener on loopback for a guaranteed-open port and derive
         // a guaranteed-closed port the same way the port-scan test does.
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
@@ -903,12 +917,10 @@ mod tests {
         );
         drop(tx);
 
-        // Skip in environments where ICMP is unavailable.
-        assert!(
-            result.is_ok(),
-            "ICMP echo unavailable in this environment; skipping: {:?}",
-            result.err()
-        );
+        // Availability was verified above; an error here is unexpected.
+        if let Err(err) = result {
+            panic!("unexpected scan error: {err:?}");
+        }
 
         let events: Vec<ScanEvent> = rx.try_iter().collect();
 

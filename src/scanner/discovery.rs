@@ -177,6 +177,17 @@ impl IcmpDiscovery {
     }
 }
 
+/// Returns `true` when an unprivileged ICMP echo socket can be opened in the
+/// current environment.
+///
+/// Opening such a socket can be denied (for example when the process lacks
+/// `CAP_NET_RAW` and `net.ipv4.ping_group_range` does not include its uid), so
+/// tests that require a live echo probe gate on this and skip rather than fail.
+#[cfg(test)]
+pub(crate) fn icmp_echo_available() -> bool {
+    IcmpDiscovery::open().is_ok()
+}
+
 impl HostDiscovery for IcmpDiscovery {
     fn discover(
         &self,
@@ -216,6 +227,12 @@ mod tests {
     /// rather than failing when the socket cannot be opened.
     #[test]
     fn discovers_localhost() {
+        // Skip when ICMP echo is unavailable (e.g. CI without a raw socket).
+        if !icmp_echo_available() {
+            eprintln!("test skipped: ICMP echo unavailable in this environment");
+            return;
+        }
+
         let target = ScanTarget::Host(Ipv4Addr::LOCALHOST);
         let config = DiscoveryConfig::default();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -224,12 +241,10 @@ mod tests {
         let result = IcmpDiscovery.discover(&target, &config, &tx, &cancel);
         drop(tx);
 
-        // ICMP echo over an unprivileged datagram socket is not guaranteed on
-        // every platform (some sandboxes or hosts block it), so the test
-        // reports a clear message when it is unavailable.
+        // Availability was verified above; an error here is unexpected.
         let outcome = match result {
             Ok(outcome) => outcome,
-            Err(err) => panic!("ICMP echo unavailable in this environment: {err:?}"),
+            Err(err) => panic!("unexpected discovery error: {err:?}"),
         };
 
         let events: Vec<ScanEvent> = rx.try_iter().collect();

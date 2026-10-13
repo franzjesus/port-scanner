@@ -2026,6 +2026,18 @@ tarball and a Debian package.
 - **Publishing:** `softprops/action-gh-release@v2` uploads the dist
   artifacts and marks the release as latest. The workflow requests only the
   `contents: write` permission.
+- **ICMP tests skip when echo is unavailable:** the `check` job runs
+  unprivileged on `ubuntu-latest`, where opening an unprivileged ICMP echo
+  socket is denied (`EACCES`: no `CAP_NET_RAW` and a restrictive
+  `net.ipv4.ping_group_range`). The three tests that need a live echo probe
+  (`discovers_localhost`, `auto_uses_icmp_when_the_socket_opens`,
+  `run_scan_frames_the_whole_run_with_one_started_and_finished`) now gate on
+  a `#[cfg(test)] icmp_echo_available()` helper (`IcmpDiscovery::open().is_ok()`)
+  and return early with a `test skipped:` message when it is `false`, instead
+  of failing. After the guard passes, a real `Err` from the probe is treated
+  as *unexpected* and panics, so a genuine regression is still surfaced. The
+  helper is `#[cfg(test)]` so it never appears in non-test builds (no
+  dead-code warning under a plain `cargo check`).
 
 ## Tasks
 
@@ -2036,6 +2048,10 @@ tarball and a Debian package.
   everything to a GitHub Release.
 - [ ]20.3 Verify the first CI run on GitHub (push to `main`) and the first
   tag-driven release (`v*` tag → published release with both artifacts).
+  - State: fmt and clippy pass in CI; the three ICMP-dependent tests were the
+    remaining failures (non-root `EACCES`) and now skip gracefully (see the
+    ICMP design decision above). Awaiting commit/push of that fix, then a
+    green `check` run, then the tag-driven release.
 
 ## Verification
 
@@ -2046,8 +2062,14 @@ tarball and a Debian package.
   the tarball contains the binary.
 - The `Depends: libc6 (>= 2.39)` lower bound matches the highest GLIBC
   symbol version required by the release binary.
-- Task 20.3 remains open until the repository has a GitHub remote and the
-  first CI/release runs have been observed.
+- The ICMP test-skip path was verified locally by temporarily forcing
+  `icmp_echo_available()` to return `false`: all three gated tests passed
+  (skipped) without performing network work, each printing a
+  `test skipped:` line; the probe was then restored and the full suite
+  (391 tests) passes with the real probe. CI (non-root, `EACCES`) is the
+  real environment for this path.
+- Task 20.3 remains open until the first CI/release runs have been observed
+  green on GitHub.
 
 ---
 
